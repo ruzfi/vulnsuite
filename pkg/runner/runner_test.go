@@ -105,6 +105,52 @@ func TestRunHostModeAndEnvCommandDevices(t *testing.T) {
 	}
 }
 
+func TestSidecarCommandReachesEngine(t *testing.T) {
+	fe := enginetest.New()
+	r := New(fe)
+	c := &contract.Contract{
+		APIVersion: contract.APIVersion,
+		Kind:       "Target",
+		Metadata:   contract.Metadata{ID: "sidecar-cmd-test"},
+		Service: contract.Service{
+			Sidecars: []contract.Sidecar{{
+				Name:    "node2",
+				Image:   "minio/minio:vuln",
+				Command: []string{"server", "http://node1/data", "http://node2/data"},
+			}},
+		},
+	}
+	// patched state swaps the sidecar image to the fixed version.
+	st := &contract.State{
+		Name:     "patched",
+		Sidecars: map[string]contract.SidecarOverride{"node2": {Image: "minio/minio:fixed"}},
+	}
+	exp := Exposure{Mode: ModeInternal, Network: DefaultNetwork}
+	names, err := r.startSidecars(context.Background(), c, st, exp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 1 {
+		t.Fatalf("expected 1 sidecar, got %v", names)
+	}
+	sc := fe.Containers[names[0]]
+	if sc == nil {
+		t.Fatalf("sidecar %q not recorded", names[0])
+	}
+	cmd := sc.Spec.Cmd
+	if len(cmd) != 3 || cmd[0] != "server" || cmd[2] != "http://node2/data" {
+		t.Fatalf("sidecar command not threaded: %v", cmd)
+	}
+	// the per-state override wins over the sidecar's own image
+	if sc.Spec.Image != "minio/minio:fixed" {
+		t.Fatalf("sidecar override not applied: %s", sc.Spec.Image)
+	}
+	// and it joins the network under its bare name, so peers can resolve it
+	if sc.Spec.Network == nil || len(sc.Spec.Network.Aliases) != 1 || sc.Spec.Network.Aliases[0] != "node2" {
+		t.Fatalf("sidecar alias: %+v", sc.Spec.Network)
+	}
+}
+
 func TestMergeEnvAndNames(t *testing.T) {
 	env := mergeEnv(map[string]string{"A": "1", "B": "2"}, map[string]string{"B": "3"})
 	if len(env) != 2 || env[0] != "A=1" || env[1] != "B=3" {

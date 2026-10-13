@@ -218,7 +218,7 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 		return nil, fmt.Errorf("unknown exposure mode %q", exp.Mode)
 	}
 
-	sidecars, err := r.startSidecars(ctx, c, exp)
+	sidecars, err := r.startSidecars(ctx, c, st, exp)
 	if err != nil {
 		return nil, err
 	}
@@ -271,18 +271,18 @@ func (r *Runner) cleanup(ctx context.Context, container string, sidecars []strin
 	}
 }
 
-func (r *Runner) startSidecars(ctx context.Context, c *contract.Contract, exp Exposure) ([]string, error) {
+func (r *Runner) startSidecars(ctx context.Context, c *contract.Contract, st *contract.State, exp Exposure) ([]string, error) {
 	var names []string
 	for _, sc := range c.Service.Sidecars {
 		name := contract.ContainerNamePrefix + strings.ReplaceAll(c.ID(), "/", "-") + "-" + sc.Name
 		_ = r.Engine.ContainerRemove(ctx, name)
-		ref := sc.Ref()
+		ref := st.SidecarRef(sc)
 		if exists, _ := r.Engine.ImageExists(ctx, ref); !exists {
 			if err := r.Engine.ImagePull(ctx, ref, nil); err != nil {
 				return names, fmt.Errorf("sidecar %s: %w", sc.Name, err)
 			}
 		}
-		spec := engine.ContainerSpec{Name: name, Image: ref, Env: mergeEnv(nil, sc.Environment),
+		spec := engine.ContainerSpec{Name: name, Image: ref, Cmd: sc.Command, Env: mergeEnv(nil, sc.Environment),
 			Labels: map[string]string{LabelManaged: "true", builder.LabelID: c.ID()}}
 		if exp.Mode == ModeInternal {
 			spec.Network = &engine.NetworkAttachment{Name: exp.Network, Aliases: []string{sc.Name}}

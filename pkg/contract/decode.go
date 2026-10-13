@@ -57,10 +57,11 @@ type rawState struct {
 	Digest      string            `yaml:"digest,omitempty"`
 	Patch       string            `yaml:"patch,omitempty"`
 	Overlay     []OverlayFile     `yaml:"overlay,omitempty"`
-	Environment map[string]string `yaml:"environment,omitempty"`
-	Command     Command           `yaml:"command,omitempty"`
-	Seed        []SeedStep        `yaml:"seed,omitempty"`
-	Verify      []Probe           `yaml:"verify,omitempty"`
+	Environment map[string]string          `yaml:"environment,omitempty"`
+	Command     Command                    `yaml:"command,omitempty"`
+	Sidecars    map[string]SidecarOverride `yaml:"sidecars,omitempty"`
+	Seed        []SeedStep                 `yaml:"seed,omitempty"`
+	Verify      []Probe                    `yaml:"verify,omitempty"`
 }
 
 // SchemaError is a structural error in a contract document (the equivalent of
@@ -130,6 +131,7 @@ func Parse(data []byte) (*Contract, error) {
 			Overlay:     rs.Overlay,
 			Environment: rs.Environment,
 			Command:     []string(rs.Command),
+			Sidecars:    rs.Sidecars,
 			Seed:        rs.Seed,
 			Verify:      rs.Verify,
 		}
@@ -286,6 +288,24 @@ func (c *Contract) checkStructure() error {
 			}
 			if o.Mode != "" && !modeRe.MatchString(o.Mode) {
 				return se(fmt.Sprintf("%s/overlay/%d/mode", loc, i), "must be an octal mode like 0644")
+			}
+		}
+		for scName, ov := range st.Sidecars {
+			if ov.Image == "" {
+				return se(fmt.Sprintf("%s/sidecars/%s/image", loc, scName), "is required")
+			}
+			if ov.Digest != "" && !digestRe.MatchString(ov.Digest) {
+				return se(fmt.Sprintf("%s/sidecars/%s/digest", loc, scName), "must look like sha256:<64 hex>")
+			}
+			found := false
+			for _, sc := range c.Service.Sidecars {
+				if sc.Name == scName {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return se(fmt.Sprintf("%s/sidecars/%s", loc, scName), "no service sidecar named %q to override", scName)
 			}
 		}
 		for i, step := range st.Seed {

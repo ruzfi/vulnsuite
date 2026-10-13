@@ -287,6 +287,12 @@
                 "type": "string",
                 "pattern": "^sha256:[0-9a-f]{64}$"
               },
+              "command": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
               "environment": {
                 "type": "object",
                 "additionalProperties": {
@@ -460,6 +466,26 @@
             "type": "string"
           },
           "description": "Per-state command override (wins over service.command)."
+        },
+        "sidecars": {
+          "type": "object",
+          "description": "Per-state sidecar image overrides, keyed by sidecar name (e.g. the patched version on every node of a multi-node target).",
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "image"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "image": {
+                "type": "string"
+              },
+              "digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              }
+            }
+          }
         }
       }
     },

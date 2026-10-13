@@ -272,10 +272,20 @@ type State struct {
 	Digest      string            `yaml:"digest,omitempty" json:"digest,omitempty"`
 	Patch       string            `yaml:"patch,omitempty" json:"patch,omitempty"`
 	Overlay     []OverlayFile     `yaml:"overlay,omitempty" json:"overlay,omitempty"`
-	Environment map[string]string `yaml:"environment,omitempty" json:"environment,omitempty"`
-	Command     []string          `yaml:"command,omitempty" json:"command,omitempty"`
-	Seed        []SeedStep        `yaml:"seed,omitempty" json:"seed,omitempty"`
-	Verify      []Probe           `yaml:"verify,omitempty" json:"verify,omitempty"`
+	Environment map[string]string          `yaml:"environment,omitempty" json:"environment,omitempty"`
+	Command     []string                   `yaml:"command,omitempty" json:"command,omitempty"`
+	Sidecars    map[string]SidecarOverride `yaml:"sidecars,omitempty" json:"sidecars,omitempty"`
+	Seed        []SeedStep                 `yaml:"seed,omitempty" json:"seed,omitempty"`
+	Verify      []Probe                    `yaml:"verify,omitempty" json:"verify,omitempty"`
+}
+
+// SidecarRef is the image ref to run for sc in this state: a per-state override
+// if present, otherwise the sidecar's own image.
+func (s State) SidecarRef(sc Sidecar) string {
+	if ov, ok := s.Sidecars[sc.Name]; ok && ov.Image != "" {
+		return pinRef(ov.Image, ov.Digest)
+	}
+	return sc.Ref()
 }
 
 // EffectiveImage is the image ref for this state if it is image-based (a
@@ -316,11 +326,19 @@ type Sidecar struct {
 	Name        string            `yaml:"name" json:"name"`
 	Image       string            `yaml:"image" json:"image"`
 	Digest      string            `yaml:"digest,omitempty" json:"digest,omitempty"`
+	Command     []string          `yaml:"command,omitempty" json:"command,omitempty"`
 	Environment map[string]string `yaml:"environment,omitempty" json:"environment,omitempty"`
 }
 
 // Ref is the sidecar's pinned image reference.
 func (s Sidecar) Ref() string { return pinRef(s.Image, s.Digest) }
+
+// SidecarOverride lets a state swap a sidecar's image (e.g. the patched state
+// of a multi-node target running the fixed version on every node).
+type SidecarOverride struct {
+	Image  string `yaml:"image" json:"image"`
+	Digest string `yaml:"digest,omitempty" json:"digest,omitempty"`
+}
 
 // Service is how the target is run.
 type Service struct {
