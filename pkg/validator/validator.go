@@ -59,6 +59,20 @@ func (v *Validator) Check(c *contract.Contract) []Finding {
 	out = append(out, v.ports(c)...)
 	out = append(out, v.provenance(c)...)
 	out = append(out, v.fidelity(c)...)
+	out = append(out, v.requires(c)...)
+	return out
+}
+
+func (v *Validator) requires(c *contract.Contract) []Finding {
+	var out []Finding
+	// A /dev/kvm device without a matching requires.kvm will hang on hosts
+	// that cannot provide it instead of skipping cleanly.
+	for _, d := range c.Service.Devices {
+		if d == "/dev/kvm" && !c.Requires.KVM {
+			out = append(out, Finding{Warning, c.ID(), "kvm-without-requires",
+				"service.devices has /dev/kvm but requires.kvm is not set; add requires.kvm (and arch: [amd64]) so hosts without it skip cleanly"})
+		}
+	}
 	return out
 }
 

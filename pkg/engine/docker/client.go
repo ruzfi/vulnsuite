@@ -19,6 +19,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/ruzfi/vulnsuite/pkg/engine"
 )
 
 // APIVersion is the minimum Engine API version we need (Docker 20.10+).
@@ -188,6 +190,18 @@ func (c *Client) Ping(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("%s (api %s, %s/%s)", v.Version, v.APIVersion, v.Os, v.Arch), nil
+}
+
+// Info returns the daemon OS/arch.
+func (c *Client) Info(ctx context.Context) (engine.HostInfo, error) {
+	var v struct {
+		Os   string `json:"Os"`
+		Arch string `json:"Arch"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, "/version", nil, nil, &v); err != nil {
+		return engine.HostInfo{}, err
+	}
+	return engine.HostInfo{OS: v.Os, Arch: v.Arch}, nil
 }
 
 // streamMessage is one line of a JSON progress stream (build, pull, push).

@@ -45,7 +45,7 @@ type listRow struct {
 }
 
 func cmdList() *Command {
-	var tag, fidelity string
+	var tag, fidelity, arch string
 	return &Command{
 		Name: "list", Aliases: []string{"ls"},
 		Short: "list templates (with state availability)",
@@ -55,6 +55,7 @@ when unique). With no selector every template is listed.`,
 		Flags: func(fs *flag.FlagSet) {
 			fs.StringVar(&tag, "tag", "", "only templates carrying this tag")
 			fs.StringVar(&fidelity, "fidelity", "", "only templates of this fidelity (real or simulated)")
+			fs.StringVar(&arch, "arch", "", "only templates that run on this host arch (e.g. amd64, arm64), honouring requires")
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
 			store, err := g.Store()
@@ -82,6 +83,15 @@ when unique). With no selector every template is listed.`,
 				}
 				if fidelity != "" && c.Fidelity() != fidelity {
 					continue
+				}
+				if arch != "" {
+					// a target runs on <arch> if it has no arch requirement, lists
+					// it, or can emulate it on linux
+					req := c.Requires
+					ok := len(req.Arch) == 0 || has(req.Arch, arch) || (req.EmulationAllowed() && !req.KVM)
+					if !ok {
+						continue
+					}
 				}
 				rows = append(rows, listRow{
 					ID: c.ID(), Severity: c.Metadata.Severity, States: c.DeclaredStates(),

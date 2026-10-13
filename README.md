@@ -286,6 +286,21 @@ doubles as a to-do list for the detection ecosystem — `vulnsuite list` shows
 the DETECTED BY column, and `custom-only` marks targets that exist purely to
 test your own detection.
 
+## Fidelity and host requirements
+
+Every target declares a **fidelity**: `real` runs the genuine affected software
+(the default and strongly preferred); `simulated` is a stand-in, only for
+bare-OS / device / protocol flaws with no reproducible image. `vulnsuite list
+-fidelity real|simulated` filters them.
+
+A target that only runs on a particular host declares a **`requires`** block
+(host `arch`, `/dev/kvm`, container-host `host_os`). `vulnsuite run` and
+`build` preflight it against the daemon's OS/arch and **skip with a reason**
+rather than hanging -- so a KVM / Windows-VM target is skipped cleanly on an
+Apple Silicon Mac -- or run cross-arch images under emulation (`--platform`).
+`-ignore-requires` overrides; `list -arch <a>` hides targets that can't run on
+that arch. See [docs/CONTRACT.md](docs/CONTRACT.md).
+
 ## Container hardening
 
 The real isolation for a knowingly-vulnerable target is the no-egress internal

@@ -102,10 +102,18 @@ type NetworkSpec struct {
 	Internal bool
 }
 
+// HostInfo describes the daemon's platform.
+type HostInfo struct {
+	OS   string // linux, windows
+	Arch string // amd64, arm64, ...
+}
+
 // Engine is the container backend.
 type Engine interface {
 	// Ping checks connectivity and returns the engine's version string.
 	Ping(ctx context.Context) (string, error)
+	// Info returns the daemon's OS/arch, for preflighting target requirements.
+	Info(ctx context.Context) (HostInfo, error)
 
 	ImageExists(ctx context.Context, ref string) (bool, error)
 	// ImagePull pulls ref, streaming progress text to out (may be nil).

@@ -349,6 +349,30 @@ type Metadata struct {
 	DetectedBy []string `yaml:"detected_by,omitempty" json:"detected_by,omitempty"`
 }
 
+// Requires declares what the container host must provide for a target to run.
+// The tooling preflights it against the detected host and skips, or runs under
+// emulation, with a precise reason instead of hanging.
+type Requires struct {
+	// HostOS is the container-host OS(es) the target supports (default [linux]).
+	HostOS []string `yaml:"host_os,omitempty" json:"host_os,omitempty"`
+	// Arch is the host CPU arch(es) the target runs on natively (empty = any).
+	Arch []string `yaml:"arch,omitempty" json:"arch,omitempty"`
+	// Emulation permits running under qemu when the host arch is not in Arch
+	// (default true). Set false for timing-sensitive or virt-backed targets.
+	Emulation *bool `yaml:"emulation,omitempty" json:"emulation,omitempty"`
+	// KVM marks a target that needs /dev/kvm + nested virtualization (e.g. a
+	// Windows guest via dockur/windows); only a linux/amd64 host provides it.
+	KVM bool `yaml:"kvm,omitempty" json:"kvm,omitempty"`
+}
+
+// EmulationAllowed reports whether qemu emulation is permitted (default true).
+func (r Requires) EmulationAllowed() bool { return r.Emulation == nil || *r.Emulation }
+
+// Empty reports whether no requirements are declared.
+func (r Requires) Empty() bool {
+	return len(r.HostOS) == 0 && len(r.Arch) == 0 && r.Emulation == nil && !r.KVM
+}
+
 // Contract is a fully loaded target template.
 type Contract struct {
 	APIVersion string            `yaml:"apiVersion" json:"apiVersion"`
@@ -356,6 +380,7 @@ type Contract struct {
 	Metadata   Metadata          `yaml:"metadata" json:"metadata"`
 	Base       Base              `yaml:"base" json:"base"`
 	Service    Service           `yaml:"service" json:"service"`
+	Requires   Requires          `yaml:"requires,omitempty" json:"requires,omitempty"`
 	States     map[string]*State `yaml:"states" json:"states"`
 
 	// Folder is the template directory; SourcePath the contract file. Both

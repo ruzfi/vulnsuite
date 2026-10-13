@@ -1,330 +1,193 @@
-# vulnsuite
+# The target contract (`vulnsuite/v1`)
 
-**Build vulnerable systems on purpose.** Point vulnsuite at a
-template and it builds a reproducible, content-addressed Docker image of a
-vulnerable system (and of its patched twin), runs it in a known state, and
-proves that state with an independent verify probe — so you can validate any
-scanner, exploit, or detection rule against ground truth instead of guesswork.
+A template is a folder holding a `contract.yaml` (also accepted:
+`contract.yml`, `template.yaml`) and the files it references. Everything is
+relative to that folder, so a template is self-contained.
 
 ```
-vulnsuite update-templates                       # fetch ruzfi/vulnsuite-templates
-vulnsuite build -t web-servers                   # build every web-server target, 4 in parallel
-vulnsuite run -t apache-httpd-2.4.49-cve-2021-41773 -expose host
-#   verify: ok -- confirmed vulnerable
-#   Scan these with your probe:
-#     apache-httpd-2.4.49-cve-2021-41773 [vulnerable]   http://127.0.0.1:49152
+<category>/<id>/
+  contract.yaml        required
+  files/...            overlay files, patched sources, configs
+  patches/...          git patches for source bases
+  src/                 Dockerfile + source for a `build` base
 ```
 
-The scanner is **not** part of vulnsuite. You bring your own.
+Unknown fields are rejected. The machine-readable form of this document is
+[`schemas/contract.schema.json`](../schemas/contract.schema.json).
 
-## Why
+## Top level
 
-Validating a vulnerability scanner means answering, for every template it
-ships: *does it fire on a system that is really vulnerable, and stay quiet on
-the same system once it is fixed?* Doing that by hand — finding the right
-version, building it, breaking it, un-breaking it — does not scale past a
-handful of CVEs. vulnsuite turns that work into a template anyone can
-contribute once and everyone can run anywhere with Docker.
+| Field | Required | Value |
+| --- | --- | --- |
+| `apiVersion` | yes | `vulnsuite/v1` (`range.legacy/v2` loads with a warning) |
+| `kind` | yes | `Target` |
+| `metadata` | yes | identity and provenance |
+| `base` | yes | the pinned foundation |
+| `service` | yes | how the target is run |
+| `states` | yes | `vulnerable` (required) and `patched` |
 
-- **Templates are a portable contract.** One folder per target, a
-  `contract.yaml` plus the files it references. Nix-inspired: the base is
-  pinned (an image digest, or a source repo at a commit) and each state is
-  reached by a config overlay and/or a patch. Templates sharing a base reuse
-  one build.
-- **Images are content-addressed.** A built image is tagged by a hash of its
-  inputs. Identical inputs never rebuild. `vulnsuite build -push` publishes
-  immutable `:<state>-<hash>` and moving `:<state>` tags to any registry.
-- **Every run is verified.** A state's `verify` probes are written from the
-  advisory, not copied from a scanner's matcher. A target that does not pass
-  its own probe is not handed to you.
-- **Fleet-friendly.** Run many targets at once, each with its own IP on an
-  internal network; `vulnsuite targets` prints the exact URLs with the right
-  ports so you scan those instead of sweeping a subnet.
-- **Single static binary.** Talks to the daemon through the official Moby
-  SDK (`github.com/moby/moby/client`), with a built-in dependency-free
-  Engine API client as an alternative (`-engine api`). Works with Docker
-  Engine, Docker Desktop, OrbStack, Colima and Podman's Docker-compatible
-  socket; `DOCKER_HOST` and the usual `DOCKER_*` variables are honoured.
+## `metadata`
 
-## The idea
+| Field | Required | Notes |
+| --- | --- | --- |
+| `id` | yes | `^[a-z0-9][a-z0-9.-]{2,79}$`; unique; `<product>-<version>-<cve>` by convention. Also the container's network alias. |
+| `summary` | yes | one line: what and how |
+| `vuln_refs` | | `CVE-YYYY-NNNN`, `GHSA-...`, or `PREFIX-ID` for flaws without a CVE (community templates use `VS-...`) |
+| `cwe` | | `CWE-NN` |
+| `severity` | | `info`, `low`, `medium`, `high`, `critical` |
+| `tags` | | free-form; `vulnsuite list -tag` filters on them |
+| `references` | | the advisory and the fix |
+| `maintainer` | | who to ask |
+| `added` | | `YYYY-MM-DD` |
+| `fidelity` | | `real` = runs the genuine affected software (the default and strongly preferred); `simulated` = a hand-written stand-in that reproduces the behaviour. Only use `simulated` when no public image or buildable upstream source reproduces the flaw (bare-OS/device/protocol sims). |
+| `detected_by` | | the scanner templates that detect this target, as `<scanner>:<id>` (`nuclei:CVE-2021-41773`, `nuclei:laravel-env`). Declaring one means "this should fire on vulnerable and stay silent on patched". |
+| `detection` | | `scanner`: the `detected_by` entries are **verified** (you ran the scanner against both states); `custom-only`: no public scanner template exists, the target tests your own detection. Unset with `detected_by` present = declared, not yet verified. Unset with nothing declared = a detection gap (`validate` warns; write a template and contribute it upstream). |
 
-This started as a very practical frustration: validating a vulnerability
-scanner means standing up the vulnerable system for each template it ships,
-confirming the flaw is really there, then fixing it and confirming the scanner
-goes quiet. Doing that by hand, one machine at a time, for hundreds of CVEs
-does not scale. Nuclei had already shown that *detection* scales when it is
-written as a small, portable, community-maintained template. The obvious
-question was: why not the same thing for *deployment*? A nuclei-style template
-that, instead of describing how to find a vulnerability, describes how to
-build and run it. That question is this project.
+## `base`
 
-vulnsuite was designed and written with the help of AI, as a deliberate
-experiment in **collaborative intelligence**: the problem, the constraints and
-every design decision (the contract format, pinning, content-addressed builds,
-independent verification, the exposure modes) came from hands-on scanner
-validation work; the implementation, the tests and much of the documentation
-were produced together with an AI assistant and reviewed line by line. The
-templates repository carries an authoring guide ([SKILL.md](https://github.com/ruzfi/vulnsuite-templates/blob/main/SKILL.md))
-written so that the same collaboration works for contributors: hand an
-assistant a CVE or a scanner template and the guide, and it can draft a
-validated target for you to review. We think that is how a catalog of
-thousands of reproducible targets actually gets built.
-
-## Automating the whole loop
-
-Everything vulnsuite does is scriptable, which is the point: a target is only
-useful as ground truth if a machine can stand it up, prove it, scan it and
-tear it down without a human in the loop.
-
-- Every command takes `-json` and returns structured output (progress goes
-  to stderr), and exits non-zero when a target fails to build, start or
-  verify.
-- `vulnsuite run -detach -targets-file` plus `vulnsuite targets` give a
-  scanner exactly the URLs to hit; `vulnsuite stop` cleans up.
-- The Go packages (`loader`, `builder`, `runner`, `probes`) are importable,
-  so a pipeline can drive targets directly and read verify results as values
-  instead of parsing text.
-- Built images are content-addressed and can be pushed to a registry, so CI
-  can pre-build once and run many validation jobs against the same immutable
-  image.
-
-A typical end-to-end use: for every scanner template you ship, bring up the
-matching target **vulnerable**, run the scanner and expect a hit; bring it up
-**patched**, run the scanner and expect silence. A template that fires on
-patched is a false positive you just caught before a customer did; one that
-is silent on vulnerable is a false negative. Run that nightly against the
-scanner's current template set and regressions surface the day they land.
-vulnsuite gives that loop its ground truth; the scoring and reporting on top
-is a few dozen lines in whatever language your pipeline speaks.
-
-## Prior art and neighbours
-
-- **[nuclei](https://github.com/projectdiscovery/nuclei)** is the model for
-  the template-driven, community-maintained approach, and the scanner most
-  people will validate first. vulnsuite is its mirror image: nuclei templates
-  say how to detect, vulnsuite templates say how to deploy.
-- **[pocsuite3](https://github.com/knownsec/pocsuite3)** (Knownsec 404) is a
-  PoC and exploit framework. It can start a Docker environment declared in a
-  PoC (`--docker-start`) so you have something to test against, but that is
-  a convenience inside a scanner: a single unpinned image, no patched twin, no
-  verification. vulnsuite is the other half of that picture, a dedicated,
-  verified, reproducible target provisioner that frameworks like pocsuite3 or
-  nuclei can be pointed at.
-- **Vulhub, DVWA, Metasploitable, VulnHub** and similar collections provide
-  vulnerable environments, usually as hand-written compose files or VM images,
-  with no notion of a patched counterpart, a pinned base, or a probe that
-  proves the state. Several of them are excellent sources for *authoring*
-  vulnsuite templates.
-
-## Install
-
-```bash
-go install github.com/ruzfi/vulnsuite/cmd/vulnsuite@latest
-# or grab a release binary from GitHub Releases
-```
-
-Requirements: a reachable Docker daemon (`DOCKER_HOST` is honoured). `git` is
-needed only for templates with a `source` base or a `patch`.
-
-## Templates
-
-Community templates live in [ruzfi/vulnsuite-templates](https://github.com/ruzfi/vulnsuite-templates).
-`vulnsuite update-templates` fetches them into `~/vulnsuite-templates`; the
-templates directory is otherwise `-templates DIR`, `$VULNSUITE_TEMPLATES`, or
-the repository you are standing in.
-
-A template:
+Exactly one of three shapes.
 
 ```yaml
-apiVersion: vulnsuite/v1
-kind: Target
-metadata:
-  id: apache-httpd-2.4.49-cve-2021-41773
-  summary: Apache httpd 2.4.49 path traversal via an aliased directory.
-  vuln_refs: [CVE-2021-41773]
-  severity: high
-  references: [https://httpd.apache.org/security/vulnerabilities_24.html]
-base:
-  kind: image                 # or: source (repo + commit), build (local Dockerfile)
-  image: httpd:2.4.49
-  digest: sha256:...          # pin it -> reproducible on any device
-service:
-  ports: [ { container: 80, protocol: http } ]
-  healthcheck: { http: { path: /, status: 200 }, timeout: 60s }
-states:
-  vulnerable:
-    overlay: [ { src: files/vuln/httpd.conf, dest: /usr/local/apache2/conf/httpd.conf } ]
-    verify:  [ { http: { raw_path: "/icons/.%2e/%2e%2e/etc/passwd", status: 200, body_matches: "root:.*:0:0:" } } ]
-  patched:
-    overlay: [ { src: files/fixed/httpd.conf, dest: /usr/local/apache2/conf/httpd.conf } ]
-    verify:  [ { http: { raw_path: "/icons/.%2e/%2e%2e/etc/passwd", status_in: [403, 404] } } ]
+base: { kind: image, image: httpd:2.4.49, digest: sha256:... }         # prebuilt image
+base: { kind: source, repo: https://..., commit: abc123, dockerfile: Dockerfile, build_args: {} }
+base: { kind: build, context: src, dockerfile: Dockerfile, build_args: {} }
 ```
 
-Four ways a state reaches its image, cheapest first:
+- `image` must pin `digest` to be reproducible (`validate` errors otherwise;
+  `-allow-unpinned` downgrades it while authoring). Get it with
+  `docker manifest inspect <image> -v | grep -m1 digest` or `docker buildx imagetools inspect <image>`.
+- `source` pins `commit`; the state's `patch` is applied on top.
+- `build` points at a folder inside the template with a Dockerfile; it is
+  self-contained and therefore always considered pinned.
 
-| Kind | How | When |
-| --- | --- | --- |
-| `image` | run a prebuilt image as-is | pure version CVE (vulnerable vs patched = two tags) |
-| `overlay` | image + config files baked into a tiny generated Dockerfile | the flaw is a config toggle |
-| `source` | clone a repo at a pinned commit, apply a patch, build | RC / unreleased vulnerable revisions |
-| `build` | a Dockerfile + source inside the template | no public image reproduces it (simulations, devices) |
+## `service`
 
-The full field reference is [docs/CONTRACT.md](docs/CONTRACT.md); the JSON
-schema for editors and CI is [schemas/contract.schema.json](schemas/contract.schema.json).
+| Field | Notes |
+| --- | --- |
+| `ports` | required; `{ container: 80, protocol: http }`. Protocols: `http`, `https`, `tcp`, `ssh`, `ftp`, `smtp`, `redis`, `mysql`, `postgres`. The first HTTP port (else the first port) is the one a scanner is pointed at. |
+| `command` | string or list; overrides the image command |
+| `environment` | map; merged with the state's environment (state wins) |
+| `healthcheck` | `{ http: { path, status }, timeout: 60s }` or `{ tcp: { port }, timeout }`; `timeout` is `<n>s|m|h` |
+| `sidecars` | helper containers `{ name, image, digest, environment }` started on the same network, reachable by `name` |
+| `user` | run-as `uid` or `uid:gid` |
+| `cap_add` / `cap_drop` | Linux capabilities, e.g. `cap_drop: [ALL]` then `cap_add: [CAP_NET_BIND_SERVICE]` |
+| `devices` | host devices to pass through, e.g. `/dev/kvm` |
 
-## Commands
+## `requires`
 
-```
-vulnsuite list [selector] [-tag TAG]                templates, with state availability
-vulnsuite validate [-t SEL]... [-strict]            structure + semantic lint
-vulnsuite build -t SEL... | -all [-j N] [-push -registry REG]
-vulnsuite run [vulnerable|patched] -t SEL... | -all [-expose MODE] [-detach]
-vulnsuite ps                                        running targets (id, state, ip)
-vulnsuite targets [-file FILE] [-by ip|alias|host]  scannable URLs, right port per template
-vulnsuite stop [-t SEL]... [-prune-net]             tear down
-vulnsuite images [-rm]                              locally built images
-vulnsuite update-templates                          fetch / update the community templates
-```
-
-`-json` on any command gives machine-readable output (progress goes to stderr).
-`-engine sdk|api` (or `$VULNSUITE_ENGINE`) picks the daemon client: the Moby
-SDK by default, or the built-in API client.
-A selector is a folder (`web-servers`), a contract file, or a template id (a
-unique substring works: `-t grafana`).
-
-### Building images
-
-`build` is the heart of vulnsuite: it resolves every requested state to an
-image, in parallel, and skips anything whose content hash already exists.
-
-```bash
-vulnsuite build -all -j 8                      # everything, 8 at a time
-vulnsuite build -t iot -state vulnerable        # one state for a category
-vulnsuite build -t grafana -force -no-cache     # rebuild from scratch
-vulnsuite build -all -push -registry ghcr.io/you/vulnsuite
-```
-
-Built images carry labels (`dev.vulnsuite.id`, `.state`, `.hash`,
-`.vuln_refs`) and bake the state's environment in, so a published image is
-self-contained: `docker run ghcr.io/you/vulnsuite/<id>:vulnerable` is the
-vulnerable target, no vulnsuite needed.
-
-### Running and verifying
-
-```bash
-vulnsuite run -t exposures -t redis-unauthenticated-access     # a category + one id
-vulnsuite run -all -detach -targets-file targets.txt            # the fleet, in the background
-vulnsuite run patched -t grafana -expose host -host-port 3000   # the fixed twin, on localhost:3000
-```
-
-Every run waits for the healthcheck, then executes the state's `verify`
-probes and prints `verify: ok` (or exactly which assertion failed). Up to 10
-targets run at once by default (`-max-concurrent`); a bigger batch starts as
-many as fit and reports the rest.
-
-### Exposure modes — how your scanner reaches the target
-
-| Mode | What happens | Use when |
-| --- | --- | --- |
-| `internal` (default) | the target joins the `vulnsuite-net` Docker network; nothing is published on the host | your scanner runs as a container (`docker run --network vulnsuite-net ...`) or your host routes to container IPs (Linux, OrbStack) |
-| `host` | the port is published on `127.0.0.1` (or `-bind 0.0.0.0`); one host port per target | the scanner is on the host or elsewhere on the network |
-| `macvlan` | the target gets its own IP on the LAN via `-parent eth0` | the target must look like a separate device |
-
-On Docker Desktop the host cannot reach container IPs; vulnsuite notices and
-tells you to scan from a container or use `-expose host` instead of waiting
-out the healthcheck.
-
-### Scanning the fleet (Nuclei or anything else)
-
-Don't sweep the subnet — ask vulnsuite for the live targets with their real ports:
-
-```bash
-vulnsuite run -t exposures -detach
-vulnsuite targets -file targets.txt          # scheme://ip:port per running target
-nuclei -l targets.txt
-# or from inside the network:
-docker run --rm --network vulnsuite-net -v $PWD:/w projectdiscovery/nuclei -l /w/targets.txt
-```
-
-Each template says whether a stock scanner can find it: `detection: scanner`
-targets reproduce a named public template's fingerprint (`detected_by:
-["nuclei:laravel-env"]`), `detection: custom-only` targets have no public
-template and exist to test *your* detection.
-
-## Which scanner template finds this target?
-
-Every template can name the scanner templates that detect it, so deploying a
-target also tells you what to point at it:
+What the container host must provide. The tooling preflights it against the
+detected daemon (OS/arch) and either runs natively, runs under emulation, or
+skips with a reason -- instead of hanging on a host that cannot run the target.
 
 ```yaml
-metadata:
-  detected_by: ["nuclei:CVE-2021-41773"]   # declared: from the upstream template's fingerprint
-  detection: scanner                        # verified: fires on vulnerable, silent on patched
+requires:
+  host_os: [linux]     # container-host OS(es); default [linux]
+  arch: [amd64]        # host CPU arch(es) that run natively; empty = any
+  emulation: false     # allow qemu when host arch is not in arch (default true)
+  kvm: true            # needs /dev/kvm + nested virt (a linux/amd64 host)
 ```
 
-`vulnsuite info <id>` and every `vulnsuite run` print them. With a
-nuclei-templates checkout on the machine (`$NUCLEI_TEMPLATES`,
-`~/nuclei-templates`, or `-nuclei-templates DIR`) the ids are resolved to
-files, templates matching the target's CVEs that nobody declared yet are
-suggested, and `vulnsuite validate` warns about ids that don't exist:
+Preflight decisions (`vulnsuite run` / `build`):
 
+| Situation | Result |
+| --- | --- |
+| `arch` empty or includes the host arch | native |
+| host arch not in `arch`, `emulation` true, linux host | emulated (`--platform linux/<arch>`, with a warning) |
+| host arch not in `arch`, `emulation` false | skip (reason) |
+| `kvm: true` on a non-`linux/amd64` host | skip (reason) |
+| `host_os` set and the daemon OS is not in it | skip (reason) |
+
+A skipped target is reported and the rest of the batch continues;
+`-ignore-requires` runs it anyway. `list -arch <a>` hides targets that cannot
+run on that arch.
+
+## `states`
+
+`vulnerable` is required; `patched` is strongly recommended (without it a
+scanner's discrimination cannot be checked). Each state:
+
+| Field | Notes |
+| --- | --- |
+| `image` / `digest` | per-state image override — the cheapest "patched": a newer tag |
+| `patch` | a git patch applied to a `source` or `build` base |
+| `overlay` | `[{ src, dest, mode }]` files from the template baked into the image (`image` base) or written into the build context (`source`/`build` base) |
+| `environment` | baked into built images and passed at run time |
+| `command` | per-state command override |
+| `seed` | `[{ run: "..." }]` shell steps executed inside the container once it is up |
+| `verify` | probes that prove the state |
+
+How a state's image is produced (`vulnsuite list` shows it as KIND):
+
+| Base | State has | Build kind | Image tag |
+| --- | --- | --- | --- |
+| `image` | nothing / `image` override | `image` (pull) | the pinned ref |
+| `image` | `overlay` | `overlay` | `vulnsuite/<id>:<state>-<hash>` |
+| `source` | anything | `source` | `vulnsuite/<id>:<state>-<hash>` |
+| `build` | anything | `build` | `vulnsuite/<id>:<state>-<hash>` |
+
+`<hash>` covers the base identity, the build context tree, the patch, every
+overlay's content and destination, the environment and build args. Identical
+inputs produce an identical tag and are never rebuilt.
+
+## `verify` probes
+
+Exactly one kind per probe. Probes are independent of any scanner: they
+demonstrate the *impact* from the advisory, not a matcher.
+
+```yaml
+- http:
+    method: GET                   # default GET
+    raw_path: "/a/..%2e/etc/passwd"   # sent verbatim (traversal payloads survive); or
+    path: /api/debug/env          # an ordinary path (may include a query)
+    headers: { X-Forwarded-For: "127.0.0.1" }
+    body: "..."
+    status: 200                   # or
+    status_in: [403, 404]
+    body_matches: "root:.*:0:0:"  # Go regexp, dot matches newline
+    body_absent: "root:"
+    header_matches: { Location: "^https?://evil" }
+    header_absent: [Set-Cookie]
+    timeout: 10                   # seconds
+- tcp:
+    port: 6379
+    send: "PING\r\n"
+    banner_matches: "\\+PONG"
+- exec:
+    run: "cat /etc/shadow"
+    expect_exit: 0
+    stdout_matches: "root:"
 ```
-$ vulnsuite info ssh-version-cve-2018-15473
-...
-scanner templates:
-  none known. No scanner template is linked to this target, and the local
-  nuclei-templates checkout has none for CVE-2018-15473.
-  this is a detection gap: a target exists but nothing can find it. Write a
-  nuclei template for it, verify it against both states, contribute it
-  upstream (https://github.com/projectdiscovery/nuclei-templates), then add
-  nuclei:<id> to detected_by in ssh-version-cve-2018-15473/contract.yaml
-```
 
-That last case is the point: a vulnsuite target with no scanner template is a
-ready-made, verified test bed for writing one. The template catalog therefore
-doubles as a to-do list for the detection ecosystem — `vulnsuite list` shows
-the DETECTED BY column, and `custom-only` marks targets that exist purely to
-test your own detection.
+HTTP probes are sent over a raw socket so the request line is exactly what the
+template says. Chunked responses are decoded. `https` ports skip certificate
+verification. A `status`-only assertion on the vulnerable state is a
+`weak-verify` warning: assert the body or a header.
 
-Every target also declares a **fidelity**: `real` (runs the genuine affected
-software -- the default and what most targets are) or `simulated` (a stand-in,
-only for bare-OS / device / protocol flaws with no reproducible image).
-`vulnsuite list -fidelity real` / `-fidelity simulated` filters them, and the
-FIDELITY column shows it at a glance.
+Probes run from the vulnsuite host against the container's IP (internal /
+macvlan) or the published port (host). Where the host cannot route to
+container IPs (Docker Desktop), verification is skipped with an explanation
+rather than failed; use `-expose host` or scan from a container.
 
-## Container hardening
+## Validation rules
 
-The real isolation for a knowingly-vulnerable target is the no-egress internal
-network (`-no-egress`) and a dedicated host — not stripping Linux
-capabilities. Targets run with `no-new-privileges` and Docker's default
-capability set (which already excludes `SYS_ADMIN`, `NET_ADMIN`,
-`SYS_PTRACE`, ...); stock images need caps from that set just to boot. A
-contract can tighten per target with `service.cap_drop: [ALL]`, `cap_add`,
-`user`, or pass through `devices` (e.g. `/dev/kvm` for VM-backed targets).
+`vulnsuite validate` reports, per template:
 
-## Using vulnsuite as a library
+| Rule | Level | Meaning |
+| --- | --- | --- |
+| `unpinned-base` | error (warning with `-allow-unpinned`) | image has no digest / source has no commit |
+| `missing-context`, `missing-dockerfile`, `missing-patch`, `missing-overlay` | error | a referenced file is not in the template |
+| `patch-needs-source` | error | a patch on an `image` base |
+| `empty-verify` | error | an http probe asserts nothing |
+| `bad-regex`, `bad-timeout` | error | malformed values |
+| `duplicate-id` | error | two templates share an id |
+| `no-patched`, `no-verify`, `weak-verify`, `identical-states` | warning | the template proves less than it could |
+| `source-no-diff` | warning | a source base where states have no patch/image difference |
+| `no-healthcheck`, `no-vuln-ref`, `no-references`, `scanner-unnamed` | warning | missing provenance |
+| `no-detected-by` | warning | no scanner template linked and `detection` unset |
+| `fidelity-unset` | warning | metadata.fidelity is not set (real or simulated) |
+| `simulated-on-image-base` | warning | fidelity: simulated but the base is a prebuilt image |
+| `kvm-without-requires` | warning | service.devices has /dev/kvm but requires.kvm is not set |
+| `unknown-scanner-template`, `undeclared-scanner-template` | warning | with a nuclei-templates checkout: a declared id does not exist / a template for the target's CVE is not declared |
+| `legacy-apiversion` | warning | `range.legacy/v2` |
 
-Every package under `pkg/` is importable: `loader` finds and parses
-templates, `validator` lints them, `builder` and `runner` do the work on any
-`engine.Engine` (`engine/moby` wraps the official SDK, `engine/docker` is the
-built-in client, `engines.New` picks one), and `engine/enginetest` is an
-in-memory engine for tests.
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-
-```go
-store := loader.New("/path/to/vulnsuite-templates")
-c, _ := store.LoadSelector("grafana-8.3.0-cve-2021-43798")
-eng, _ := engines.New("sdk", "")
-h, _ := runner.New(eng).Run(ctx, c, "vulnerable", runner.DefaultExposure(), runner.Options{Verify: true})
-fmt.Println(h.ScannerTarget(), *h.VerifyOK)
-```
-
-## Contributing
-
-Templates go to [vulnsuite-templates](https://github.com/ruzfi/vulnsuite-templates);
-engine and CLI changes here. See [CONTRIBUTING.md](CONTRIBUTING.md) — commits
-follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/).
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+`-strict` turns warnings into failures (use it in CI).

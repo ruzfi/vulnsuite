@@ -12,6 +12,7 @@ import (
 
 	"github.com/ruzfi/vulnsuite/pkg/builder"
 	"github.com/ruzfi/vulnsuite/pkg/contract"
+	"github.com/ruzfi/vulnsuite/pkg/runner"
 )
 
 func parseStates(s string) ([]string, error) {
@@ -44,7 +45,7 @@ type buildResult struct {
 
 func cmdBuild() *Command {
 	var sel multiFlag
-	var all, noCache, force, noPull, push, showLog bool
+	var all, noCache, force, noPull, push, showLog, ignoreRequires bool
 	var states, registry, platform string
 	var jobs int
 	return &Command{
@@ -70,6 +71,7 @@ VULNSUITE_REGISTRY_USER / VULNSUITE_REGISTRY_TOKEN or ~/.docker/config.json.`,
 			fs.BoolVar(&push, "push", false, "push the images to -registry after building")
 			fs.StringVar(&registry, "registry", "", "registry prefix for -push, e.g. ghcr.io/ruzfi/vulnsuite")
 			fs.BoolVar(&showLog, "log", false, "print the full engine output of every build")
+			fs.BoolVar(&ignoreRequires, "ignore-requires", false, "build even when the host does not meet a target's requires")
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
 			sel = append(sel, args...)
@@ -106,7 +108,41 @@ VULNSUITE_REGISTRY_USER / VULNSUITE_REGISTRY_TOKEN or ~/.docker/config.json.`,
 			if err != nil {
 				return err
 			}
+			host, err := eng.Info(ctx)
+			if err != nil {
+				return err
+			}
 			b := builder.New(eng)
+			// Preflight each job's target: skip unsupported hosts, emulate cross-arch.
+			platformFor := map[string]string{}
+			var kept []builder.Job
+			for _, j := range jobsList {
+				if j.Contract.Requires.Empty() {
+					kept = append(kept, j)
+					continue
+				}
+				d := runner.Preflight(j.Contract.Requires, host)
+				if d.Skip() && !ignoreRequires {
+					g.errorf("skip %s [%s]: %s\n", j.Contract.ID(), j.State, d.Reason)
+					continue
+				}
+				if d.Action == runner.ActionEmulated {
+					platformFor[j.Contract.ID()] = d.Platform
+				}
+				kept = append(kept, j)
+			}
+			jobsList = kept
+			if len(jobsList) == 0 {
+				return fmt.Errorf("nothing to build (all targets skipped by host requirements; -ignore-requires to override)")
+			}
+			if platform == "" && len(platformFor) > 0 {
+				// emulate: pick the single platform (targets needing emulation on
+				// this host all target the same arch).
+				for _, pf := range platformFor {
+					platform = pf
+				}
+				g.printf("building under emulation for %s (host is %s/%s)\n", platform, host.OS, host.Arch)
+			}
 			g.printf("building %d image(s) with %d worker(s)...\n", len(jobsList), jobs)
 			started := time.Now()
 			results := make([]buildResult, 0, len(jobsList))

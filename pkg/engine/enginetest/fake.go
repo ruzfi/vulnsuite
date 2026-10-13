@@ -54,14 +54,19 @@ type Fake struct {
 	FailPull bool
 	nextIP   int
 	nextID   int
+	// Host is what Info reports (default linux/amd64).
+	Host engine.HostInfo
 }
 
 // New returns an empty fake.
 func New() *Fake {
-	return &Fake{Images: map[string]bool{}, Containers: map[string]*Container{}, Networks: map[string]engine.NetworkSpec{}}
+	return &Fake{Images: map[string]bool{}, Containers: map[string]*Container{}, Networks: map[string]engine.NetworkSpec{},
+		Host: engine.HostInfo{OS: "linux", Arch: "amd64"}}
 }
 
 func (f *Fake) Ping(context.Context) (string, error) { return "fake", nil }
+
+func (f *Fake) Info(context.Context) (engine.HostInfo, error) { return f.Host, nil }
 
 func (f *Fake) ImageExists(_ context.Context, ref string) (bool, error) {
 	f.mu.Lock()

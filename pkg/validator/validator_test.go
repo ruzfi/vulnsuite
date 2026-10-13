@@ -138,6 +138,19 @@ states:
 	}
 }
 
+func TestRequiresRules(t *testing.T) {
+	v := &Validator{}
+	doc := strings.Replace(base, "service: { ports: [ { container: 80, protocol: http } ], healthcheck: { tcp: { port: 80 }, timeout: 10s } }",
+		"service: { ports: [ { container: 80, protocol: http } ], devices: [\"/dev/kvm\"], healthcheck: { tcp: { port: 80 }, timeout: 10s } }", 1)
+	if rules(v.Check(parse(t, doc)))["kvm-without-requires"] != Warning {
+		t.Fatal("kvm-without-requires expected")
+	}
+	doc2 := strings.Replace(doc, "states:", "requires: { kvm: true, arch: [amd64] }\nstates:", 1)
+	if _, bad := rules(v.Check(parse(t, doc2)))["kvm-without-requires"]; bad {
+		t.Fatal("requires.kvm set should silence it")
+	}
+}
+
 func TestFidelityRules(t *testing.T) {
 	v := &Validator{}
 	// unset -> warn

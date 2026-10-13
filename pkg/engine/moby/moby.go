@@ -65,6 +65,15 @@ func (e *Engine) Ping(ctx context.Context) (string, error) {
 	return fmt.Sprintf("%s (api %s, %s/%s)", v.Version, v.APIVersion, v.Os, v.Arch), nil
 }
 
+// Info returns the daemon OS/arch.
+func (e *Engine) Info(ctx context.Context) (engine.HostInfo, error) {
+	v, err := e.cli.ServerVersion(ctx, client.ServerVersionOptions{})
+	if err != nil {
+		return engine.HostInfo{}, err
+	}
+	return engine.HostInfo{OS: v.Os, Arch: v.Arch}, nil
+}
+
 // -- images -------------------------------------------------------------------
 
 func (e *Engine) ImageExists(ctx context.Context, ref string) (bool, error) {

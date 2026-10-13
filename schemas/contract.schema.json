@@ -341,6 +341,46 @@
           "$ref": "#/$defs/state"
         }
       }
+    },
+    "requires": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "What the container host must provide; the tooling preflights it and skips or emulates with a reason.",
+      "properties": {
+        "host_os": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "linux",
+              "windows"
+            ]
+          },
+          "description": "container-host OS(es); default [linux]"
+        },
+        "arch": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "amd64",
+              "arm64",
+              "386",
+              "arm",
+              "ppc64le",
+              "s390x",
+              "riscv64"
+            ]
+          },
+          "description": "host CPU arch(es) that run natively; empty = any"
+        },
+        "emulation": {
+          "type": "boolean",
+          "description": "allow qemu emulation when the host arch is not in arch (default true)"
+        },
+        "kvm": {
+          "type": "boolean",
+          "description": "needs /dev/kvm + nested virtualization (a linux/amd64 host)"
+        }
+      }
     }
   },
   "$defs": {

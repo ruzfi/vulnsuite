@@ -50,6 +50,7 @@ func cmdRun() *Command {
 	var all, detach, noVerify, noPull, noCache, force bool
 	var maxConcurrent int
 	var targetsFile, platform, readyTimeout, nucleiDir string
+	var ignoreRequires bool
 	exp := runner.DefaultExposure()
 	return &Command{
 		Name:  "run",
@@ -81,6 +82,7 @@ Exposure modes:
 			fs.StringVar(&platform, "platform", "", "target platform for builds, e.g. linux/amd64")
 			fs.StringVar(&readyTimeout, "ready-timeout", "", "override every template's healthcheck timeout, e.g. 120s")
 			fs.StringVar(&nucleiDir, "nuclei-templates", "", "nuclei-templates checkout used to resolve the scanner templates shown for each target")
+			fs.BoolVar(&ignoreRequires, "ignore-requires", false, "run even when the host does not meet a target's requires (arch/kvm/host_os)")
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
 			state := contract.StateVulnerable
@@ -165,20 +167,41 @@ Exposure modes:
 			if !g.JSON && !g.Quiet {
 				opts.Build.Output = g.Stdout
 			}
+			host, herr := eng.Info(ctx)
+			if herr != nil {
+				return herr
+			}
 			var idx *scanners.Index
 			if dir := scanners.ResolveDir(nucleiDir); dir != "" {
 				idx, _ = scanners.Load(dir)
 			}
 			var handles []*runner.Handle
-			var failures []string
+			var failures, skippedReq []string
 			for _, c := range runnable {
 				if multi {
 					g.printf("\n=== [%s] %s ===\n", c.ID(), state)
 				} else {
 					g.printf("[%s] %s: %s\n", c.ID(), state, c.Metadata.Summary)
 				}
+				tgtOpts := opts
+				if !c.Requires.Empty() {
+					d := runner.Preflight(c.Requires, host)
+					switch {
+					case d.Skip() && !ignoreRequires:
+						g.printf("  skip %s: %s\n", c.ID(), d.Reason)
+						skippedReq = append(skippedReq, c.ID())
+						continue
+					case d.Skip() && ignoreRequires:
+						g.printf("  %s does not meet requires (%s) -- running anyway (-ignore-requires)\n", c.ID(), d.Reason)
+					case d.Action == runner.ActionEmulated:
+						g.printf("  %s: %s\n", c.ID(), d.Reason)
+						if tgtOpts.Build.Platform == "" {
+							tgtOpts.Build.Platform = d.Platform
+						}
+					}
+				}
 				g.printf("resolving image (%s)...\n", c.BuildKind(state))
-				h, err := r.Run(ctx, c, state, exp, opts)
+				h, err := r.Run(ctx, c, state, exp, tgtOpts)
 				if err != nil {
 					g.errorf("  could not run %s: %v\n", c.ID(), err)
 					failures = append(failures, c.ID())
@@ -238,6 +261,10 @@ Exposure modes:
 			}
 			if len(failures) > 0 {
 				g.errorf("\n%d failed to start: %s\n", len(failures), strings.Join(failures, ", "))
+			}
+			if len(skippedReq) > 0 {
+				g.printf("\n%d skipped (host does not meet requires): %s\n", len(skippedReq), strings.Join(skippedReq, ", "))
+				g.printf("  override with -ignore-requires, or run on a matching host.\n")
 			}
 			if len(overCap) > 0 {
 				ids := make([]string, 0, len(overCap))

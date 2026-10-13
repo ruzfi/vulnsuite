@@ -144,6 +144,27 @@ states:
 	}
 }
 
+func TestRequires(t *testing.T) {
+	c, _ := Parse([]byte(minimal))
+	if !c.Requires.Empty() || !c.Requires.EmulationAllowed() {
+		t.Fatal("default requires empty, emulation allowed")
+	}
+	doc := strings.Replace(minimal, "service:", "requires:\n  host_os: [linux]\n  arch: [amd64]\n  kvm: true\n  emulation: false\nservice:", 1)
+	c, err := Parse([]byte(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Requires.Empty() || !c.Requires.KVM || c.Requires.EmulationAllowed() || c.Requires.Arch[0] != "amd64" {
+		t.Fatalf("requires: %+v", c.Requires)
+	}
+	if _, err := Parse([]byte(strings.Replace(minimal, "service:", "requires:\n  arch: [sparc]\nservice:", 1))); err == nil {
+		t.Fatal("bad arch must reject")
+	}
+	if _, err := Parse([]byte(strings.Replace(minimal, "service:", "requires:\n  host_os: [macos]\nservice:", 1))); err == nil {
+		t.Fatal("bad host_os must reject")
+	}
+}
+
 func TestDurations(t *testing.T) {
 	for in, want := range map[string]string{"60s": "1m0s", "5m": "5m0s", "1h": "1h0m0s", "": "1m0s"} {
 		d, err := ParseDuration(in, 60e9)

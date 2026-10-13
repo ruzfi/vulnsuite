@@ -36,6 +36,7 @@ type rawContract struct {
 	Metadata   Metadata             `yaml:"metadata"`
 	Base       Base                 `yaml:"base"`
 	Service    rawService           `yaml:"service"`
+	Requires   Requires             `yaml:"requires"`
 	States     map[string]*rawState `yaml:"states"`
 }
 
@@ -86,6 +87,8 @@ var (
 		"smtp": true, "redis": true, "mysql": true, "postgres": true}
 	detections = map[string]bool{"scanner": true, "custom-only": true}
 	fidelities = map[string]bool{"real": true, "simulated": true}
+	hostOSes   = map[string]bool{"linux": true, "windows": true}
+	arches     = map[string]bool{"amd64": true, "arm64": true, "386": true, "arm": true, "ppc64le": true, "s390x": true, "riscv64": true}
 )
 
 // Parse decodes and structurally validates a contract document. Semantic lint
@@ -100,6 +103,7 @@ func Parse(data []byte) (*Contract, error) {
 		Kind:       raw.Kind,
 		Metadata:   raw.Metadata,
 		Base:       raw.Base,
+		Requires:   raw.Requires,
 		Service: Service{
 			Ports:       raw.Service.Ports,
 			Command:     []string(raw.Service.Command),
@@ -206,6 +210,17 @@ func (c *Contract) checkStructure() error {
 	}
 	if b.Digest != "" && !digestRe.MatchString(b.Digest) {
 		return se("base/digest", "must look like sha256:<64 hex>")
+	}
+
+	for i, o := range c.Requires.HostOS {
+		if !hostOSes[o] {
+			return se(fmt.Sprintf("requires/host_os/%d", i), "%q is not one of linux, windows", o)
+		}
+	}
+	for i, a := range c.Requires.Arch {
+		if !arches[a] {
+			return se(fmt.Sprintf("requires/arch/%d", i), "%q is not a known GOARCH (amd64, arm64, ...)", a)
+		}
 	}
 
 	s := c.Service

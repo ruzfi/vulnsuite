@@ -85,6 +85,22 @@ writing a template and contributing it upstream.`,
 				ports = append(ports, fmt.Sprintf("%d/%s", p.Container, p.Protocol))
 			}
 			kv("ports", strings.Join(ports, ", "))
+			if !c.Requires.Empty() {
+				var parts []string
+				if len(c.Requires.HostOS) > 0 {
+					parts = append(parts, "host_os "+strings.Join(c.Requires.HostOS, "/"))
+				}
+				if len(c.Requires.Arch) > 0 {
+					parts = append(parts, "arch "+strings.Join(c.Requires.Arch, "/"))
+				}
+				if c.Requires.KVM {
+					parts = append(parts, "kvm")
+				}
+				if !c.Requires.EmulationAllowed() {
+					parts = append(parts, "no-emulation")
+				}
+				kv("requires", strings.Join(parts, ", "))
+			}
 			fmt.Fprintln(g.Stdout)
 			for _, name := range c.DeclaredStates() {
 				st := c.States[name]
