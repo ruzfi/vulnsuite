@@ -1,0 +1,159 @@
+# The target contract (`vulnsuite/v1`)
+
+A template is a folder holding a `contract.yaml` (also accepted:
+`contract.yml`, `template.yaml`) and the files it references. Everything is
+relative to that folder, so a template is self-contained.
+
+```
+<category>/<id>/
+  contract.yaml        required
+  files/...            overlay files, patched sources, configs
+  patches/...          git patches for source bases
+  src/                 Dockerfile + source for a `build` base
+```
+
+Unknown fields are rejected. The machine-readable form of this document is
+[`schemas/contract.schema.json`](../schemas/contract.schema.json).
+
+## Top level
+
+| Field | Required | Value |
+| --- | --- | --- |
+| `apiVersion` | yes | `vulnsuite/v1` (`range.legacy/v2` loads with a warning) |
+| `kind` | yes | `Target` |
+| `metadata` | yes | identity and provenance |
+| `base` | yes | the pinned foundation |
+| `service` | yes | how the target is run |
+| `states` | yes | `vulnerable` (required) and `patched` |
+
+## `metadata`
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `id` | yes | `^[a-z0-9][a-z0-9.-]{2,79}$`; unique; `<product>-<version>-<cve>` by convention. Also the container's network alias. |
+| `summary` | yes | one line: what and how |
+| `vuln_refs` | | `CVE-YYYY-NNNN`, `GHSA-...`, or `PREFIX-ID` for flaws without a CVE (community templates use `VS-...`) |
+| `cwe` | | `CWE-NN` |
+| `severity` | | `info`, `low`, `medium`, `high`, `critical` |
+| `tags` | | free-form; `vulnsuite list -tag` filters on them |
+| `references` | | the advisory and the fix |
+| `maintainer` | | who to ask |
+| `added` | | `YYYY-MM-DD` |
+| `detection` | | `scanner`: the target reproduces a real scanner template's fingerprint; `custom-only`: no public template exists |
+| `detected_by` | | the scanner templates it reproduces, e.g. `nuclei:laravel-env` |
+
+## `base`
+
+Exactly one of three shapes.
+
+```yaml
+base: { kind: image, image: httpd:2.4.49, digest: sha256:... }         # prebuilt image
+base: { kind: source, repo: https://..., commit: abc123, dockerfile: Dockerfile, build_args: {} }
+base: { kind: build, context: src, dockerfile: Dockerfile, build_args: {} }
+```
+
+- `image` must pin `digest` to be reproducible (`validate` errors otherwise;
+  `-allow-unpinned` downgrades it while authoring). Get it with
+  `docker manifest inspect <image> -v | grep -m1 digest` or `docker buildx imagetools inspect <image>`.
+- `source` pins `commit`; the state's `patch` is applied on top.
+- `build` points at a folder inside the template with a Dockerfile; it is
+  self-contained and therefore always considered pinned.
+
+## `service`
+
+| Field | Notes |
+| --- | --- |
+| `ports` | required; `{ container: 80, protocol: http }`. Protocols: `http`, `https`, `tcp`, `ssh`, `ftp`, `smtp`, `redis`, `mysql`, `postgres`. The first HTTP port (else the first port) is the one a scanner is pointed at. |
+| `command` | string or list; overrides the image command |
+| `environment` | map; merged with the state's environment (state wins) |
+| `healthcheck` | `{ http: { path, status }, timeout: 60s }` or `{ tcp: { port }, timeout }`; `timeout` is `<n>s|m|h` |
+| `sidecars` | helper containers `{ name, image, digest, environment }` started on the same network, reachable by `name` |
+| `user` | run-as `uid` or `uid:gid` |
+| `cap_add` / `cap_drop` | Linux capabilities, e.g. `cap_drop: [ALL]` then `cap_add: [CAP_NET_BIND_SERVICE]` |
+| `devices` | host devices to pass through, e.g. `/dev/kvm` |
+
+## `states`
+
+`vulnerable` is required; `patched` is strongly recommended (without it a
+scanner's discrimination cannot be checked). Each state:
+
+| Field | Notes |
+| --- | --- |
+| `image` / `digest` | per-state image override — the cheapest "patched": a newer tag |
+| `patch` | a git patch applied to a `source` or `build` base |
+| `overlay` | `[{ src, dest, mode }]` files from the template baked into the image (`image` base) or written into the build context (`source`/`build` base) |
+| `environment` | baked into built images and passed at run time |
+| `command` | per-state command override |
+| `seed` | `[{ run: "..." }]` shell steps executed inside the container once it is up |
+| `verify` | probes that prove the state |
+
+How a state's image is produced (`vulnsuite list` shows it as KIND):
+
+| Base | State has | Build kind | Image tag |
+| --- | --- | --- | --- |
+| `image` | nothing / `image` override | `image` (pull) | the pinned ref |
+| `image` | `overlay` | `overlay` | `vulnsuite/<id>:<state>-<hash>` |
+| `source` | anything | `source` | `vulnsuite/<id>:<state>-<hash>` |
+| `build` | anything | `build` | `vulnsuite/<id>:<state>-<hash>` |
+
+`<hash>` covers the base identity, the build context tree, the patch, every
+overlay's content and destination, the environment and build args. Identical
+inputs produce an identical tag and are never rebuilt.
+
+## `verify` probes
+
+Exactly one kind per probe. Probes are independent of any scanner: they
+demonstrate the *impact* from the advisory, not a matcher.
+
+```yaml
+- http:
+    method: GET                   # default GET
+    raw_path: "/a/..%2e/etc/passwd"   # sent verbatim (traversal payloads survive); or
+    path: /api/debug/env          # an ordinary path (may include a query)
+    headers: { X-Forwarded-For: "127.0.0.1" }
+    body: "..."
+    status: 200                   # or
+    status_in: [403, 404]
+    body_matches: "root:.*:0:0:"  # Go regexp, dot matches newline
+    body_absent: "root:"
+    header_matches: { Location: "^https?://evil" }
+    header_absent: [Set-Cookie]
+    timeout: 10                   # seconds
+- tcp:
+    port: 6379
+    send: "PING\r\n"
+    banner_matches: "\\+PONG"
+- exec:
+    run: "cat /etc/shadow"
+    expect_exit: 0
+    stdout_matches: "root:"
+```
+
+HTTP probes are sent over a raw socket so the request line is exactly what the
+template says. Chunked responses are decoded. `https` ports skip certificate
+verification. A `status`-only assertion on the vulnerable state is a
+`weak-verify` warning: assert the body or a header.
+
+Probes run from the vulnsuite host against the container's IP (internal /
+macvlan) or the published port (host). Where the host cannot route to
+container IPs (Docker Desktop), verification is skipped with an explanation
+rather than failed; use `-expose host` or scan from a container.
+
+## Validation rules
+
+`vulnsuite validate` reports, per template:
+
+| Rule | Level | Meaning |
+| --- | --- | --- |
+| `unpinned-base` | error (warning with `-allow-unpinned`) | image has no digest / source has no commit |
+| `missing-context`, `missing-dockerfile`, `missing-patch`, `missing-overlay` | error | a referenced file is not in the template |
+| `patch-needs-source` | error | a patch on an `image` base |
+| `empty-verify` | error | an http probe asserts nothing |
+| `bad-regex`, `bad-timeout` | error | malformed values |
+| `duplicate-id` | error | two templates share an id |
+| `no-patched`, `no-verify`, `weak-verify`, `identical-states` | warning | the template proves less than it could |
+| `source-no-diff` | warning | a source base where states have no patch/image difference |
+| `no-healthcheck`, `no-vuln-ref`, `no-references`, `scanner-unnamed` | warning | missing provenance |
+| `legacy-apiversion` | warning | `range.legacy/v2` |
+
+`-strict` turns warnings into failures (use it in CI).
