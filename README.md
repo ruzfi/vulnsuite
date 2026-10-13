@@ -46,6 +46,76 @@ contribute once and everyone can run anywhere with Docker.
   Engine, Docker Desktop, OrbStack, Colima and Podman's Docker-compatible
   socket; `DOCKER_HOST` and the usual `DOCKER_*` variables are honoured.
 
+## The idea
+
+This started as a very practical frustration: validating a vulnerability
+scanner means standing up the vulnerable system for each template it ships,
+confirming the flaw is really there, then fixing it and confirming the scanner
+goes quiet. Doing that by hand, one machine at a time, for hundreds of CVEs
+does not scale. Nuclei had already shown that *detection* scales when it is
+written as a small, portable, community-maintained template. The obvious
+question was: why not the same thing for *deployment*? A nuclei-style template
+that, instead of describing how to find a vulnerability, describes how to
+build and run it. That question is this project.
+
+vulnsuite was designed and written with the help of AI, as a deliberate
+experiment in **collaborative intelligence**: the problem, the constraints and
+every design decision (the contract format, pinning, content-addressed builds,
+independent verification, the exposure modes) came from hands-on scanner
+validation work; the implementation, the tests and much of the documentation
+were produced together with an AI assistant and reviewed line by line. The
+templates repository carries an authoring guide ([SKILL.md](https://github.com/ruzfi/vulnsuite-templates/blob/main/SKILL.md))
+written so that the same collaboration works for contributors: hand an
+assistant a CVE or a scanner template and the guide, and it can draft a
+validated target for you to review. We think that is how a catalog of
+thousands of reproducible targets actually gets built.
+
+## Automating the whole loop
+
+Everything vulnsuite does is scriptable, which is the point: a target is only
+useful as ground truth if a machine can stand it up, prove it, scan it and
+tear it down without a human in the loop.
+
+- Every command takes `-json` and returns structured output (progress goes
+  to stderr), and exits non-zero when a target fails to build, start or
+  verify.
+- `vulnsuite run -detach -targets-file` plus `vulnsuite targets` give a
+  scanner exactly the URLs to hit; `vulnsuite stop` cleans up.
+- The Go packages (`loader`, `builder`, `runner`, `probes`) are importable,
+  so a pipeline can drive targets directly and read verify results as values
+  instead of parsing text.
+- Built images are content-addressed and can be pushed to a registry, so CI
+  can pre-build once and run many validation jobs against the same immutable
+  image.
+
+A typical end-to-end use: for every scanner template you ship, bring up the
+matching target **vulnerable**, run the scanner and expect a hit; bring it up
+**patched**, run the scanner and expect silence. A template that fires on
+patched is a false positive you just caught before a customer did; one that
+is silent on vulnerable is a false negative. Run that nightly against the
+scanner's current template set and regressions surface the day they land.
+vulnsuite gives that loop its ground truth; the scoring and reporting on top
+is a few dozen lines in whatever language your pipeline speaks.
+
+## Prior art and neighbours
+
+- **[nuclei](https://github.com/projectdiscovery/nuclei)** is the model for
+  the template-driven, community-maintained approach, and the scanner most
+  people will validate first. vulnsuite is its mirror image: nuclei templates
+  say how to detect, vulnsuite templates say how to deploy.
+- **[pocsuite3](https://github.com/knownsec/pocsuite3)** (Knownsec 404) is a
+  PoC and exploit framework. It can start a Docker environment declared in a
+  PoC (`--docker-start`) so you have something to test against, but that is
+  a convenience inside a scanner: a single unpinned image, no patched twin, no
+  verification. vulnsuite is the other half of that picture, a dedicated,
+  verified, reproducible target provisioner that frameworks like pocsuite3 or
+  nuclei can be pointed at.
+- **Vulhub, DVWA, Metasploitable, VulnHub** and similar collections provide
+  vulnerable environments, usually as hand-written compose files or VM images,
+  with no notion of a patched counterpart, a pinned base, or a probe that
+  proves the state. Several of them are excellent sources for *authoring*
+  vulnsuite templates.
+
 ## Install
 
 ```bash
