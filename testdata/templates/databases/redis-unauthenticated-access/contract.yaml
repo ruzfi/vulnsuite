@@ -1,0 +1,28 @@
+apiVersion: vulnsuite/v1
+kind: Target
+metadata:
+  id: redis-unauthenticated-access
+  summary: Redis reachable with no authentication (default), allowing full data access.
+  vuln_refs: [VS-REDIS-NOAUTH]
+  cwe: [CWE-306]
+  severity: high
+  tags: [redis, authentication, exposure, database]
+  references: [https://redis.io/docs/management/security/]
+  maintainer: ruzfi
+  added: "2026-09-29"
+base:
+  kind: image
+  image: redis:7.2-alpine
+service:
+  ports: [ { container: 6379, protocol: redis } ]
+  command: ["redis-server", "/etc/redis/redis.conf"]
+  healthcheck: { tcp: { port: 6379 }, timeout: 30s }
+states:
+  vulnerable:
+    overlay: [ { src: files/vuln.conf, dest: /etc/redis/redis.conf } ]
+    verify:
+      - tcp: { port: 6379, send: "PING\r\n", banner_matches: "\\+PONG" }
+  patched:
+    overlay: [ { src: files/redis.conf, dest: /etc/redis/redis.conf } ]
+    verify:
+      - tcp: { port: 6379, send: "PING\r\n", banner_matches: "NOAUTH" }

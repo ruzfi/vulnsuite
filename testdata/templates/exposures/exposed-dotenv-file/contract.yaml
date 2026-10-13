@@ -1,0 +1,44 @@
+apiVersion: vulnsuite/v1
+kind: Target
+
+metadata:
+  id: exposed-dotenv-file
+  summary: Application root serves its .env, leaking database and API secrets.
+  vuln_refs: [VS-EXPO-DOTENV]
+  cwe: [CWE-538]
+  severity: high
+  tags: [exposures, information-disclosure, secrets, dotenv]
+  references:
+    - https://cwe.mitre.org/data/definitions/538.html
+  maintainer: ruzfi
+  added: "2026-09-29"
+  detection: scanner
+  detected_by: ["nuclei:laravel-env"]
+
+base:
+  kind: build
+  context: src
+
+service:
+  ports:
+    - { container: 8080, protocol: http }
+  healthcheck:
+    http: { path: /, status: 200 }
+    timeout: 30s
+
+states:
+  vulnerable:
+    verify:
+      - http:
+          method: GET
+          path: "/.env"
+          status: 200
+          body_matches: "DB_PASSWORD="
+  patched:
+    environment: { MODE: "patched" }
+    verify:
+      - http:
+          method: GET
+          path: "/.env"
+          status_in: [404]
+          body_absent: "DB_PASSWORD"

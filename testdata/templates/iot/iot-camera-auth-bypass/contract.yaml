@@ -1,0 +1,44 @@
+apiVersion: vulnsuite/v1
+kind: Target
+
+metadata:
+  id: iot-camera-auth-bypass
+  summary: Simulated IP camera exposing its credential config without authentication.
+  vuln_refs: [VS-IOT-AUTHZ-001]
+  cwe: [CWE-306]
+  severity: high
+  tags: [iot, auth-bypass, camera, information-disclosure, simulated]
+  references:
+    - https://cwe.mitre.org/data/definitions/306.html
+  maintainer: ruzfi
+  added: "2026-09-29"
+  detection: custom-only
+
+base:
+  kind: build
+  context: src
+
+service:
+  ports:
+    - { container: 8080, protocol: http }
+  healthcheck:
+    http: { path: /, status: 200 }
+    timeout: 30s
+
+states:
+  vulnerable:
+    verify:
+      - http:
+          method: GET
+          path: "/admin/config"
+          status: 200
+          body_matches: "rtsp_password"
+  patched:
+    overlay:
+      - { src: files/app_patched.py, dest: app.py }
+    verify:
+      - http:
+          method: GET
+          path: "/admin/config"
+          status_in: [401]
+          body_absent: "rtsp_password"

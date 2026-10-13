@@ -1,0 +1,529 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/ruzfi/vulnsuite/main/schemas/contract.schema.json",
+  "title": "vulnsuite Target Contract",
+  "description": "A portable, reproducible description of a vulnerable system and its patched counterpart. Built and run by vulnsuite on any device with Docker.",
+  "type": "object",
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "base",
+    "service",
+    "states"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "apiVersion": {
+      "enum": [
+        "vulnsuite/v1",
+        "range.legacy/v2"
+      ],
+      "description": "vulnsuite/v1. The legacy range.legacy/v2 value is accepted with a warning."
+    },
+    "kind": {
+      "const": "Target"
+    },
+    "metadata": {
+      "type": "object",
+      "required": [
+        "id",
+        "summary"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9.-]{2,79}$"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "vuln_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^(CVE-\\d{4}-\\d{4,7}|GHSA-[a-z0-9-]+|[A-Z]{2,8}-[A-Z0-9-]+)$"
+          },
+          "description": "CVE or GHSA ids, or a PREFIX-ID for simulations / misconfigurations with no CVE (community templates use VS-...)."
+        },
+        "cwe": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^CWE-\\d+$"
+          }
+        },
+        "severity": {
+          "enum": [
+            "info",
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ]
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "references": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "maintainer": {
+          "type": "string"
+        },
+        "added": {
+          "type": "string"
+        },
+        "detected_by": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "scanner template ids this target reproduces the fingerprint of, e.g. nuclei:laravel-env"
+        },
+        "detection": {
+          "enum": [
+            "scanner",
+            "custom-only"
+          ],
+          "description": "scanner = reproduces a real scanner template's fingerprint (name it in detected_by); custom-only = no public template exists, validate with your own probes"
+        }
+      }
+    },
+    "base": {
+      "description": "The reusable, content-addressed foundation. Templates sharing a base reuse one built image.",
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "const": "image"
+            },
+            "image": {
+              "type": "string"
+            },
+            "digest": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            }
+          },
+          "required": [
+            "image"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "source"
+            },
+            "repo": {
+              "type": "string"
+            },
+            "commit": {
+              "type": "string",
+              "description": "Pinned commit -- an RC or unreleased vulnerable revision."
+            },
+            "dockerfile": {
+              "type": "string"
+            },
+            "build_args": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "repo",
+            "commit"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "build"
+            },
+            "context": {
+              "type": "string",
+              "description": "Folder inside the template with a Dockerfile + source (e.g. a Python/Go socket sim)."
+            },
+            "dockerfile": {
+              "type": "string"
+            },
+            "build_args": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "context"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "service": {
+      "type": "object",
+      "required": [
+        "ports"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "ports": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "container"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "container": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535
+              },
+              "protocol": {
+                "enum": [
+                  "http",
+                  "https",
+                  "tcp",
+                  "ssh",
+                  "ftp",
+                  "smtp",
+                  "redis",
+                  "mysql",
+                  "postgres"
+                ]
+              }
+            }
+          }
+        },
+        "command": {
+          "type": [
+            "string",
+            "array"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "environment": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "healthcheck": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "http": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "integer"
+                }
+              }
+            },
+            "tcp": {
+              "type": "object",
+              "properties": {
+                "port": {
+                  "type": "integer"
+                }
+              },
+              "additionalProperties": false
+            },
+            "timeout": {
+              "type": "string",
+              "pattern": "^\\d+[smh]$"
+            }
+          }
+        },
+        "sidecars": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "image"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "image": {
+                "type": "string"
+              },
+              "digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              "environment": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "user": {
+          "type": "string",
+          "pattern": "^[0-9]+(:[0-9]+)?$",
+          "description": "run-as uid or uid:gid, e.g. '1000:0'"
+        },
+        "cap_add": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Z_]+$"
+          },
+          "description": "Linux capabilities to grant on top of the default set, e.g. CAP_SYS_CHROOT"
+        },
+        "cap_drop": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Z_]+$"
+          },
+          "description": "Linux capabilities to drop, e.g. ['ALL'] for a hand-audited paranoid target (then add back what the image needs via cap_add)"
+        },
+        "devices": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^/dev/[a-zA-Z0-9/_-]+$"
+          },
+          "description": "Host device paths to pass through to the container, e.g. ['/dev/kvm'] for KVM/QEMU targets"
+        }
+      }
+    },
+    "states": {
+      "type": "object",
+      "required": [
+        "vulnerable"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "vulnerable": {
+          "$ref": "#/$defs/state"
+        },
+        "patched": {
+          "$ref": "#/$defs/state"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "image": {
+          "type": "string",
+          "description": "Per-state image override (reuse-if-matches): e.g. patched = a newer tag."
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "patch": {
+          "type": "string",
+          "description": "Git patch applied to a source base to reach this state."
+        },
+        "overlay": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "src",
+              "dest"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "src": {
+                "type": "string"
+              },
+              "dest": {
+                "type": "string"
+              },
+              "mode": {
+                "type": "string",
+                "pattern": "^0[0-7]{3}$"
+              }
+            }
+          }
+        },
+        "environment": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "seed": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "run"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "run": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "verify": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/probe"
+          }
+        },
+        "command": {
+          "type": [
+            "string",
+            "array"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "Per-state command override (wins over service.command)."
+        }
+      }
+    },
+    "probe": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "http": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "method": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "raw_path": {
+              "type": "string"
+            },
+            "headers": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "body": {
+              "type": "string"
+            },
+            "status": {
+              "type": "integer"
+            },
+            "status_in": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            "body_matches": {
+              "type": "string"
+            },
+            "body_absent": {
+              "type": "string"
+            },
+            "timeout": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "header_matches": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "response header name -> regex the value must match (case-insensitive name)"
+            },
+            "header_absent": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "response header names that must NOT be present"
+            }
+          }
+        },
+        "exec": {
+          "type": "object",
+          "required": [
+            "run"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "run": {
+              "type": "string"
+            },
+            "expect_exit": {
+              "type": "integer"
+            },
+            "stdout_matches": {
+              "type": "string"
+            },
+            "timeout": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            }
+          }
+        },
+        "tcp": {
+          "type": "object",
+          "required": [
+            "port"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "port": {
+              "type": "integer"
+            },
+            "send": {
+              "type": "string"
+            },
+            "banner_matches": {
+              "type": "string"
+            },
+            "timeout": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            }
+          }
+        }
+      }
+    }
+  }
+}
