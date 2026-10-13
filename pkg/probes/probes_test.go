@@ -110,6 +110,59 @@ func TestHTTPProbeVerbatimAndAssertions(t *testing.T) {
 	}
 }
 
+func TestHTTPProbePortOverrideAndTCPClosed(t *testing.T) {
+	// The HTTP server is on its own port; the probe target's primary Port is a
+	// different (closed) port, so the probe must honour the per-probe override.
+	host, httpPort, seen := rawServer(t)
+	ctx := context.Background()
+
+	// find a closed port by opening then closing a listener
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedPort := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+
+	// a plain TCP listener that just accepts, for the "open" assertion
+	openL, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer openL.Close()
+	go func() {
+		for {
+			c, err := openL.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	openPort := openL.Addr().(*net.TCPAddr).Port
+
+	tgt := Target{Host: host, Port: closedPort, Scheme: "http"}
+
+	// HTTP probe with an explicit port reaches the real server despite the
+	// primary port being closed.
+	r := Run(ctx, contract.Probe{HTTP: &contract.HTTPProbe{Port: httpPort, Path: "/echo-ua", Headers: map[string]string{"User-Agent": "p/1"}, BodyMatches: "^p/1$"}}, tgt)
+	<-seen
+	if !r.OK {
+		t.Fatalf("http port override: %s", r.Detail)
+	}
+
+	// TCP closed: the primary (closed) port must assert as closed.
+	r = Run(ctx, contract.Probe{TCP: &contract.TCPProbe{Closed: true}}, tgt)
+	if !r.OK || !strings.Contains(r.Detail, "closed as expected") {
+		t.Fatalf("tcp closed should pass on a refused port: ok=%v %s", r.OK, r.Detail)
+	}
+	// TCP closed against an OPEN port must fail.
+	r = Run(ctx, contract.Probe{TCP: &contract.TCPProbe{Port: openPort, Closed: true}}, tgt)
+	if r.OK || !strings.Contains(r.Detail, "open but was expected") {
+		t.Fatalf("tcp closed should fail on an open port: ok=%v %s", r.OK, r.Detail)
+	}
+}
+
 func TestTCPProbeAndReachability(t *testing.T) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

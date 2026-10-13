@@ -105,6 +105,7 @@ func (p Port) Scheme() string {
 // HTTPProbe is a raw HTTP request plus assertions on the response.
 type HTTPProbe struct {
 	Method        string            `yaml:"method,omitempty" json:"method,omitempty"`
+	Port          int               `yaml:"port,omitempty" json:"port,omitempty"` // target a non-primary port (default: the primary port)
 	Path          string            `yaml:"path,omitempty" json:"path,omitempty"`
 	RawPath       string            `yaml:"raw_path,omitempty" json:"raw_path,omitempty"`
 	Headers       map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
@@ -142,6 +143,7 @@ type TCPProbe struct {
 	Port          int     `yaml:"port" json:"port"`
 	Send          string  `yaml:"send,omitempty" json:"send,omitempty"`
 	BannerMatches string  `yaml:"banner_matches,omitempty" json:"banner_matches,omitempty"`
+	Closed        bool    `yaml:"closed,omitempty" json:"closed,omitempty"` // assert the port is NOT open (connection refused/unreachable)
 	Timeout       float64 `yaml:"timeout,omitempty" json:"timeout,omitempty"`
 }
 

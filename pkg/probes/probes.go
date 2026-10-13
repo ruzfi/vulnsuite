@@ -228,7 +228,11 @@ func runHTTP(ctx context.Context, s *contract.HTTPProbe, t Target) (bool, string
 	if path == "" {
 		path = "/"
 	}
-	resp, err := RawHTTP(ctx, t.Host, t.Port, s.Method, path, s.Headers, s.Body, secs(s.Timeout, 10*time.Second), t.Scheme == "https")
+	port := t.Port
+	if s.Port != 0 {
+		port = s.Port
+	}
+	resp, err := RawHTTP(ctx, t.Host, port, s.Method, path, s.Headers, s.Body, secs(s.Timeout, 10*time.Second), t.Scheme == "https")
 	if err != nil {
 		return false, "", fmt.Errorf("%s -> %v", path, err)
 	}
@@ -298,6 +302,15 @@ func runTCP(ctx context.Context, s *contract.TCPProbe, t Target) (bool, string, 
 	timeout := secs(s.Timeout, 10*time.Second)
 	d := net.Dialer{Timeout: timeout}
 	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(t.Host, strconv.Itoa(port)))
+	if s.Closed {
+		// Asserting the port is NOT open: a dial error (refused/unreachable) is
+		// the expected result; a successful connection is the failure.
+		if err != nil {
+			return true, fmt.Sprintf("tcp %d closed as expected (%v)", port, err), nil
+		}
+		conn.Close()
+		return false, fmt.Sprintf("tcp %d is open but was expected to be closed", port), nil
+	}
 	if err != nil {
 		return false, "", fmt.Errorf("tcp %d -> %v", port, err)
 	}

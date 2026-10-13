@@ -138,6 +138,7 @@ demonstrate the *impact* from the advisory, not a matcher.
 ```yaml
 - http:
     method: GET                   # default GET
+    port: 9229                    # target a non-primary container port (default: the primary port)
     raw_path: "/a/..%2e/etc/passwd"   # sent verbatim (traversal payloads survive); or
     path: /api/debug/env          # an ordinary path (may include a query)
     headers: { X-Forwarded-For: "127.0.0.1" }
@@ -153,6 +154,7 @@ demonstrate the *impact* from the advisory, not a matcher.
     port: 6379
     send: "PING\r\n"
     banner_matches: "\\+PONG"
+    closed: true                  # instead: assert the port is NOT open (refused/unreachable is a pass)
 - net:                            # scripted multi-step dialogue over one connection
     port: 21
     steps:

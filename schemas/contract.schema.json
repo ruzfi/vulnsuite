@@ -549,6 +549,10 @@
                 "type": "string"
               },
               "description": "response header names that must NOT be present"
+            },
+            "port": {
+              "type": "integer",
+              "description": "Target a non-primary container port (default: the primary port)."
             }
           }
         },
@@ -593,6 +597,10 @@
             "timeout": {
               "type": "number",
               "exclusiveMinimum": 0
+            },
+            "closed": {
+              "type": "boolean",
+              "description": "Assert the port is NOT open (connection refused/unreachable is a pass)."
             }
           }
         },
