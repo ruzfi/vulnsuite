@@ -49,6 +49,15 @@ const (
 // StateNames lists the states a contract may declare, in canonical order.
 var StateNames = []string{StateVulnerable, StatePatched}
 
+// Fidelity values.
+const (
+	FidelityReal      = "real"      // runs the genuine affected software
+	FidelitySimulated = "simulated" // a stand-in that reproduces the behaviour
+)
+
+// Fidelities lists the allowed fidelity values.
+var Fidelities = []string{FidelityReal, FidelitySimulated}
+
 // ImageRepoPrefix is the local repository prefix for images vulnsuite builds.
 const ImageRepoPrefix = "vulnsuite"
 
@@ -327,6 +336,12 @@ type Metadata struct {
 	References []string `yaml:"references,omitempty" json:"references,omitempty"`
 	Maintainer string   `yaml:"maintainer,omitempty" json:"maintainer,omitempty"`
 	Added      string   `yaml:"added,omitempty" json:"added,omitempty"`
+	// Fidelity says whether the target runs the genuine affected software
+	// (real) or a hand-written stand-in that reproduces its behaviour
+	// (simulated). Real is the default and strongly preferred; simulated is
+	// only honest when no public image or buildable upstream source
+	// reproduces the flaw (bare-OS/device/protocol sims).
+	Fidelity string `yaml:"fidelity,omitempty" json:"fidelity,omitempty"`
 	// Detection says whether a stock scanner can find this target:
 	//   scanner      the target reproduces a real scanner template's fingerprint
 	//   custom-only  no public template exists; validate with your own probes
@@ -351,6 +366,17 @@ type Contract struct {
 
 // ID is a shortcut for Metadata.ID.
 func (c *Contract) ID() string { return c.Metadata.ID }
+
+// Fidelity returns the declared fidelity, defaulting to real when unset.
+func (c *Contract) Fidelity() string {
+	if c.Metadata.Fidelity == "" {
+		return FidelityReal
+	}
+	return c.Metadata.Fidelity
+}
+
+// IsSimulated reports whether the target is a stand-in rather than the real software.
+func (c *Contract) IsSimulated() bool { return c.Fidelity() == FidelitySimulated }
 
 // HasState reports whether the contract declares the named state.
 func (c *Contract) HasState(name string) bool {

@@ -94,6 +94,13 @@
             "custom-only"
           ],
           "description": "scanner = reproduces a real scanner template's fingerprint (name it in detected_by); custom-only = no public template exists, validate with your own probes"
+        },
+        "fidelity": {
+          "enum": [
+            "real",
+            "simulated"
+          ],
+          "description": "real = runs the genuine affected software (preferred); simulated = a hand-written stand-in (only for bare-OS/device/protocol flaws with no reproducible image/source)"
         }
       }
     },

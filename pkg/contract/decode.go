@@ -85,6 +85,7 @@ var (
 	protocols  = map[string]bool{"http": true, "https": true, "tcp": true, "ssh": true, "ftp": true,
 		"smtp": true, "redis": true, "mysql": true, "postgres": true}
 	detections = map[string]bool{"scanner": true, "custom-only": true}
+	fidelities = map[string]bool{"real": true, "simulated": true}
 )
 
 // Parse decodes and structurally validates a contract document. Semantic lint
@@ -169,6 +170,9 @@ func (c *Contract) checkStructure() error {
 	}
 	if m.Detection != "" && !detections[m.Detection] {
 		return se("metadata/detection", "%q is not one of scanner, custom-only", m.Detection)
+	}
+	if m.Fidelity != "" && !fidelities[m.Fidelity] {
+		return se("metadata/fidelity", "%q is not one of real, simulated", m.Fidelity)
 	}
 
 	b := c.Base

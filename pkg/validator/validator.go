@@ -58,6 +58,7 @@ func (v *Validator) Check(c *contract.Contract) []Finding {
 	out = append(out, v.verify(c)...)
 	out = append(out, v.ports(c)...)
 	out = append(out, v.provenance(c)...)
+	out = append(out, v.fidelity(c)...)
 	return out
 }
 
@@ -235,6 +236,22 @@ func (v *Validator) ports(c *contract.Contract) []Finding {
 			"no healthcheck; the runner cannot tell when the target is ready"})
 	} else if _, err := contract.ParseDuration(c.Service.Healthcheck.Timeout, 0); err != nil {
 		out = append(out, Finding{Error, c.ID(), "bad-timeout", err.Error()})
+	}
+	return out
+}
+
+func (v *Validator) fidelity(c *contract.Contract) []Finding {
+	var out []Finding
+	if c.Metadata.Fidelity == "" {
+		out = append(out, Finding{Warning, c.ID(), "fidelity-unset",
+			"set metadata.fidelity: real (runs the genuine software) or simulated (a stand-in); real is preferred and only sims of bare-OS/device/protocol flaws should be simulated"})
+		return out
+	}
+	// A simulation normally builds a stand-in; a prebuilt public image as the
+	// base strongly suggests this is actually the real software mislabelled.
+	if c.IsSimulated() && c.Base.Kind == contract.BaseImage {
+		out = append(out, Finding{Warning, c.ID(), "simulated-on-image-base",
+			"fidelity: simulated but the base is a prebuilt image; if this runs the genuine software it should be fidelity: real"})
 	}
 	return out
 }

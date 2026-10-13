@@ -138,6 +138,37 @@ states:
 	}
 }
 
+func TestFidelityRules(t *testing.T) {
+	v := &Validator{}
+	// unset -> warn
+	if rules(v.Check(parse(t, base)))["fidelity-unset"] != Warning {
+		t.Fatal("fidelity-unset expected")
+	}
+	// real + image base -> clean
+	c := parse(t, strings.Replace(base, "metadata: { id: lint-demo,", "metadata: { fidelity: real, id: lint-demo,", 1))
+	if _, bad := rules(v.Check(c))["fidelity-unset"]; bad {
+		t.Fatal("real set, no warn")
+	}
+	// simulated + image base -> mismatch warn
+	c = parse(t, strings.Replace(base, "metadata: { id: lint-demo,", "metadata: { fidelity: simulated, id: lint-demo,", 1))
+	if rules(v.Check(c))["simulated-on-image-base"] != Warning {
+		t.Fatal("simulated-on-image-base expected")
+	}
+	// simulated + build base -> fine
+	c = parse(t, `apiVersion: vulnsuite/v1
+kind: Target
+metadata: { fidelity: simulated, id: sim, summary: x, vuln_refs: [VS-X], references: [https://e.invalid] }
+base: { kind: build, context: src }
+service: { ports: [ { container: 80, protocol: http } ], healthcheck: { tcp: { port: 80 }, timeout: 10s } }
+states:
+  vulnerable: { verify: [ { http: { path: /, status: 200, body_matches: x } } ] }
+  patched: { verify: [ { http: { path: /, status_in: [404] } } ] }
+`)
+	if _, bad := rules(v.Check(c))["simulated-on-image-base"]; bad {
+		t.Fatal("sim+build must not warn")
+	}
+}
+
 func TestScannerLinkRules(t *testing.T) {
 	v := &Validator{}
 	// nothing linked, nothing declared -> warn

@@ -60,6 +60,7 @@ writing a template and contributing it upstream.`,
 				}
 			}
 			kv("severity", m.Severity)
+			kv("fidelity", c.Fidelity())
 			kv("vuln refs", strings.Join(m.VulnRefs, ", "))
 			kv("cwe", strings.Join(m.CWE, ", "))
 			kv("tags", strings.Join(m.Tags, ", "))

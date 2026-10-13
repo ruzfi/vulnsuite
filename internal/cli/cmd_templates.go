@@ -34,6 +34,7 @@ type listRow struct {
 	Severity   string   `json:"severity"`
 	States     []string `json:"states"`
 	BuildKind  string   `json:"build_kind"`
+	Fidelity   string   `json:"fidelity"`
 	VulnRefs   []string `json:"vuln_refs"`
 	Detection  string   `json:"detection,omitempty"`
 	DetectedBy []string `json:"detected_by,omitempty"`
@@ -44,7 +45,7 @@ type listRow struct {
 }
 
 func cmdList() *Command {
-	var tag string
+	var tag, fidelity string
 	return &Command{
 		Name: "list", Aliases: []string{"ls"},
 		Short: "list templates (with state availability)",
@@ -53,6 +54,7 @@ func cmdList() *Command {
 when unique). With no selector every template is listed.`,
 		Flags: func(fs *flag.FlagSet) {
 			fs.StringVar(&tag, "tag", "", "only templates carrying this tag")
+			fs.StringVar(&fidelity, "fidelity", "", "only templates of this fidelity (real or simulated)")
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
 			store, err := g.Store()
@@ -78,9 +80,12 @@ when unique). With no selector every template is listed.`,
 				if tag != "" && !has(c.Metadata.Tags, tag) {
 					continue
 				}
+				if fidelity != "" && c.Fidelity() != fidelity {
+					continue
+				}
 				rows = append(rows, listRow{
 					ID: c.ID(), Severity: c.Metadata.Severity, States: c.DeclaredStates(),
-					BuildKind: c.BuildKind(contract.StateVulnerable), VulnRefs: c.Metadata.VulnRefs,
+					BuildKind: c.BuildKind(contract.StateVulnerable), Fidelity: c.Fidelity(), VulnRefs: c.Metadata.VulnRefs,
 					Detection: c.Metadata.Detection, DetectedBy: c.Metadata.DetectedBy, Tags: c.Metadata.Tags,
 					Summary: c.Metadata.Summary, Path: p,
 				})
@@ -93,7 +98,7 @@ when unique). With no selector every template is listed.`,
 				return nil
 			}
 			tw := tabwriter.NewWriter(g.Stdout, 2, 4, 2, ' ', 0)
-			fmt.Fprintln(tw, "ID\tSEV\tSTATES\tKIND\tREFS\tDETECTED BY")
+			fmt.Fprintln(tw, "ID\tSEV\tFIDELITY\tKIND\tREFS\tDETECTED BY")
 			for _, r := range rows {
 				if r.Error != "" {
 					fmt.Fprintf(tw, "%s\t-\t-\t-\t-\t(unloadable: %s)\n", r.ID, r.Error)
@@ -108,7 +113,7 @@ when unique). With no selector every template is listed.`,
 				case det == "":
 					det = "- (none linked)"
 				}
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", r.ID, r.Severity, strings.Join(r.States, ","), r.BuildKind, strings.Join(r.VulnRefs, ","), det)
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", r.ID, r.Severity, r.Fidelity, r.BuildKind, strings.Join(r.VulnRefs, ","), det)
 			}
 			tw.Flush()
 			g.printf("\n%d templates in %s\n", len(rows), store.Root)

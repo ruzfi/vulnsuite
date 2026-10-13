@@ -64,6 +64,21 @@ func TestParseMinimal(t *testing.T) {
 	}
 }
 
+func TestFidelity(t *testing.T) {
+	c, _ := Parse([]byte(minimal))
+	if c.Fidelity() != FidelityReal || c.IsSimulated() {
+		t.Fatal("default fidelity must be real")
+	}
+	doc := strings.Replace(minimal, "severity: high", "severity: high\n  fidelity: simulated", 1)
+	c, err := Parse([]byte(doc))
+	if err != nil || !c.IsSimulated() {
+		t.Fatalf("simulated: %v", err)
+	}
+	if _, err := Parse([]byte(strings.Replace(minimal, "severity: high", "severity: high\n  fidelity: fake", 1))); err == nil {
+		t.Fatal("bad fidelity must reject")
+	}
+}
+
 func TestParseRejects(t *testing.T) {
 	cases := map[string]string{
 		"unknown field":   strings.Replace(minimal, "summary: demo", "summary: demo\n  bogus: 1", 1),
