@@ -40,9 +40,11 @@ contribute once and everyone can run anywhere with Docker.
 - **Fleet-friendly.** Run many targets at once, each with its own IP on an
   internal network; `vulnsuite targets` prints the exact URLs with the right
   ports so you scan those instead of sweeping a subnet.
-- **Single static binary, no dependencies.** vulnsuite speaks the Docker
-  Engine API directly over the socket. Works with Docker Engine, Docker
-  Desktop, OrbStack, Colima and Podman's Docker-compatible socket.
+- **Single static binary.** Talks to the daemon through the official Moby
+  SDK (`github.com/moby/moby/client`), with a built-in dependency-free
+  Engine API client as an alternative (`-engine api`). Works with Docker
+  Engine, Docker Desktop, OrbStack, Colima and Podman's Docker-compatible
+  socket; `DOCKER_HOST` and the usual `DOCKER_*` variables are honoured.
 
 ## Install
 
@@ -115,6 +117,8 @@ vulnsuite update-templates                          fetch / update the community
 ```
 
 `-json` on any command gives machine-readable output (progress goes to stderr).
+`-engine sdk|api` (or `$VULNSUITE_ENGINE`) picks the daemon client: the Moby
+SDK by default, or the built-in API client.
 A selector is a folder (`web-servers`), a contract file, or a template id (a
 unique substring works: `-t grafana`).
 
@@ -191,13 +195,15 @@ contract can tighten per target with `service.cap_drop: [ALL]`, `cap_add`,
 
 Every package under `pkg/` is importable: `loader` finds and parses
 templates, `validator` lints them, `builder` and `runner` do the work on any
-`engine.Engine`, and `engine/enginetest` is an in-memory engine for tests.
+`engine.Engine` (`engine/moby` wraps the official SDK, `engine/docker` is the
+built-in client, `engines.New` picks one), and `engine/enginetest` is an
+in-memory engine for tests.
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ```go
 store := loader.New("/path/to/vulnsuite-templates")
 c, _ := store.LoadSelector("grafana-8.3.0-cve-2021-43798")
-eng, _ := docker.New("")
+eng, _ := engines.New("sdk", "")
 h, _ := runner.New(eng).Run(ctx, c, "vulnerable", runner.DefaultExposure(), runner.Options{Verify: true})
 fmt.Println(h.ScannerTarget(), *h.VerifyOK)
 ```

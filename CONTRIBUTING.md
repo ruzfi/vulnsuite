@@ -15,11 +15,12 @@ make e2e            # end-to-end against your local Docker daemon
 make lint           # gofmt + go vet
 ```
 
-Go 1.24 or newer. The only runtime dependency is a Docker-compatible daemon;
-the module itself depends on `github.com/goccy/go-yaml` and nothing else, and
-we would like to keep it that way: the Docker Engine API is spoken directly
-with `net/http` (see `pkg/engine/docker`). Anything that needs a different
-backend implements `engine.Engine`.
+Go 1.24 or newer. The only runtime dependency is a Docker-compatible daemon.
+The module depends on `github.com/goccy/go-yaml` and the official Moby SDK
+(`github.com/moby/moby/client` + `api`); please don't add more without a
+discussion. Anything that needs a different backend implements
+`engine.Engine` (see `pkg/engine/moby` and the dependency-free
+`pkg/engine/docker` for two examples).
 
 Layout:
 
@@ -33,7 +34,8 @@ pkg/validator      semantic lint
 pkg/builder        content-addressed image builds (overlay / source / build) and publishing
 pkg/runner         exposure modes, readiness, verification, fleet management
 pkg/probes         raw-socket HTTP / TCP / exec verify probes
-pkg/engine         the container engine interface; docker/ implementation; enginetest/ fake
+pkg/engine         the container engine interface; moby/ (official SDK, default) and docker/ (built-in API client)
+                   implementations; engines/ picks one; registryauth/ credentials; enginetest/ fake
 pkg/templates      templates directory resolution and update-templates
 schemas/           JSON schema of the contract (kept in sync with pkg/contract)
 ```
@@ -80,7 +82,7 @@ Types we use:
 | `chore` | maintenance that touches none of the above |
 
 Scopes are package or area names: `builder`, `runner`, `probes`, `engine`,
-`cli`, `contract`, `loader`, `validator`, `templates`, `schema`.
+`moby`, `cli`, `contract`, `loader`, `validator`, `templates`, `schema`.
 
 A breaking change (anything that stops an existing template from loading or
 changes CLI behaviour incompatibly) carries `!` after the type/scope **and** a

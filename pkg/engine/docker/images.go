@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/ruzfi/vulnsuite/pkg/engine"
+	"github.com/ruzfi/vulnsuite/pkg/engine/registryauth"
 )
 
 // ImageExists reports whether ref is present locally.
@@ -47,7 +48,7 @@ func (c *Client) ImagePull(ctx context.Context, ref string, out io.Writer) error
 		q.Set("tag", tag)
 	}
 	headers := map[string]string{}
-	if auth := c.registryAuth(from); auth != "" {
+	if auth := registryauth.For(from); auth != "" {
 		headers["X-Registry-Auth"] = auth
 	}
 	resp, err := c.do(ctx, http.MethodPost, "/images/create", q, nil, headers)
@@ -89,7 +90,7 @@ func (c *Client) ImageBuild(ctx context.Context, opts engine.BuildOptions, out i
 	}
 	q.Set("rm", "1")
 	headers := map[string]string{"Content-Type": "application/x-tar"}
-	if cfg := c.registryConfigHeader(); cfg != "" {
+	if cfg := registryauth.ConfigsHeader(); cfg != "" {
 		headers["X-Registry-Config"] = cfg
 	}
 	resp, err := c.do(ctx, http.MethodPost, "/build", q, opts.Context, headers)
@@ -117,9 +118,9 @@ func (c *Client) ImagePush(ctx context.Context, ref string, out io.Writer) error
 	if tag != "" {
 		q.Set("tag", tag)
 	}
-	auth := c.registryAuth(repo)
+	auth := registryauth.For(repo)
 	if auth == "" {
-		auth = emptyAuth()
+		auth = registryauth.Empty()
 	}
 	resp, err := c.do(ctx, http.MethodPost, "/images/"+url.PathEscape(repo)+"/push", q, nil,
 		map[string]string{"X-Registry-Auth": auth})

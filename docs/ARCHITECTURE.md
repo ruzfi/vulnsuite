@@ -10,7 +10,8 @@ contract.yaml ───────► Contract ─────────► i
                      (semantic lint)   (reuse / publish)      (internal/host/macvlan)
                                              │                        │
                                              └──────── engine.Engine ─┘
-                                                  (Docker Engine API over the socket)
+                                            (engine/moby: official SDK, default)
+                                            (engine/docker: built-in API client)
 ```
 
 ## Packages
@@ -20,7 +21,7 @@ contract.yaml ───────► Contract ─────────► i
 | `pkg/contract` | The data model. `Parse` does strict YAML decoding and the structural checks that mirror the JSON schema. `ContentHash` / `ImageTag` give every state a content-addressed identity. No I/O beyond reading overlay files for hashing. |
 | `pkg/loader` | Finds contracts under a root and resolves selectors (folder, file, id, unique substring). Sets `Folder`/`SourcePath` on loaded contracts. |
 | `pkg/validator` | Semantic lint: is the template *wrong* rather than malformed (unpinned base, missing files, identical states, weak probes, ...). Pure functions over contracts. |
-| `pkg/engine` | The `Engine` interface the rest of the system builds and runs on. `engine/docker` implements it against the Docker Engine HTTP API with `net/http` only; `engine/enginetest` is an in-memory fake for tests. |
+| `pkg/engine` | The `Engine` interface the rest of the system builds and runs on. `engine/moby` implements it with the official Moby SDK (`github.com/moby/moby/client`, the default); `engine/docker` implements the same thing against the Engine HTTP API with `net/http` only; `engine/engines` picks one by name; `engine/registryauth` resolves registry credentials for both; `engine/enginetest` is an in-memory fake for tests. |
 | `pkg/builder` | Turns a (contract, state) into a local image: pull for `image` kinds, a generated overlay Dockerfile for `overlay`, a git checkout + patch for `source`, the template's own context for `build`. Builds are tar streams in memory; `ResolveAll` runs them in parallel with a bounded worker pool. `Publish` tags and pushes to a registry. |
 | `pkg/runner` | Starts a resolved image with the hardening baseline and the chosen exposure, waits for readiness, runs the state's probes, and manages the fleet (`Running`, `StopAll`). Stateless: the fleet is discovered by container name prefix and labels, so there is no bookkeeping file to drift. |
 | `pkg/probes` | Raw-socket HTTP, TCP and exec probes plus readiness helpers. Deliberately not `net/http` on the client side so encoded traversal payloads reach the wire unchanged. |
@@ -35,12 +36,16 @@ runs and across templates sharing a base, makes `-push` produce immutable
 tags, and lets the validator detect states that are accidentally identical.
 The state name is not in the hash on purpose.
 
-**No Docker SDK dependency.** The official Go SDK pulls in a very large
-module graph. The handful of Engine API endpoints we need (build, pull, push,
-tag, create/start/remove/inspect/exec, networks) are a few hundred lines over
-the unix socket, keep the binary small, and run anywhere the socket exists.
-Everything goes through `engine.Engine`, so swapping in the SDK, Podman's
-native API or a remote builder is a contained change.
+**Two engine clients behind one interface.** The default is the official
+Moby SDK (`github.com/moby/moby/client`, the modern, modular successor of
+`github.com/docker/docker/client`): API-version negotiation, `DOCKER_HOST` /
+TLS / context handling and error typing come for free and track the daemon.
+`engine/docker` is a few hundred lines over the unix socket with `net/http`
+only, kept as a fallback (`-engine api`) and as proof that the interface is
+small: everything the builder and runner need is build, pull, push, tag,
+create/start/remove/inspect/exec/logs/wait and networks. Both run the same
+end-to-end test. Podman's native API or a remote builder would be a third
+implementation, not a change to the callers.
 
 **The engine decides what "unreachable" means.** On Docker Desktop the host
 cannot route to bridge IPs, on Linux and OrbStack it can. Rather than

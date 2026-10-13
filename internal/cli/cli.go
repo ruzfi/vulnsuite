@@ -14,7 +14,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/ruzfi/vulnsuite/pkg/engine"
-	"github.com/ruzfi/vulnsuite/pkg/engine/docker"
+	"github.com/ruzfi/vulnsuite/pkg/engine/engines"
 	"github.com/ruzfi/vulnsuite/pkg/loader"
 	"github.com/ruzfi/vulnsuite/pkg/templates"
 )
@@ -53,6 +53,7 @@ type Command struct {
 type Global struct {
 	TemplatesDir string
 	DockerHost   string
+	EngineKind   string
 	JSON         bool
 	Quiet        bool
 	Stdout       io.Writer
@@ -67,6 +68,7 @@ func (g *Global) addFlags(fs *flag.FlagSet) {
 	fs.StringVar(&g.TemplatesDir, "templates", g.TemplatesDir, "templates directory (default: $VULNSUITE_TEMPLATES, the current repo, or ~/vulnsuite-templates)")
 	fs.StringVar(&g.TemplatesDir, "T", g.TemplatesDir, "alias for -templates")
 	fs.StringVar(&g.DockerHost, "docker-host", g.DockerHost, "container engine address (default: $DOCKER_HOST or the local socket)")
+	fs.StringVar(&g.EngineKind, "engine", g.EngineKind, "container engine client: sdk (the official Moby SDK) or api (built-in, dependency-free); default $VULNSUITE_ENGINE or sdk")
 	fs.BoolVar(&g.JSON, "json", g.JSON, "machine-readable JSON output")
 	fs.BoolVar(&g.Quiet, "q", g.Quiet, "less output")
 }
@@ -88,15 +90,15 @@ func (g *Global) Engine(ctx context.Context) (engine.Engine, error) {
 	if g.engine != nil {
 		return g.engine, nil
 	}
-	c, err := docker.New(g.DockerHost)
+	e, err := engines.New(g.EngineKind, g.DockerHost)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := c.Ping(ctx); err != nil {
+	if _, err := e.Ping(ctx); err != nil {
 		return nil, err
 	}
-	g.engine = c
-	return c, nil
+	g.engine = e
+	return e, nil
 }
 
 // SetEngine injects an engine (tests, embedding).
@@ -270,6 +272,7 @@ func printRootHelp(w io.Writer) {
 	fmt.Fprintln(w, "global flags:")
 	fmt.Fprintln(w, "  -templates, -T DIR  templates directory (default: $VULNSUITE_TEMPLATES, the current repo, or ~/vulnsuite-templates)")
 	fmt.Fprintln(w, "  -docker-host ADDR   container engine (default: $DOCKER_HOST or the local socket)")
+	fmt.Fprintln(w, "  -engine sdk|api     Moby SDK client (default) or the built-in API client")
 	fmt.Fprintln(w, "  -json               machine-readable output")
 	fmt.Fprintln(w, "  -q                  less output")
 	fmt.Fprintln(w)

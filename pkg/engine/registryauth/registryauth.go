@@ -1,4 +1,7 @@
-package docker
+// Package registryauth resolves registry credentials the way the docker CLI
+// does: VULNSUITE_REGISTRY_USER/TOKEN, then credential helpers, then the
+// plain auths in ~/.docker/config.json.
+package registryauth
 
 import (
 	"bytes"
@@ -11,8 +14,8 @@ import (
 	"sync"
 )
 
-// authConfig is what the daemon expects in X-Registry-Auth.
-type authConfig struct {
+// Config is one registry credential.
+type Config struct {
 	Username      string `json:"username,omitempty"`
 	Password      string `json:"password,omitempty"`
 	ServerAddress string `json:"serveraddress,omitempty"`
@@ -62,18 +65,25 @@ func registryOf(ref string) string {
 	return "https://index.docker.io/v1/"
 }
 
-// registryAuth returns the base64 X-Registry-Auth value for an image ref, or
-// "" when no credentials are known. Credentials come from, in order:
-// VULNSUITE_REGISTRY_USER/VULNSUITE_REGISTRY_TOKEN, a credential helper, or
-// the plain auths in ~/.docker/config.json.
-func (c *Client) registryAuth(ref string) string {
+// For returns the base64 X-Registry-Auth value for an image ref, or "" when
+// no credentials are known.
+func For(ref string) string {
+	a, ok := Lookup(ref)
+	if !ok {
+		return ""
+	}
+	return Encode(a)
+}
+
+// Lookup resolves the credential for an image ref.
+func Lookup(ref string) (Config, bool) {
 	reg := registryOf(ref)
 	if u, t := os.Getenv("VULNSUITE_REGISTRY_USER"), os.Getenv("VULNSUITE_REGISTRY_TOKEN"); u != "" && t != "" {
-		return encodeAuth(authConfig{Username: u, Password: t, ServerAddress: reg})
+		return Config{Username: u, Password: t, ServerAddress: reg}, true
 	}
 	conf := loadConfig()
 	if conf == nil {
-		return ""
+		return Config{}, false
 	}
 	helper := conf.CredsStore
 	if h, ok := conf.CredHelpers[reg]; ok {
@@ -81,7 +91,7 @@ func (c *Client) registryAuth(ref string) string {
 	}
 	if helper != "" {
 		if a, ok := fromHelper(helper, reg); ok {
-			return encodeAuth(a)
+			return a, true
 		}
 	}
 	for key, entry := range conf.Auths {
@@ -97,53 +107,55 @@ func (c *Client) registryAuth(ref string) string {
 			if !ok {
 				continue
 			}
-			return encodeAuth(authConfig{Username: u, Password: p, ServerAddress: reg})
+			return Config{Username: u, Password: p, ServerAddress: reg}, true
 		}
 	}
-	return ""
+	return Config{}, false
 }
 
-func fromHelper(helper, reg string) (authConfig, bool) {
+func fromHelper(helper, reg string) (Config, bool) {
 	bin := "docker-credential-" + helper
 	if _, err := exec.LookPath(bin); err != nil {
-		return authConfig{}, false
+		return Config{}, false
 	}
 	cmd := exec.Command(bin, "get")
 	cmd.Stdin = strings.NewReader(reg)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
-		return authConfig{}, false
+		return Config{}, false
 	}
 	var r struct {
 		Username string `json:"Username"`
 		Secret   string `json:"Secret"`
 	}
 	if json.Unmarshal(out.Bytes(), &r) != nil || r.Secret == "" {
-		return authConfig{}, false
+		return Config{}, false
 	}
-	a := authConfig{Username: r.Username, Password: r.Secret, ServerAddress: reg}
+	a := Config{Username: r.Username, Password: r.Secret, ServerAddress: reg}
 	if r.Username == "<token>" {
-		a = authConfig{IdentityToken: r.Secret, ServerAddress: reg}
+		a = Config{IdentityToken: r.Secret, ServerAddress: reg}
 	}
 	return a, true
 }
 
-func encodeAuth(a authConfig) string {
+// Encode renders a credential as the daemon's base64 JSON header value.
+func Encode(a Config) string {
 	b, _ := json.Marshal(a)
 	return base64.URLEncoding.EncodeToString(b)
 }
 
-func emptyAuth() string { return encodeAuth(authConfig{}) }
+// Empty is the header value for "no credentials".
+func Empty() string { return Encode(Config{}) }
 
-// registryConfigHeader builds X-Registry-Config for builds that pull from
-// private registries (only plain auths; helpers are resolved lazily per pull).
-func (c *Client) registryConfigHeader() string {
+// Configs returns every plain credential in the docker config, keyed by
+// registry, for builds that pull from private registries.
+func Configs() map[string]Config {
 	conf := loadConfig()
-	if conf == nil || len(conf.Auths) == 0 {
-		return ""
+	m := map[string]Config{}
+	if conf == nil {
+		return m
 	}
-	m := map[string]authConfig{}
 	for key, entry := range conf.Auths {
 		raw, err := base64.StdEncoding.DecodeString(entry.Auth)
 		if err != nil {
@@ -151,9 +163,15 @@ func (c *Client) registryConfigHeader() string {
 		}
 		u, p, ok := strings.Cut(string(raw), ":")
 		if ok {
-			m[key] = authConfig{Username: u, Password: p, ServerAddress: key}
+			m[key] = Config{Username: u, Password: p, ServerAddress: key}
 		}
 	}
+	return m
+}
+
+// ConfigsHeader renders Configs as the X-Registry-Config header value ("" when empty).
+func ConfigsHeader() string {
+	m := Configs()
 	if len(m) == 0 {
 		return ""
 	}

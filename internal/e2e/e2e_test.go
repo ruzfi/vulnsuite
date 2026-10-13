@@ -17,7 +17,7 @@ import (
 
 	"github.com/ruzfi/vulnsuite/pkg/builder"
 	"github.com/ruzfi/vulnsuite/pkg/contract"
-	"github.com/ruzfi/vulnsuite/pkg/engine/docker"
+	"github.com/ruzfi/vulnsuite/pkg/engine/engines"
 	"github.com/ruzfi/vulnsuite/pkg/loader"
 	"github.com/ruzfi/vulnsuite/pkg/runner"
 	"github.com/ruzfi/vulnsuite/pkg/validator"
@@ -102,9 +102,15 @@ func TestEndToEnd(t *testing.T) {
 	if os.Getenv("VULNSUITE_E2E") == "" {
 		t.Skip("set VULNSUITE_E2E=1 to run against a Docker daemon")
 	}
+	for _, kind := range []string{"sdk", "api"} {
+		t.Run(kind, func(t *testing.T) { endToEnd(t, kind) })
+	}
+}
+
+func endToEnd(t *testing.T, kind string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	eng, err := docker.New("")
+	eng, err := engines.New(kind, "")
 	if err != nil {
 		t.Fatal(err)
 	}
