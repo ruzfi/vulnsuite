@@ -311,6 +311,12 @@ func (c *Contract) checkStructure() error {
 					return se(ploc+"/tcp/port", "is required")
 				}
 			}
+			if p.Net != nil {
+				n++
+				if len(p.Net.Steps) == 0 {
+					return se(ploc+"/net/steps", "at least one step is required")
+				}
+			}
 			if n != 1 {
 				return se(ploc, "exactly one of http, exec, tcp must be set")
 			}

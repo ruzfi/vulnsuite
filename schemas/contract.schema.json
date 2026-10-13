@@ -569,6 +569,57 @@
               "exclusiveMinimum": 0
             }
           }
+        },
+        "net": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "steps"
+          ],
+          "description": "scripted TCP dialogue (send/expect steps over one connection) for multi-step protocols",
+          "properties": {
+            "port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            },
+            "tls": {
+              "type": "boolean"
+            },
+            "timeout": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "steps": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "send": {
+                    "type": "string"
+                  },
+                  "expect": {
+                    "type": "string",
+                    "description": "regex the response must match"
+                  },
+                  "expect_absent": {
+                    "type": "string",
+                    "description": "regex the response must NOT match"
+                  },
+                  "read": {
+                    "type": "integer",
+                    "description": "bytes to read after this step (default 4096)"
+                  },
+                  "no_read": {
+                    "type": "boolean",
+                    "description": "send without reading a response"
+                  }
+                }
+              }
+            }
+          }
         }
       }
     }

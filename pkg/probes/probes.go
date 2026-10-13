@@ -209,6 +209,8 @@ func Run(ctx context.Context, p contract.Probe, t Target) Result {
 		ok, detail, err = runExec(ctx, p.Exec, t)
 	case "tcp":
 		ok, detail, err = runTCP(ctx, p.TCP, t)
+	case "net":
+		ok, detail, err = runNet(ctx, p.Net, t)
 	default:
 		err = fmt.Errorf("unknown probe kind %q", p.Kind())
 	}
@@ -313,6 +315,61 @@ func runTCP(ctx context.Context, s *contract.TCPProbe, t Target) (bool, string, 
 		return false, fmt.Sprintf("tcp %d banner %q !~ /%s/", port, trunc(banner, 60), s.BannerMatches), nil
 	}
 	return true, fmt.Sprintf("tcp %d -> %q", port, trunc(banner, 60)), nil
+}
+
+func runNet(ctx context.Context, s *contract.NetProbe, t Target) (bool, string, error) {
+	port := s.Port
+	if port == 0 {
+		port = t.Port
+	}
+	timeout := secs(s.Timeout, 15*time.Second)
+	d := net.Dialer{Timeout: timeout}
+	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(t.Host, strconv.Itoa(port)))
+	if err != nil {
+		return false, "", fmt.Errorf("net %d -> %v", port, err)
+	}
+	defer conn.Close()
+	if s.TLS || t.Scheme == "https" {
+		tc := tls.Client(conn, &tls.Config{InsecureSkipVerify: true, ServerName: t.Host}) //nolint:gosec // knowingly-vulnerable targets
+		if err := tc.HandshakeContext(ctx); err != nil {
+			return false, "", fmt.Errorf("net %d tls -> %v", port, err)
+		}
+		conn = tc
+	}
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	var log strings.Builder
+	for i, step := range s.Steps {
+		if step.Send != "" {
+			if _, err := io.WriteString(conn, step.Send); err != nil {
+				return false, "", fmt.Errorf("net step %d send -> %v", i+1, err)
+			}
+			log.WriteString("> " + oneline(step.Send) + "\n")
+		}
+		if step.NoRead {
+			continue
+		}
+		readN := step.Read
+		if readN <= 0 {
+			readN = 4096
+		}
+		buf := make([]byte, readN)
+		n, _ := conn.Read(buf) // a timeout yields what arrived, which the expect then judges
+		resp := string(buf[:n])
+		log.WriteString("< " + oneline(resp) + "\n")
+		if step.Expect != "" && !matchDotAll(step.Expect, resp) {
+			return false, fmt.Sprintf("net step %d: %q !~ /%s/\n%s", i+1, trunc(resp, 80), step.Expect, log.String()), nil
+		}
+		if step.ExpectAbsent != "" && matchDotAll(step.ExpectAbsent, resp) {
+			return false, fmt.Sprintf("net step %d: %q unexpectedly ~ /%s/\n%s", i+1, trunc(resp, 80), step.ExpectAbsent, log.String()), nil
+		}
+	}
+	return true, "net dialogue ok (" + strconv.Itoa(len(s.Steps)) + " steps)", nil
+}
+
+func oneline(s string) string {
+	s = strings.ReplaceAll(s, "\r", "\\r")
+	s = strings.ReplaceAll(s, "\n", "\\n")
+	return trunc(s, 120)
 }
 
 // RunAll executes every probe; it reports overall success and a line per probe.

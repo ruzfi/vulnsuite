@@ -145,12 +145,34 @@ type TCPProbe struct {
 	Timeout       float64 `yaml:"timeout,omitempty" json:"timeout,omitempty"`
 }
 
+// NetStep is one step of a scripted TCP dialogue: optionally send bytes, then
+// read the response and assert on it. The first step usually only reads (a
+// server banner).
+type NetStep struct {
+	Send         string `yaml:"send,omitempty" json:"send,omitempty"`
+	Expect       string `yaml:"expect,omitempty" json:"expect,omitempty"`               // regex the response must match
+	ExpectAbsent string `yaml:"expect_absent,omitempty" json:"expect_absent,omitempty"` // regex the response must NOT match
+	Read         int    `yaml:"read,omitempty" json:"read,omitempty"`                   // bytes to read after this step (default 4096; 0 = skip read)
+	NoRead       bool   `yaml:"no_read,omitempty" json:"no_read,omitempty"`             // send without reading a response
+}
+
+// NetProbe runs an ordered send/expect dialogue over one TCP connection, for
+// multi-step protocols (FTP SITE commands, SMTP, line protocols) that a
+// single-shot tcp probe cannot express.
+type NetProbe struct {
+	Port    int       `yaml:"port,omitempty" json:"port,omitempty"`
+	TLS     bool      `yaml:"tls,omitempty" json:"tls,omitempty"`
+	Steps   []NetStep `yaml:"steps" json:"steps"`
+	Timeout float64   `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+}
+
 // Probe proves a target is genuinely in its declared state. Exactly one of the
 // kinds is set.
 type Probe struct {
 	HTTP *HTTPProbe `yaml:"http,omitempty" json:"http,omitempty"`
 	Exec *ExecProbe `yaml:"exec,omitempty" json:"exec,omitempty"`
 	TCP  *TCPProbe  `yaml:"tcp,omitempty" json:"tcp,omitempty"`
+	Net  *NetProbe  `yaml:"net,omitempty" json:"net,omitempty"`
 }
 
 // Kind returns "http", "exec", "tcp" or "" when nothing is set.
@@ -162,6 +184,8 @@ func (p Probe) Kind() string {
 		return "exec"
 	case p.TCP != nil:
 		return "tcp"
+	case p.Net != nil:
+		return "net"
 	}
 	return ""
 }

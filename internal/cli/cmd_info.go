@@ -158,6 +158,8 @@ func probeSummary(p contract.Probe) string {
 		return fmt.Sprintf("tcp :%d send %q banner ~ /%s/", p.TCP.Port, p.TCP.Send, p.TCP.BannerMatches)
 	case "exec":
 		return fmt.Sprintf("exec %q stdout ~ /%s/", p.Exec.Run, p.Exec.StdoutMatches)
+	case "net":
+		return fmt.Sprintf("net :%d, %d-step dialogue", p.Net.Port, len(p.Net.Steps))
 	}
 	return p.Kind()
 }

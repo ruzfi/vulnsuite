@@ -234,6 +234,17 @@ func (v *Validator) verify(c *contract.Contract) []Finding {
 							fmt.Sprintf("%s: verify probe #%d: %v", name, i+1, err)})
 					}
 				}
+			case "net":
+				for _, st := range p.Net.Steps {
+					for _, re := range []string{st.Expect, st.ExpectAbsent} {
+						if re != "" {
+							if _, err := regexp.Compile(re); err != nil {
+								out = append(out, Finding{Error, c.ID(), "bad-regex",
+									fmt.Sprintf("%s: verify probe #%d: %v", name, i+1, err)})
+							}
+						}
+					}
+				}
 			}
 		}
 	}

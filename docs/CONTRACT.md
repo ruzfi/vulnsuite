@@ -152,11 +152,21 @@ demonstrate the *impact* from the advisory, not a matcher.
     port: 6379
     send: "PING\r\n"
     banner_matches: "\\+PONG"
+- net:                            # scripted multi-step dialogue over one connection
+    port: 21
+    steps:
+      - expect: "^220"            # read the banner
+      - send: "SITE CPFR /etc/hostname\r\n"
+        expect: "^350"
+      - send: "SITE CPTO /tmp/canary\r\n"
+        expect: "Copy successful" # each step: send?, then read and assert expect / expect_absent
 - exec:
     run: "cat /etc/shadow"
     expect_exit: 0
     stdout_matches: "root:"
 ```
+
+The `net` probe runs an ordered send/expect dialogue over a single TCP connection (optionally TLS), for multi-step protocols -- FTP SITE commands, SMTP, line protocols -- that a one-shot `tcp` probe cannot express. Each step optionally sends bytes, then reads the response and asserts `expect` (regex must match) and/or `expect_absent`.
 
 HTTP probes are sent over a raw socket so the request line is exactly what the
 template says. Chunked responses are decoded. `https` ports skip certificate

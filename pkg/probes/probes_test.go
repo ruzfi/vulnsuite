@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -188,5 +189,85 @@ func TestParseHTTPTolerant(t *testing.T) {
 	}
 	if _, err := parseHTTP([]byte("not http")); err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+// netServer mimics a line protocol: it greets, then replies per the command
+// prefix from the script map.
+func netServer(t *testing.T, greet string, reply map[string]string) (string, int) {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				io.WriteString(c, greet)
+				buf := make([]byte, 512)
+				for {
+					c.SetReadDeadline(time.Now().Add(2 * time.Second))
+					n, err := c.Read(buf)
+					if err != nil {
+						return
+					}
+					line := strings.ToUpper(strings.TrimSpace(string(buf[:n])))
+					sent := false
+					for prefix, resp := range reply {
+						if strings.HasPrefix(line, strings.ToUpper(prefix)) {
+							io.WriteString(c, resp)
+							sent = true
+							break
+						}
+					}
+					if !sent {
+						io.WriteString(c, "500 not understood\r\n")
+					}
+				}
+			}(c)
+		}
+	}()
+	a := l.Addr().(*net.TCPAddr)
+	return a.IP.String(), a.Port
+}
+
+func TestNetProbe(t *testing.T) {
+	// a mod_copy-style dialogue: the detectable surface is "Copy successful"
+	steps := []contract.NetStep{
+		{Expect: "^220"},
+		{Send: "SITE CPFR /etc/hostname\r\n", Expect: "^350"},
+		{Send: "SITE CPTO /tmp/canary\r\n", Expect: "Copy successful"},
+	}
+	// vulnerable: pre-auth SITE commands succeed
+	host, port := netServer(t, "220 ProFTPD 1.3.5 ready\r\n", map[string]string{
+		"SITE CPFR": "350 ready for destination\r\n", "SITE CPTO": "250 Copy successful\r\n"})
+	r := Run(context.Background(), contract.Probe{Net: &contract.NetProbe{Steps: steps}}, Target{Host: host, Port: port})
+	if !r.OK {
+		t.Fatalf("vulnerable dialogue should pass: %s", r.Detail)
+	}
+	// patched: pre-auth denied -> fails at the 350 step, with a trace
+	host, port = netServer(t, "220 ProFTPD 1.3.5a ready\r\n", map[string]string{
+		"SITE CPFR": "530 Please login with USER and PASS\r\n"})
+	r = Run(context.Background(), contract.Probe{Net: &contract.NetProbe{Steps: steps}}, Target{Host: host, Port: port})
+	if r.OK || !strings.Contains(r.Detail, "step 2") || !strings.Contains(r.Detail, "530") {
+		t.Fatalf("patched dialogue should fail at step 2: ok=%v %s", r.OK, r.Detail)
+	}
+	// a patched-state probe asserts the patched response explicitly
+	patchedVerify := []contract.NetStep{{Expect: "^220"}, {Send: "SITE CPFR /x\r\n", Expect: "530|not understood"}}
+	r = Run(context.Background(), contract.Probe{Net: &contract.NetProbe{Steps: patchedVerify}}, Target{Host: host, Port: port})
+	if !r.OK {
+		t.Fatalf("patched verify should pass: %s", r.Detail)
+	}
+	// expect_absent
+	steps2 := []contract.NetStep{{Expect: "^220"}, {Send: "SITE CPFR /x\r\n", ExpectAbsent: "Copy successful"}}
+	r = Run(context.Background(), contract.Probe{Net: &contract.NetProbe{Steps: steps2}}, Target{Host: host, Port: port})
+	if !r.OK {
+		t.Fatalf("expect_absent should pass on patched: %s", r.Detail)
 	}
 }
