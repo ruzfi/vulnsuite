@@ -251,6 +251,41 @@ targets reproduce a named public template's fingerprint (`detected_by:
 ["nuclei:laravel-env"]`), `detection: custom-only` targets have no public
 template and exist to test *your* detection.
 
+## Which scanner template finds this target?
+
+Every template can name the scanner templates that detect it, so deploying a
+target also tells you what to point at it:
+
+```yaml
+metadata:
+  detected_by: ["nuclei:CVE-2021-41773"]   # declared: from the upstream template's fingerprint
+  detection: scanner                        # verified: fires on vulnerable, silent on patched
+```
+
+`vulnsuite info <id>` and every `vulnsuite run` print them. With a
+nuclei-templates checkout on the machine (`$NUCLEI_TEMPLATES`,
+`~/nuclei-templates`, or `-nuclei-templates DIR`) the ids are resolved to
+files, templates matching the target's CVEs that nobody declared yet are
+suggested, and `vulnsuite validate` warns about ids that don't exist:
+
+```
+$ vulnsuite info ssh-version-cve-2018-15473
+...
+scanner templates:
+  none known. No scanner template is linked to this target, and the local
+  nuclei-templates checkout has none for CVE-2018-15473.
+  this is a detection gap: a target exists but nothing can find it. Write a
+  nuclei template for it, verify it against both states, contribute it
+  upstream (https://github.com/projectdiscovery/nuclei-templates), then add
+  nuclei:<id> to detected_by in ssh-version-cve-2018-15473/contract.yaml
+```
+
+That last case is the point: a vulnsuite target with no scanner template is a
+ready-made, verified test bed for writing one. The template catalog therefore
+doubles as a to-do list for the detection ecosystem — `vulnsuite list` shows
+the DETECTED BY column, and `custom-only` marks targets that exist purely to
+test your own detection.
+
 ## Container hardening
 
 The real isolation for a knowingly-vulnerable target is the no-egress internal

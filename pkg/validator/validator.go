@@ -10,6 +10,7 @@ import (
 	"regexp"
 
 	"github.com/ruzfi/vulnsuite/pkg/contract"
+	"github.com/ruzfi/vulnsuite/pkg/scanners"
 )
 
 // Level is a finding severity.
@@ -42,6 +43,9 @@ type Validator struct {
 	// AllowUnpinned downgrades an unpinned base from an error to a warning
 	// (useful while authoring; pin before merging).
 	AllowUnpinned bool
+	// Scanners, when set, cross-checks detected_by against a nuclei-templates
+	// checkout (unknown ids, undeclared CVE matches).
+	Scanners *scanners.Index
 }
 
 // Check lints one contract.
@@ -248,6 +252,24 @@ func (v *Validator) provenance(c *contract.Contract) []Finding {
 	if c.Metadata.Detection == "scanner" && len(c.Metadata.DetectedBy) == 0 {
 		out = append(out, Finding{Warning, c.ID(), "scanner-unnamed",
 			"detection: scanner but detected_by names no scanner template"})
+	}
+	if c.Metadata.Detection == "" && len(c.Metadata.DetectedBy) == 0 {
+		out = append(out, Finding{Warning, c.ID(), "no-detected-by",
+			"no scanner template linked: list the ones that detect this target in detected_by (e.g. nuclei:<id>), " +
+				"or set detection: custom-only if none exists upstream (and consider contributing one)"})
+	}
+	if v.Scanners != nil {
+		rep := scanners.Match(c, v.Scanners)
+		for _, l := range rep.Declared {
+			if l.Missing {
+				out = append(out, Finding{Warning, c.ID(), "unknown-scanner-template",
+					fmt.Sprintf("detected_by names %s, which is not in %s", l.Ref, v.Scanners.Root)})
+			}
+		}
+		for _, t := range rep.Suggested {
+			out = append(out, Finding{Warning, c.ID(), "undeclared-scanner-template",
+				fmt.Sprintf("nuclei:%s (%s) matches this target's CVE but is not in detected_by; verify it against both states and declare it", t.ID, t.Path)})
+		}
 	}
 	return out
 }

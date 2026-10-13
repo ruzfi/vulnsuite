@@ -8,6 +8,7 @@ import (
 
 	"github.com/ruzfi/vulnsuite/pkg/contract"
 	"github.com/ruzfi/vulnsuite/pkg/loader"
+	"github.com/ruzfi/vulnsuite/pkg/scanners"
 )
 
 func fixtures(t *testing.T) []*contract.Contract {
@@ -134,5 +135,40 @@ states:
 	e, w := Count(v.CheckAll([]*contract.Contract{a, b}))
 	if e < 1 || w < 1 || Worst(v.Check(a)) != Warning {
 		t.Fatalf("count/worst: %d %d", e, w)
+	}
+}
+
+func TestScannerLinkRules(t *testing.T) {
+	v := &Validator{}
+	// nothing linked, nothing declared -> warn
+	c := parse(t, base)
+	if rules(v.Check(c))["no-detected-by"] != Warning {
+		t.Fatal("no-detected-by expected")
+	}
+	// custom-only silences it
+	c = parse(t, strings.Replace(base, "metadata: { id: lint-demo,", "metadata: { detection: custom-only, id: lint-demo,", 1))
+	if _, bad := rules(v.Check(c))["no-detected-by"]; bad {
+		t.Fatal("custom-only must not warn")
+	}
+	// cross-check against a checkout
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, "http"), 0o755)
+	os.WriteFile(filepath.Join(root, "http", "x.yaml"), []byte("id: real-template\ninfo:\n  classification:\n    cve-id: CVE-2021-41773\n"), 0o644)
+	idx, err := scanners.Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v = &Validator{Scanners: idx}
+	c = parse(t, strings.Replace(base, "vuln_refs: [VS-X]", "vuln_refs: [CVE-2021-41773], detected_by: [\"nuclei:ghost\"]", 1))
+	r := rules(v.Check(c))
+	if r["unknown-scanner-template"] != Warning || r["undeclared-scanner-template"] != Warning {
+		t.Fatalf("%v", r)
+	}
+	c = parse(t, strings.Replace(base, "vuln_refs: [VS-X]", "vuln_refs: [CVE-2021-41773], detected_by: [\"nuclei:real-template\"]", 1))
+	r = rules(v.Check(c))
+	for _, bad := range []string{"unknown-scanner-template", "undeclared-scanner-template", "no-detected-by"} {
+		if _, ok := r[bad]; ok {
+			t.Fatalf("%s should not fire: %v", bad, r)
+		}
 	}
 }

@@ -65,6 +65,14 @@ func TestListAndValidate(t *testing.T) {
 	if code != ExitUsage || !strings.Contains(errOut, "unknown command") {
 		t.Fatalf("unknown command: %d %s", code, errOut)
 	}
+	code, out, _ = run(t, nil, "-T", root, "info", "exposed-dotenv-file")
+	if code != ExitOK || !strings.Contains(out, "nuclei:laravel-env  verified") || !strings.Contains(out, "verify http GET /.env") {
+		t.Fatalf("info: %d\n%s", code, out)
+	}
+	code, out, _ = run(t, nil, "-T", root, "info", "grafana")
+	if code != ExitOK || !strings.Contains(out, "detection gap") {
+		t.Fatalf("info gap hint: %d\n%s", code, out)
+	}
 	code, out, _ = run(t, nil, "help", "build")
 	if code != ExitOK || !strings.Contains(out, "-registry") {
 		t.Fatalf("help: %d %s", code, out)

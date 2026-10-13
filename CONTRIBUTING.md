@@ -37,6 +37,7 @@ pkg/probes         raw-socket HTTP / TCP / exec verify probes
 pkg/engine         the container engine interface; moby/ (official SDK, default) and docker/ (built-in API client)
                    implementations; engines/ picks one; registryauth/ credentials; enginetest/ fake
 pkg/templates      templates directory resolution and update-templates
+pkg/scanners       links targets to scanner templates (detected_by), nuclei-templates index
 schemas/           JSON schema of the contract (kept in sync with pkg/contract)
 ```
 

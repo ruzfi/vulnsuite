@@ -39,8 +39,8 @@ Unknown fields are rejected. The machine-readable form of this document is
 | `references` | | the advisory and the fix |
 | `maintainer` | | who to ask |
 | `added` | | `YYYY-MM-DD` |
-| `detection` | | `scanner`: the target reproduces a real scanner template's fingerprint; `custom-only`: no public template exists |
-| `detected_by` | | the scanner templates it reproduces, e.g. `nuclei:laravel-env` |
+| `detected_by` | | the scanner templates that detect this target, as `<scanner>:<id>` (`nuclei:CVE-2021-41773`, `nuclei:laravel-env`). Declaring one means "this should fire on vulnerable and stay silent on patched". |
+| `detection` | | `scanner`: the `detected_by` entries are **verified** (you ran the scanner against both states); `custom-only`: no public scanner template exists, the target tests your own detection. Unset with `detected_by` present = declared, not yet verified. Unset with nothing declared = a detection gap (`validate` warns; write a template and contribute it upstream). |
 
 ## `base`
 
@@ -154,6 +154,8 @@ rather than failed; use `-expose host` or scan from a container.
 | `no-patched`, `no-verify`, `weak-verify`, `identical-states` | warning | the template proves less than it could |
 | `source-no-diff` | warning | a source base where states have no patch/image difference |
 | `no-healthcheck`, `no-vuln-ref`, `no-references`, `scanner-unnamed` | warning | missing provenance |
+| `no-detected-by` | warning | no scanner template linked and `detection` unset |
+| `unknown-scanner-template`, `undeclared-scanner-template` | warning | with a nuclei-templates checkout: a declared id does not exist / a template for the target's CVE is not declared |
 | `legacy-apiversion` | warning | `range.legacy/v2` |
 
 `-strict` turns warnings into failures (use it in CI).

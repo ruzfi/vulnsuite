@@ -9,6 +9,7 @@ import (
 
 	"github.com/ruzfi/vulnsuite/pkg/contract"
 	"github.com/ruzfi/vulnsuite/pkg/loader"
+	"github.com/ruzfi/vulnsuite/pkg/scanners"
 	"github.com/ruzfi/vulnsuite/pkg/templates"
 	"github.com/ruzfi/vulnsuite/pkg/validator"
 )
@@ -92,17 +93,22 @@ when unique). With no selector every template is listed.`,
 				return nil
 			}
 			tw := tabwriter.NewWriter(g.Stdout, 2, 4, 2, ' ', 0)
-			fmt.Fprintln(tw, "ID\tSEV\tSTATES\tKIND\tDETECTION\tREFS")
+			fmt.Fprintln(tw, "ID\tSEV\tSTATES\tKIND\tREFS\tDETECTED BY")
 			for _, r := range rows {
 				if r.Error != "" {
 					fmt.Fprintf(tw, "%s\t-\t-\t-\t-\t(unloadable: %s)\n", r.ID, r.Error)
 					continue
 				}
-				det := r.Detection
-				if det == "" {
-					det = "-"
+				det := strings.Join(r.DetectedBy, ",")
+				switch {
+				case det != "" && r.Detection == "scanner":
+					det += " (verified)"
+				case det == "" && r.Detection == "custom-only":
+					det = "custom-only"
+				case det == "":
+					det = "- (none linked)"
 				}
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", r.ID, r.Severity, strings.Join(r.States, ","), r.BuildKind, det, strings.Join(r.VulnRefs, ","))
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", r.ID, r.Severity, strings.Join(r.States, ","), r.BuildKind, strings.Join(r.VulnRefs, ","), det)
 			}
 			tw.Flush()
 			g.printf("\n%d templates in %s\n", len(rows), store.Root)
@@ -125,6 +131,7 @@ func has(list []string, v string) bool {
 func cmdValidate() *Command {
 	var sel multiFlag
 	var all, strict, allowUnpinned bool
+	var nucleiDir string
 	return &Command{
 		Name:  "validate",
 		Short: "validate template contracts (structure + semantic lint)",
@@ -134,6 +141,7 @@ func cmdValidate() *Command {
 			fs.BoolVar(&all, "all", false, "validate every template (the default when no -t is given)")
 			fs.BoolVar(&strict, "strict", false, "treat warnings as errors")
 			fs.BoolVar(&allowUnpinned, "allow-unpinned", false, "an unpinned base is a warning, not an error")
+			fs.StringVar(&nucleiDir, "nuclei-templates", "", "nuclei-templates checkout to cross-check detected_by against (default: $NUCLEI_TEMPLATES or ~/nuclei-templates when present)")
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
 			store, err := g.Store()
@@ -148,7 +156,16 @@ func cmdValidate() *Command {
 			if err != nil {
 				return err
 			}
-			findings := (&validator.Validator{AllowUnpinned: allowUnpinned}).CheckAll(cs)
+			v := &validator.Validator{AllowUnpinned: allowUnpinned}
+			if dir := scanners.ResolveDir(nucleiDir); dir != "" {
+				idx, err := scanners.Load(dir)
+				if err != nil {
+					return err
+				}
+				v.Scanners = idx
+				g.printf("cross-checking detected_by against %s (%d templates)\n", dir, idx.Count)
+			}
+			findings := v.CheckAll(cs)
 			nerr, nwarn := validator.Count(findings)
 			nerr += len(loadErrs)
 			if g.JSON {

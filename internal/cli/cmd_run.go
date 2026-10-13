@@ -13,6 +13,7 @@ import (
 	"github.com/ruzfi/vulnsuite/pkg/builder"
 	"github.com/ruzfi/vulnsuite/pkg/contract"
 	"github.com/ruzfi/vulnsuite/pkg/runner"
+	"github.com/ruzfi/vulnsuite/pkg/scanners"
 )
 
 // DefaultMaxConcurrent caps simultaneously running targets.
@@ -48,7 +49,7 @@ func cmdRun() *Command {
 	var sel multiFlag
 	var all, detach, noVerify, noPull, noCache, force bool
 	var maxConcurrent int
-	var targetsFile, platform, readyTimeout string
+	var targetsFile, platform, readyTimeout, nucleiDir string
 	exp := runner.DefaultExposure()
 	return &Command{
 		Name:  "run",
@@ -79,6 +80,7 @@ Exposure modes:
 			fs.BoolVar(&force, "force", false, "rebuild images even when they exist")
 			fs.StringVar(&platform, "platform", "", "target platform for builds, e.g. linux/amd64")
 			fs.StringVar(&readyTimeout, "ready-timeout", "", "override every template's healthcheck timeout, e.g. 120s")
+			fs.StringVar(&nucleiDir, "nuclei-templates", "", "nuclei-templates checkout used to resolve the scanner templates shown for each target")
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
 			state := contract.StateVulnerable
@@ -163,6 +165,10 @@ Exposure modes:
 			if !g.JSON && !g.Quiet {
 				opts.Build.Output = g.Stdout
 			}
+			var idx *scanners.Index
+			if dir := scanners.ResolveDir(nucleiDir); dir != "" {
+				idx, _ = scanners.Load(dir)
+			}
 			var handles []*runner.Handle
 			var failures []string
 			for _, c := range runnable {
@@ -191,6 +197,10 @@ Exposure modes:
 					g.printf("  ready: NO -- the healthcheck did not pass in time\n")
 				}
 				reportVerify(g, h, "  ")
+				g.printf("  scanner templates:\n")
+				for _, line := range scanners.Match(c, idx).Lines(c) {
+					g.printf("  %s\n", line)
+				}
 			}
 			if len(handles) == 0 {
 				return fmt.Errorf("nothing came up")
