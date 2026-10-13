@@ -68,7 +68,7 @@ base: { kind: build, context: src, dockerfile: Dockerfile, build_args: {} }
 | `command` | string or list; overrides the image command |
 | `environment` | map; merged with the state's environment (state wins) |
 | `healthcheck` | `{ http: { path, status }, timeout: 60s }` or `{ tcp: { port }, timeout }`; `timeout` is `<n>s|m|h` |
-| `sidecars` | helper containers `{ name, image, digest, environment }` started on the same network, reachable by `name` |
+| `sidecars` | helper containers `{ name, image, digest, command, environment }` started on the same network, reachable by `name` (`command` sets the container command, e.g. a `server ...` arg list for a clustered node) |
 | `user` | run-as `uid` or `uid:gid` |
 | `cap_add` / `cap_drop` | Linux capabilities, e.g. `cap_drop: [ALL]` then `cap_add: [CAP_NET_BIND_SERVICE]` |
 | `devices` | host devices to pass through, e.g. `/dev/kvm` |
@@ -113,6 +113,7 @@ scanner's discrimination cannot be checked). Each state:
 | `overlay` | `[{ src, dest, mode }]` files from the template baked into the image (`image` base) or written into the build context (`source`/`build` base) |
 | `environment` | baked into built images and passed at run time |
 | `command` | per-state command override |
+| `sidecars` | per-state sidecar image overrides, `{ <name>: { image, digest } }` -- swap a sidecar to another version for this state (e.g. the fixed release on every node of a multi-node cluster, which will not form across mixed versions) |
 | `seed` | `[{ run: "..." }]` shell steps executed inside the container once it is up |
 | `verify` | probes that prove the state |
 
