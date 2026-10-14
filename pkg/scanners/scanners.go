@@ -21,8 +21,14 @@ import (
 	"github.com/ruzfi/vulnsuite/pkg/contract"
 )
 
-// Nuclei is the scanner name used in detected_by refs.
-const Nuclei = "nuclei"
+// Scanner names used in detected_by refs.
+const (
+	Nuclei = "nuclei" // projectdiscovery nuclei templates
+	Nmap   = "nmap"   // nmap NSE scripts (e.g. nmap:http-aspnet-debug)
+)
+
+// Known is the set of recognized scanner names a detected_by ref may use.
+var Known = map[string]bool{Nuclei: true, Nmap: true}
 
 // Env names a nuclei-templates checkout.
 const Env = "NUCLEI_TEMPLATES"
@@ -37,6 +43,9 @@ type Ref struct {
 }
 
 func (r Ref) String() string { return r.Scanner + ":" + r.ID }
+
+// Known reports whether the ref names a recognized scanner.
+func (r Ref) Known() bool { return Known[r.Scanner] }
 
 // ParseRef splits "scanner:id". A bare id is assumed to be nuclei's.
 func ParseRef(s string) Ref {

@@ -114,3 +114,27 @@ func TestResolveDir(t *testing.T) {
 		t.Fatal("expected none")
 	}
 }
+
+func TestParseRefScannersAndKnown(t *testing.T) {
+	cases := []struct {
+		in      string
+		scanner string
+		id      string
+		known   bool
+	}{
+		{"nuclei:CVE-2021-41773", "nuclei", "CVE-2021-41773", true},
+		{"nmap:http-aspnet-debug", "nmap", "http-aspnet-debug", true},
+		{"laravel-env", "nuclei", "laravel-env", true}, // bare id defaults to nuclei
+		{"NMAP:Foo", "nmap", "Foo", true},              // scanner lowercased
+		{"bogus:x", "bogus", "x", false},
+	}
+	for _, c := range cases {
+		r := ParseRef(c.in)
+		if r.Scanner != c.scanner || r.ID != c.id {
+			t.Errorf("ParseRef(%q) = %+v, want %s:%s", c.in, r, c.scanner, c.id)
+		}
+		if r.Known() != c.known {
+			t.Errorf("ParseRef(%q).Known() = %v, want %v", c.in, r.Known(), c.known)
+		}
+	}
+}

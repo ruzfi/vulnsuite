@@ -300,6 +300,12 @@ func (v *Validator) provenance(c *contract.Contract) []Finding {
 			"no scanner template linked: list the ones that detect this target in detected_by (e.g. nuclei:<id>), " +
 				"or set detection: custom-only if none exists upstream (and consider contributing one)"})
 	}
+	for _, r := range scanners.Refs(c) {
+		if !r.Known() {
+			out = append(out, Finding{Warning, c.ID(), "unknown-scanner",
+				fmt.Sprintf("detected_by %q uses an unrecognized scanner; known scanners are nuclei and nmap", r.String())})
+		}
+	}
 	if v.Scanners != nil {
 		rep := scanners.Match(c, v.Scanners)
 		for _, l := range rep.Declared {

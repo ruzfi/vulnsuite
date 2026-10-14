@@ -40,7 +40,7 @@ Unknown fields are rejected. The machine-readable form of this document is
 | `maintainer` | | who to ask |
 | `added` | | `YYYY-MM-DD` |
 | `fidelity` | | `real` = runs the genuine affected software (the default and strongly preferred); `simulated` = a hand-written stand-in that reproduces the behaviour. Only use `simulated` when no public image or buildable upstream source reproduces the flaw (bare-OS/device/protocol sims). |
-| `detected_by` | | the scanner templates that detect this target, as `<scanner>:<id>` (`nuclei:CVE-2021-41773`, `nuclei:laravel-env`). Declaring one means "this should fire on vulnerable and stay silent on patched". |
+| `detected_by` | | the scanner templates/scripts that detect this target, as `<scanner>:<id>`. Known scanners: `nuclei:` (template id, e.g. `nuclei:CVE-2021-41773`, `nuclei:laravel-env`) and `nmap:` (NSE script, e.g. `nmap:http-aspnet-debug`). Declaring one means "this should fire on vulnerable and stay silent on patched". A bare id (no `scanner:`) defaults to nuclei. |
 | `detection` | | `scanner`: the `detected_by` entries are **verified** (you ran the scanner against both states); `custom-only`: no public scanner template exists, the target tests your own detection. Unset with `detected_by` present = declared, not yet verified. Unset with nothing declared = a detection gap (`validate` warns; write a template and contribute it upstream). |
 
 ## `base`
