@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 
 	"github.com/ruzfi/vulnsuite/pkg/contract"
 	"github.com/ruzfi/vulnsuite/pkg/scanners"
@@ -60,6 +61,7 @@ func (v *Validator) Check(c *contract.Contract) []Finding {
 	out = append(out, v.provenance(c)...)
 	out = append(out, v.fidelity(c)...)
 	out = append(out, v.requires(c)...)
+	out = append(out, v.hostAccess(c)...)
 	return out
 }
 
@@ -151,6 +153,30 @@ func (v *Validator) filesExist(c *contract.Contract) []Finding {
 		if st.Patch != "" && c.Base.Kind == contract.BaseImage {
 			out = append(out, Finding{Error, c.ID(), "patch-needs-source",
 				name + ": a patch can only be applied to a source or build base"})
+		}
+	}
+	return out
+}
+
+// safeCaps mirrors the runner's benign-capability allowlist.
+var safeCaps = map[string]bool{
+	"NET_BIND_SERVICE": true, "CHOWN": true, "SETUID": true, "SETGID": true,
+	"KILL": true, "FOWNER": true, "DAC_OVERRIDE": true,
+}
+
+// hostAccess warns when a template requests host-access primitives (device
+// passthrough or an elevated capability), so authors and reviewers see that
+// running it needs -allow-host-access and that it must be trusted.
+func (v *Validator) hostAccess(c *contract.Contract) []Finding {
+	var out []Finding
+	if len(c.Service.Devices) > 0 {
+		out = append(out, Finding{Warning, c.ID(), "host-device-access",
+			fmt.Sprintf("requests host device(s) %v; this is host access, so `run` needs -allow-host-access and the template must be trusted", c.Service.Devices)})
+	}
+	for _, cp := range c.Service.CapAdd {
+		if !safeCaps[strings.TrimPrefix(strings.ToUpper(cp), "CAP_")] {
+			out = append(out, Finding{Warning, c.ID(), "elevated-capability",
+				fmt.Sprintf("adds capability %q, which can escape the container; `run` needs -allow-host-access and the template must be trusted", cp)})
 		}
 	}
 	return out

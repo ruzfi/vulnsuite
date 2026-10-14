@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -158,5 +159,46 @@ func TestMergeEnvAndNames(t *testing.T) {
 	}
 	if FormatTarget("https", "::1", 443) != "https://[::1]:443" {
 		t.Fatal(FormatTarget("https", "::1", 443))
+	}
+}
+
+func TestRefusesHostAccessWithoutConsent(t *testing.T) {
+	fe := enginetest.New()
+	r := New(fe)
+	r.Reach = func(string, int, time.Duration) probes.Reach { return probes.Unreachable }
+	ctx := context.Background()
+	exp := Exposure{Mode: ModeInternal, Network: DefaultNetwork}
+
+	mk := func(dev []string, caps []string) *contract.Contract {
+		return &contract.Contract{
+			APIVersion: contract.APIVersion, Kind: "Target",
+			Metadata: contract.Metadata{ID: "hosttest"},
+			Base:     contract.Base{Kind: contract.BaseImage, Image: "alpine"},
+			Service: contract.Service{
+				Ports:    []contract.Port{{Container: 80, Protocol: "http"}},
+				Devices:  dev,
+				CapAdd:   caps,
+			},
+			States: map[string]*contract.State{
+				contract.StateVulnerable: {Name: contract.StateVulnerable, Verify: []contract.Probe{{TCP: &contract.TCPProbe{Port: 80}}}},
+			},
+		}
+	}
+
+	// device passthrough is refused without consent
+	if _, err := r.Run(ctx, mk([]string{"/dev/kvm"}, nil), contract.StateVulnerable, exp, Options{}); err == nil || !strings.Contains(err.Error(), "allow-host-access") {
+		t.Fatalf("device run should be refused without consent, got %v", err)
+	}
+	// an elevated capability is refused
+	if _, err := r.Run(ctx, mk(nil, []string{"SYS_ADMIN"}), contract.StateVulnerable, exp, Options{}); err == nil || !strings.Contains(err.Error(), "allow-host-access") {
+		t.Fatalf("SYS_ADMIN run should be refused without consent, got %v", err)
+	}
+	// a benign capability is allowed (reaches the engine, no refusal)
+	if _, err := r.Run(ctx, mk(nil, []string{"NET_BIND_SERVICE"}), contract.StateVulnerable, exp, Options{Build: builder.Options{Pull: true}}); err != nil && strings.Contains(err.Error(), "allow-host-access") {
+		t.Fatalf("benign cap should not be gated: %v", err)
+	}
+	// with consent, device passthrough is honored (reaches the engine)
+	if _, err := r.Run(ctx, mk([]string{"/dev/kvm"}, nil), contract.StateVulnerable, exp, Options{AllowHostAccess: true, Build: builder.Options{Pull: true}}); err != nil && strings.Contains(err.Error(), "allow-host-access") {
+		t.Fatalf("consent should allow device passthrough: %v", err)
 	}
 }

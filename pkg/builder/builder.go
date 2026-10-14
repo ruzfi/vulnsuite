@@ -253,8 +253,12 @@ func (b *Builder) buildSource(ctx context.Context, c *contract.Contract, st *con
 		return err
 	}
 	defer os.RemoveAll(tmp)
+	if err := validateRepoURL(c.Base.Repo); err != nil {
+		return err
+	}
 	repo := filepath.Join(tmp, "src")
-	if out, err := b.git(ctx, "", 10*time.Minute, "clone", "--filter=blob:none", "--no-checkout", c.Base.Repo, repo); err != nil {
+	// "--" stops the repo value being read as an option.
+	if out, err := b.git(ctx, "", 10*time.Minute, "clone", "--filter=blob:none", "--no-checkout", "--", c.Base.Repo, repo); err != nil {
 		return fmt.Errorf("clone %s: %s", c.Base.Repo, tail(out))
 	}
 	if out, err := b.git(ctx, repo, 2*time.Minute, "checkout", "--quiet", c.Base.Commit); err != nil {
@@ -308,15 +312,54 @@ func bakeEnv(mc *memContext, dockerfile string, env map[string]string) error {
 }
 
 func (b *Builder) applyPatch(ctx context.Context, dir, patch string) error {
-	if out, err := b.git(ctx, dir, 2*time.Minute, "apply", "--unsafe-paths", "--directory", dir, patch); err == nil {
+	// A patch is untrusted template content applied on the host. Refuse any
+	// hunk that targets an absolute path or escapes the source tree with "..".
+	if err := patchStaysInTree(patch); err != nil {
+		return fmt.Errorf("apply %s: %w", filepath.Base(patch), err)
+	}
+	// No --unsafe-paths: git apply then refuses paths outside the working tree.
+	if out, err := b.git(ctx, dir, 2*time.Minute, "apply", "--directory", dir, "--", patch); err == nil {
 		return nil
 	} else if _, perr := exec.LookPath("patch"); perr != nil {
 		return fmt.Errorf("apply %s: %s", filepath.Base(patch), tail(out))
 	}
-	cmd := exec.CommandContext(ctx, "patch", "-p1", "-d", dir, "-i", patch)
+	// Fallback: GNU patch, refusing absolute targets and never creating files
+	// outside dir (the patchStaysInTree check above already bars "..").
+	cmd := exec.CommandContext(ctx, "patch", "-p1", "--no-absolute-filenames", "--forward", "-d", dir, "-i", patch)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("apply %s: %s", filepath.Base(patch), tail(string(out)))
+	}
+	return nil
+}
+
+// patchStaysInTree rejects a unified diff whose target paths are absolute or
+// contain a ".." segment, so applying it cannot write outside the source tree.
+func patchStaysInTree(patch string) error {
+	data, err := os.ReadFile(patch)
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "--- ") && !strings.HasPrefix(line, "+++ ") {
+			continue
+		}
+		p := strings.TrimSpace(line[4:])
+		if i := strings.IndexAny(p, "\t "); i >= 0 { // strip trailing timestamp
+			p = p[:i]
+		}
+		p = strings.TrimPrefix(strings.TrimPrefix(p, "a/"), "b/")
+		if p == "" || p == "/dev/null" {
+			continue
+		}
+		if strings.HasPrefix(p, "/") {
+			return fmt.Errorf("patch targets an absolute path %q", p)
+		}
+		for _, seg := range strings.Split(filepath.ToSlash(p), "/") {
+			if seg == ".." {
+				return fmt.Errorf("patch escapes the source tree via %q", p)
+			}
+		}
 	}
 	return nil
 }
@@ -335,8 +378,47 @@ func (b *Builder) git(ctx context.Context, dir string, timeout time.Duration, ar
 	if dir != "" {
 		cmd.Dir = dir
 	}
+	// Templates are untrusted. Restrict git to network transports (no ext::/
+	// fd:: which execute arbitrary commands, no local file:: side effects) and
+	// never prompt for credentials on the host.
+	cmd.Env = append(os.Environ(),
+		"GIT_ALLOW_PROTOCOL=https:http:git:ssh",
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_PROTOCOL_FROM_USER=0",
+	)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+// validateRepoURL rejects repo values that a malicious template could use to
+// run commands on the host at clone time (git ext::/fd:: transports, option
+// injection via a leading dash) or reach the local filesystem (file://, bare
+// paths). Only real remote URLs are allowed.
+func validateRepoURL(repo string) error {
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return errors.New("base.repo is empty")
+	}
+	if strings.HasPrefix(repo, "-") {
+		return fmt.Errorf("base.repo %q may not start with '-'", repo)
+	}
+	if strings.Contains(repo, "::") {
+		return fmt.Errorf("base.repo %q uses a disallowed git transport; use an https, git or ssh URL", repo)
+	}
+	if i := strings.Index(repo, "://"); i >= 0 {
+		switch strings.ToLower(repo[:i]) {
+		case "https", "http", "git", "ssh":
+			return nil
+		default:
+			return fmt.Errorf("base.repo scheme %q is not allowed; use https, git or ssh", repo[:i])
+		}
+	}
+	// scp-like remote (user@host:path), not a local path.
+	if strings.Contains(repo, "@") && strings.Contains(repo, ":") &&
+		!strings.HasPrefix(repo, "/") && !strings.HasPrefix(repo, ".") {
+		return nil
+	}
+	return fmt.Errorf("base.repo %q is not an allowed remote URL (use https://, git://, ssh:// or user@host:path)", repo)
 }
 
 func tail(s string) string {

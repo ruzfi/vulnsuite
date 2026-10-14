@@ -50,7 +50,7 @@ func cmdRun() *Command {
 	var all, detach, noVerify, noPull, noCache, force bool
 	var maxConcurrent int
 	var targetsFile, platform, readyTimeout, nucleiDir string
-	var ignoreRequires bool
+	var ignoreRequires, allowHostAccess bool
 	exp := runner.DefaultExposure()
 	return &Command{
 		Name:  "run",
@@ -83,6 +83,7 @@ Exposure modes:
 			fs.StringVar(&readyTimeout, "ready-timeout", "", "override every template's healthcheck timeout, e.g. 120s")
 			fs.StringVar(&nucleiDir, "nuclei-templates", "", "nuclei-templates checkout used to resolve the scanner templates shown for each target")
 			fs.BoolVar(&ignoreRequires, "ignore-requires", false, "run even when the host does not meet a target's requires (arch/kvm/host_os)")
+			fs.BoolVar(&allowHostAccess, "allow-host-access", false, "honor a template's host device passthrough and elevated capabilities (host-access primitives; only for templates you trust)")
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
 			state := contract.StateVulnerable
@@ -156,7 +157,7 @@ Exposure modes:
 				multi = len(runnable) > 1
 			}
 
-			opts := runner.Options{Verify: !noVerify, Build: builder.Options{Pull: !noPull, NoCache: noCache, Force: force, Platform: platform}}
+			opts := runner.Options{Verify: !noVerify, AllowHostAccess: allowHostAccess, Build: builder.Options{Pull: !noPull, NoCache: noCache, Force: force, Platform: platform}}
 			if readyTimeout != "" {
 				d, err := contract.ParseDuration(readyTimeout, 0)
 				if err != nil {

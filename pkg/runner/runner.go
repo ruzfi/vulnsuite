@@ -102,6 +102,42 @@ type Options struct {
 	ReadyTimeout time.Duration
 	// Build options used to resolve the image.
 	Build builder.Options
+	// AllowHostAccess honors a template's host-device passthrough and elevated
+	// capabilities. Off by default: those are host-access primitives and
+	// templates are untrusted, so the user must opt in per run.
+	AllowHostAccess bool
+}
+
+// safeCaps are capabilities benign enough to add without host-access consent.
+// Everything else (SYS_ADMIN, SYS_PTRACE, SYS_MODULE, NET_ADMIN, DAC_READ_SEARCH,
+// SYS_RAWIO, ...) can lead to a container escape and is consent-gated.
+var safeCaps = map[string]bool{
+	"NET_BIND_SERVICE": true,
+	"CHOWN":            true,
+	"SETUID":           true,
+	"SETGID":           true,
+	"KILL":             true,
+	"FOWNER":           true,
+	"DAC_OVERRIDE":     true,
+}
+
+// unsafeHostRequest returns a human-readable reason when a contract asks for
+// host access (device passthrough or a non-benign added capability), or "".
+func unsafeHostRequest(c *contract.Contract) string {
+	var reasons []string
+	if len(c.Service.Devices) > 0 {
+		reasons = append(reasons, fmt.Sprintf("host device(s) %v", c.Service.Devices))
+	}
+	var caps []string
+	for _, cp := range c.Service.CapAdd {
+		if !safeCaps[strings.ToUpper(strings.TrimPrefix(strings.ToUpper(cp), "CAP_"))] {
+			caps = append(caps, cp)
+		}
+	}
+	if len(caps) > 0 {
+		reasons = append(reasons, fmt.Sprintf("elevated capabilit(ies) %v", caps))
+	}
+	return strings.Join(reasons, " and ")
 }
 
 // Runner runs targets.
@@ -130,6 +166,16 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 	}
 	if exp.Bind == "" {
 		exp.Bind = "127.0.0.1"
+	}
+	// Templates are untrusted. Host device passthrough and elevated
+	// capabilities can escape the container to the host, which is never needed
+	// just to stand up a vulnerable service, so they require explicit per-run
+	// consent.
+	if !opts.AllowHostAccess {
+		if reason := unsafeHostRequest(c); reason != "" {
+			return nil, fmt.Errorf("refusing to run %s: it requests %s, which grants access to the host. "+
+				"Re-run with -allow-host-access only if you trust this template", c.ID(), reason)
+		}
 	}
 	img, err := r.Builder.Resolve(ctx, c, state, opts.Build)
 	if err != nil {

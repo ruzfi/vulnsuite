@@ -187,3 +187,45 @@ func keys(m map[string]string) []string {
 	}
 	return out
 }
+
+func TestValidateRepoURL(t *testing.T) {
+	ok := []string{
+		"https://github.com/x/y", "http://h/x", "git://h/x.git",
+		"ssh://git@h/x.git", "git@github.com:x/y.git",
+	}
+	bad := []string{
+		"", "ext::sh -c 'id'", "fd::17/foo", "file:///etc/passwd",
+		"-u/evil", "--upload-pack=touch /tmp/x", "/local/path", "./rel",
+	}
+	for _, r := range ok {
+		if err := validateRepoURL(r); err != nil {
+			t.Errorf("validateRepoURL(%q) = %v, want nil", r, err)
+		}
+	}
+	for _, r := range bad {
+		if err := validateRepoURL(r); err == nil {
+			t.Errorf("validateRepoURL(%q) = nil, want error", r)
+		}
+	}
+}
+
+func TestPatchStaysInTree(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		os.WriteFile(p, []byte(body), 0o644)
+		return p
+	}
+	good := write("ok.patch", "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-x\n+y\n")
+	if err := patchStaysInTree(good); err != nil {
+		t.Errorf("good patch rejected: %v", err)
+	}
+	trav := write("trav.patch", "--- a/x\n+++ b/../../../../etc/cron.d/evil\n@@ -0,0 +1 @@\n+* * * * * root id\n")
+	if err := patchStaysInTree(trav); err == nil {
+		t.Error("traversal patch should be rejected")
+	}
+	abs := write("abs.patch", "--- /dev/null\n+++ /root/.ssh/authorized_keys\n@@ -0,0 +1 @@\n+ssh-rsa AAAA\n")
+	if err := patchStaysInTree(abs); err == nil {
+		t.Error("absolute-path patch should be rejected")
+	}
+}

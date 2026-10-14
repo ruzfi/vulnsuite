@@ -249,6 +249,9 @@ func (c *Contract) checkStructure() error {
 		if !deviceRe.MatchString(d) {
 			return se("service/devices", "%q must be a /dev path", d)
 		}
+		if dangerousDevice(d) {
+			return se("service/devices", "%q gives raw host disk/memory access and is never needed for a target", d)
+		}
 	}
 	if s.Healthcheck.Timeout != "" && !timeoutRe.MatchString(s.Healthcheck.Timeout) {
 		return se("service/healthcheck/timeout", "must look like 60s or 5m")
@@ -348,6 +351,27 @@ func (c *Contract) checkStructure() error {
 func isLegacyAPIVersion(v string) bool {
 	for _, l := range LegacyAPIVersions {
 		if l == v {
+			return true
+		}
+	}
+	return false
+}
+
+// dangerousDevice reports whether a /dev path grants raw host disk or memory
+// access (a direct host-compromise primitive, never legitimate for a target).
+// Device access that can be legitimate (e.g. /dev/kvm) is allowed here but
+// still consent-gated at run time.
+func dangerousDevice(d string) bool {
+	d = strings.ToLower(strings.TrimRight(d, "0123456789"))
+	switch d {
+	case "/dev/mem", "/dev/kmem", "/dev/port", "/dev/msr":
+		return true
+	}
+	for _, pfx := range []string{
+		"/dev/sd", "/dev/hd", "/dev/vd", "/dev/xvd", "/dev/nvme", "/dev/sg",
+		"/dev/dm-", "/dev/loop", "/dev/md", "/dev/mmcblk", "/dev/disk", "/dev/mapper",
+	} {
+		if strings.HasPrefix(d, pfx) {
 			return true
 		}
 	}
