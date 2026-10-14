@@ -177,7 +177,7 @@ Exposure modes:
 				idx, _ = scanners.Load(dir)
 			}
 			var handles []*runner.Handle
-			var failures, skippedReq []string
+			var failures, skippedReq, skippedHost []string
 			for _, c := range runnable {
 				if multi {
 					g.printf("\n=== [%s] %s ===\n", c.ID(), state)
@@ -199,6 +199,13 @@ Exposure modes:
 						if tgtOpts.Build.Platform == "" {
 							tgtOpts.Build.Platform = d.Platform
 						}
+					}
+				}
+				if !allowHostAccess {
+					if reason := runner.HostAccessReason(c); reason != "" {
+						g.printf("  skip %s: needs host access (%s) -- re-run with -allow-host-access to include it\n", c.ID(), reason)
+						skippedHost = append(skippedHost, c.ID())
+						continue
 					}
 				}
 				g.printf("resolving image (%s)...\n", c.BuildKind(state))
@@ -227,6 +234,9 @@ Exposure modes:
 				}
 			}
 			if len(handles) == 0 {
+				if len(skippedHost) > 0 {
+					return fmt.Errorf("nothing came up: %d target(s) need -allow-host-access (%s)", len(skippedHost), strings.Join(skippedHost, ", "))
+				}
 				return fmt.Errorf("nothing came up")
 			}
 
@@ -266,6 +276,10 @@ Exposure modes:
 			if len(skippedReq) > 0 {
 				g.printf("\n%d skipped (host does not meet requires): %s\n", len(skippedReq), strings.Join(skippedReq, ", "))
 				g.printf("  override with -ignore-requires, or run on a matching host.\n")
+			}
+			if len(skippedHost) > 0 {
+				g.printf("\n%d skipped (needs host access): %s\n", len(skippedHost), strings.Join(skippedHost, ", "))
+				g.printf("  these request host devices or elevated capabilities; if you trust them, re-run with -allow-host-access.\n")
 			}
 			if len(overCap) > 0 {
 				ids := make([]string, 0, len(overCap))

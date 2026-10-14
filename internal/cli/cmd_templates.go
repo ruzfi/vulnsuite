@@ -9,6 +9,7 @@ import (
 
 	"github.com/ruzfi/vulnsuite/pkg/contract"
 	"github.com/ruzfi/vulnsuite/pkg/loader"
+	"github.com/ruzfi/vulnsuite/pkg/runner"
 	"github.com/ruzfi/vulnsuite/pkg/scanners"
 	"github.com/ruzfi/vulnsuite/pkg/templates"
 	"github.com/ruzfi/vulnsuite/pkg/validator"
@@ -39,6 +40,7 @@ type listRow struct {
 	Detection  string   `json:"detection,omitempty"`
 	DetectedBy []string `json:"detected_by,omitempty"`
 	Tags       []string `json:"tags,omitempty"`
+	HostAccess bool     `json:"host_access,omitempty"`
 	Summary    string   `json:"summary"`
 	Path       string   `json:"path"`
 	Error      string   `json:"error,omitempty"`
@@ -97,7 +99,8 @@ when unique). With no selector every template is listed.`,
 					ID: c.ID(), Severity: c.Metadata.Severity, States: c.DeclaredStates(),
 					BuildKind: c.BuildKind(contract.StateVulnerable), Fidelity: c.Fidelity(), VulnRefs: c.Metadata.VulnRefs,
 					Detection: c.Metadata.Detection, DetectedBy: c.Metadata.DetectedBy, Tags: c.Metadata.Tags,
-					Summary: c.Metadata.Summary, Path: p,
+					HostAccess: runner.HostAccessReason(c) != "",
+					Summary:    c.Metadata.Summary, Path: p,
 				})
 			}
 			if g.JSON {
@@ -123,10 +126,17 @@ when unique). With no selector every template is listed.`,
 				case det == "":
 					det = "- (none linked)"
 				}
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", r.ID, r.Severity, r.Fidelity, r.BuildKind, strings.Join(r.VulnRefs, ","), det)
+				kind := r.BuildKind
+				if r.HostAccess {
+					kind += "*"
+				}
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", r.ID, r.Severity, r.Fidelity, kind, strings.Join(r.VulnRefs, ","), det)
 			}
 			tw.Flush()
 			g.printf("\n%d templates in %s\n", len(rows), store.Root)
+			if anyHostAccess(rows) {
+				g.printf("* needs host access (device/elevated capability); run with -allow-host-access, and only for templates you trust.\n")
+			}
 			return nil
 		},
 	}
@@ -268,4 +278,13 @@ func cmdVersion() *Command {
 			return nil
 		},
 	}
+}
+
+func anyHostAccess(rows []listRow) bool {
+	for _, r := range rows {
+		if r.HostAccess {
+			return true
+		}
+	}
+	return false
 }

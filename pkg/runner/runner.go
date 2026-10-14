@@ -121,9 +121,10 @@ var safeCaps = map[string]bool{
 	"DAC_OVERRIDE":     true,
 }
 
-// unsafeHostRequest returns a human-readable reason when a contract asks for
+// HostAccessReason returns a human-readable reason when a contract asks for
 // host access (device passthrough or a non-benign added capability), or "".
-func unsafeHostRequest(c *contract.Contract) string {
+// Callers use it to consent-gate or to skip-with-reason before running.
+func HostAccessReason(c *contract.Contract) string {
 	var reasons []string
 	if len(c.Service.Devices) > 0 {
 		reasons = append(reasons, fmt.Sprintf("host device(s) %v", c.Service.Devices))
@@ -172,7 +173,7 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 	// just to stand up a vulnerable service, so they require explicit per-run
 	// consent.
 	if !opts.AllowHostAccess {
-		if reason := unsafeHostRequest(c); reason != "" {
+		if reason := HostAccessReason(c); reason != "" {
 			return nil, fmt.Errorf("refusing to run %s: it requests %s, which grants access to the host. "+
 				"Re-run with -allow-host-access only if you trust this template", c.ID(), reason)
 		}

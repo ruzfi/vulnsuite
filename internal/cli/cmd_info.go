@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/ruzfi/vulnsuite/pkg/contract"
+	"github.com/ruzfi/vulnsuite/pkg/runner"
 	"github.com/ruzfi/vulnsuite/pkg/scanners"
 )
 
@@ -100,6 +101,9 @@ writing a template and contributing it upstream.`,
 					parts = append(parts, "no-emulation")
 				}
 				kv("requires", strings.Join(parts, ", "))
+			}
+			if reason := runner.HostAccessReason(c); reason != "" {
+				kv("host access", reason+" -- run needs -allow-host-access (trust the template first)")
 			}
 			fmt.Fprintln(g.Stdout)
 			for _, name := range c.DeclaredStates() {
