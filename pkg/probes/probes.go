@@ -431,10 +431,26 @@ func Reachability(host string, port int, timeout time.Duration) Reach {
 		conn.Close()
 		return Open
 	}
-	if errors.Is(err, syscall.ECONNREFUSED) {
+	if isConnRefused(err) {
 		return Refused
 	}
 	return Unreachable
+}
+
+// wsaeConnRefused is Windows' WSAECONNREFUSED. On Windows a refused TCP dial
+// reports this value, which differs from syscall.ECONNREFUSED there, so
+// errors.Is(err, syscall.ECONNREFUSED) misses it. It is harmless on other
+// platforms, where a refused dial never carries errno 10061.
+const wsaeConnRefused = syscall.Errno(10061)
+
+// isConnRefused reports whether err is a TCP "connection refused", portably
+// across Unix and Windows.
+func isConnRefused(err error) bool {
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	var errno syscall.Errno
+	return errors.As(err, &errno) && errno == wsaeConnRefused
 }
 
 // WaitForPort polls until host:port accepts a TCP connection or the deadline passes.
