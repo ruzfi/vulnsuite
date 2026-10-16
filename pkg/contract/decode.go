@@ -148,7 +148,7 @@ func se(loc, format string, args ...any) error {
 
 // checkStructure enforces the same rules as schemas/contract.schema.json.
 func (c *Contract) checkStructure() error {
-	if c.APIVersion != APIVersion && !isLegacyAPIVersion(c.APIVersion) {
+	if c.APIVersion != APIVersion {
 		return se("apiVersion", "must be %q (got %q)", APIVersion, c.APIVersion)
 	}
 	if c.Kind != Kind {
@@ -348,15 +348,6 @@ func (c *Contract) checkStructure() error {
 	return nil
 }
 
-func isLegacyAPIVersion(v string) bool {
-	for _, l := range LegacyAPIVersions {
-		if l == v {
-			return true
-		}
-	}
-	return false
-}
-
 // dangerousDevice reports whether a /dev path grants raw host disk or memory
 // access (a direct host-compromise primitive, never legitimate for a target).
 // Device access that can be legitimate (e.g. /dev/kvm) is allowed here but
@@ -378,5 +369,3 @@ func dangerousDevice(d string) bool {
 	return false
 }
 
-// IsLegacyAPIVersion reports whether the contract uses a pre-vulnsuite apiVersion.
-func (c *Contract) IsLegacyAPIVersion() bool { return isLegacyAPIVersion(c.APIVersion) }

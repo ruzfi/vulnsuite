@@ -19,7 +19,7 @@ Unknown fields are rejected. The machine-readable form of this document is
 
 | Field | Required | Value |
 | --- | --- | --- |
-| `apiVersion` | yes | `vulnsuite/v1` (`range.legacy/v2` loads with a warning) |
+| `apiVersion` | yes | `vulnsuite/v1` |
 | `kind` | yes | `Target` |
 | `metadata` | yes | identity and provenance |
 | `base` | yes | the pinned foundation |
@@ -201,6 +201,5 @@ rather than failed; use `-expose host` or scan from a container.
 | `simulated-on-image-base` | warning | fidelity: simulated but the base is a prebuilt image |
 | `kvm-without-requires` | warning | service.devices has /dev/kvm but requires.kvm is not set |
 | `unknown-scanner-template`, `undeclared-scanner-template` | warning | with a nuclei-templates checkout: a declared id does not exist / a template for the target's CVE is not declared |
-| `legacy-apiversion` | warning | `range.legacy/v2` |
 
 `-strict` turns warnings into failures (use it in CI).

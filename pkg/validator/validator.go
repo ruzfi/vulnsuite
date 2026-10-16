@@ -52,7 +52,6 @@ type Validator struct {
 // Check lints one contract.
 func (v *Validator) Check(c *contract.Contract) []Finding {
 	var out []Finding
-	out = append(out, v.apiVersion(c)...)
 	out = append(out, v.pinning(c)...)
 	out = append(out, v.filesExist(c)...)
 	out = append(out, v.states(c)...)
@@ -90,14 +89,6 @@ func (v *Validator) CheckAll(contracts []*contract.Contract) []Finding {
 		out = append(out, v.Check(c)...)
 	}
 	return out
-}
-
-func (v *Validator) apiVersion(c *contract.Contract) []Finding {
-	if c.IsLegacyAPIVersion() {
-		return []Finding{{Warning, c.ID(), "legacy-apiversion",
-			fmt.Sprintf("apiVersion %s is deprecated; use %s", c.APIVersion, contract.APIVersion)}}
-	}
-	return nil
 }
 
 func (v *Validator) pinning(c *contract.Contract) []Finding {

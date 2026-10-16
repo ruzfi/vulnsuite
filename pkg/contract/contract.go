@@ -33,10 +33,6 @@ import (
 // APIVersion is the contract version this build of vulnsuite speaks.
 const APIVersion = "vulnsuite/v1"
 
-// LegacyAPIVersions are accepted with a validator warning so existing
-// templates can be migrated gradually.
-var LegacyAPIVersions = []string{"range.legacy/v2"}
-
 // Kind is the only document kind.
 const Kind = "Target"
 

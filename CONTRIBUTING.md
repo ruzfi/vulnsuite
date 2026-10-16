@@ -94,7 +94,7 @@ feat(builder): push immutable and moving tags with -push
 fix(probes): decode chunked bodies before matching
 perf(builder): resolve image states in parallel
 docs: document exposure modes on Docker Desktop
-feat(contract)!: drop range.legacy/v2 apiVersion
+feat(contract)!: drop a deprecated apiVersion alias
 
 BREAKING CHANGE: templates must declare apiVersion: vulnsuite/v1.
 ```

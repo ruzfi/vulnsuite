@@ -96,11 +96,6 @@ func TestParseRejects(t *testing.T) {
 			t.Errorf("%s: expected an error", name)
 		}
 	}
-	legacy := strings.Replace(minimal, "vulnsuite/v1", "range.legacy/v2", 1)
-	c, err := Parse([]byte(legacy))
-	if err != nil || !c.IsLegacyAPIVersion() {
-		t.Fatalf("legacy apiVersion must still load: %v", err)
-	}
 }
 
 func TestContentHash(t *testing.T) {

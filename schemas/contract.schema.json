@@ -16,10 +16,9 @@
   "properties": {
     "apiVersion": {
       "enum": [
-        "vulnsuite/v1",
-        "range.legacy/v2"
+        "vulnsuite/v1"
       ],
-      "description": "vulnsuite/v1. The legacy range.legacy/v2 value is accepted with a warning."
+      "description": "vulnsuite/v1."
     },
     "kind": {
       "const": "Target"
