@@ -47,6 +47,9 @@ type Validator struct {
 	// Scanners, when set, cross-checks detected_by against a nuclei-templates
 	// checkout (unknown ids, undeclared CVE matches).
 	Scanners *scanners.Index
+	// Nmap, when set, cross-checks nmap: detected_by refs against a directory
+	// of nmap NSE scripts.
+	Nmap *scanners.Index
 }
 
 // Check lints one contract.
@@ -334,6 +337,16 @@ func (v *Validator) provenance(c *contract.Contract) []Finding {
 		for _, t := range rep.Suggested {
 			out = append(out, Finding{Warning, c.ID(), "undeclared-scanner-template",
 				fmt.Sprintf("nuclei:%s (%s) matches this target's CVE but is not in detected_by; verify it against both states and declare it", t.ID, t.Path)})
+		}
+	}
+	if v.Nmap != nil {
+		for _, r := range scanners.Refs(c) {
+			if r.Scanner == scanners.Nmap {
+				if _, ok := v.Nmap.ByID[r.ID]; !ok {
+					out = append(out, Finding{Warning, c.ID(), "unknown-scanner-template",
+						fmt.Sprintf("detected_by names %s, which is not in %s", r.String(), v.Nmap.Root)})
+				}
+			}
 		}
 	}
 	return out

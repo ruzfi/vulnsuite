@@ -36,6 +36,9 @@ const Env = "NUCLEI_TEMPLATES"
 // UpstreamURL is where new nuclei templates are contributed.
 const UpstreamURL = "https://github.com/projectdiscovery/nuclei-templates"
 
+// NmapEnv overrides the directory of nmap NSE scripts to cross-check against.
+const NmapEnv = "NMAPDIR"
+
 // Ref is one parsed detected_by entry.
 type Ref struct {
 	Scanner string `json:"scanner"`
@@ -159,6 +162,57 @@ func Load(root string) (*Index, error) {
 	}
 	for k := range idx.ByCVE {
 		sort.Slice(idx.ByCVE[k], func(i, j int) bool { return idx.ByCVE[k][i].ID < idx.ByCVE[k][j].ID })
+	}
+	return idx, nil
+}
+
+// ResolveNmapDir finds a directory of nmap NSE scripts: flag, then $NMAPDIR,
+// then the usual install locations. It returns "" when none exists.
+func ResolveNmapDir(flag string) string {
+	candidates := []string{
+		flag,
+		os.Getenv(NmapEnv),
+		"/usr/share/nmap/scripts",
+		"/usr/local/share/nmap/scripts",
+		"/opt/homebrew/share/nmap/scripts",
+	}
+	for _, c := range candidates {
+		if c == "" {
+			continue
+		}
+		if st, err := os.Stat(c); err == nil && st.IsDir() {
+			abs, _ := filepath.Abs(c)
+			return abs
+		}
+	}
+	return ""
+}
+
+// LoadNmap indexes every NSE script (*.nse) under root by its script name
+// (the file name without the .nse extension -- how detected_by refers to it).
+func LoadNmap(root string) (*Index, error) {
+	idx := &Index{Root: root, ByID: map[string]*Template{}, ByCVE: map[string][]*Template{}}
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if p != root && strings.HasPrefix(d.Name(), ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if filepath.Ext(d.Name()) != ".nse" {
+			return nil
+		}
+		name := strings.TrimSuffix(d.Name(), ".nse")
+		rel, _ := filepath.Rel(root, p)
+		idx.ByID[name] = &Template{ID: name, Path: filepath.ToSlash(rel)}
+		idx.Count++
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return idx, nil
 }
