@@ -34,17 +34,25 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - uses: actions/checkout@v4
+      - name: Check out vulnsuite-templates (if reachable)
+        id: tmpl
+        continue-on-error: true
+        uses: actions/checkout@v4
         with:
           repository: ruzfi/vulnsuite-templates
           path: vulnsuite-templates
-          # Works whether vulnsuite-templates is private or public: use the
-          # read-only PAT when the TEMPLATES_RO secret is set (needed while the
-          # repo is private), and fall back to the default job token once the
-          # repo is public and the secret is removed. No workflow edit needed
-          # when visibility flips.
+          # Prefer the read-only PAT (required while the templates repo is
+          # private); fall back to the job token once it is public. The default
+          # job token cannot read a *separate private* repo, and fork PRs never
+          # receive secrets -- in those cases this step is tolerated and the
+          # validation below is skipped, so CI does not hard-fail.
           token: ${{ secrets.TEMPLATES_RO || github.token }}
-      - run: go run ./cmd/vulnsuite -templates ./vulnsuite-templates validate -allow-unpinned
+      - name: Validate vulnsuite-templates with this build
+        if: steps.tmpl.outcome == 'success'
+        run: go run ./cmd/vulnsuite -templates ./vulnsuite-templates validate -allow-unpinned
+      - name: Note skip
+        if: steps.tmpl.outcome != 'success'
+        run: echo "::notice::Skipped cross-repo template validation -- no access to ruzfi/vulnsuite-templates here (private repo without TEMPLATES_RO, a fork PR, or the repo is unreachable)."
   lint-commits:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
