@@ -188,7 +188,9 @@ func cmdValidate() *Command {
 					return err
 				}
 				v.Scanners = idx
-				g.printf("cross-checking detected_by against %s (%d templates)\n", dir, idx.Count)
+				g.printf("cross-checking detected_by against %d nuclei templates from your checkout at %s\n", idx.Count, dir)
+			} else {
+				g.printf("skipping detected_by cross-check: no nuclei-templates checkout found (set -nuclei-templates, $NUCLEI_TEMPLATES, or clone to ~/nuclei-templates)\n")
 			}
 			findings := v.CheckAll(cs)
 			nerr, nwarn := validator.Count(findings)
