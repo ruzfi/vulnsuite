@@ -41,7 +41,25 @@ pkg/scanners       links targets to scanner templates (detected_by), nuclei-temp
 schemas/           JSON schema of the contract (kept in sync with pkg/contract)
 ```
 
+## Branches
+
+- `main` is protected and holds the released, CI-green state. **Do not push to
+  `main` directly** — it only advances through reviewed, squash-merged pull
+  requests.
+- `dev` is the integration branch. **Base all work on `dev`.** Branch from it,
+  and open your pull request against `dev`, not `main`.
+- Maintainers promote `dev` to `main` for releases.
+
+```bash
+git switch dev && git pull
+git switch -c feat/my-change      # or fix/..., docs/...
+# ...work, commit...
+git push -u origin feat/my-change # then open a PR targeting `dev`
+```
+
 ## Pull requests
+All pull requests target the `dev` branch (see **Branches** above); `main` is updated only by maintainers at release time.
+
 
 1. Open an issue first for anything bigger than a bug fix, so the design can be
    discussed before the code.
