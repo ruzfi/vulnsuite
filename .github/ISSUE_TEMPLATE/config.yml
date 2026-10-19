@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security / host-escape report
+    url: https://github.com/ruzfi/vulnsuite/security/advisories/new
+    about: Report privately if a template can affect the host beyond its container (see SECURITY.md). Do not open a public issue.
+  - name: Contribute a vulnerable target
+    url: https://github.com/ruzfi/vulnsuite-templates
+    about: Targets live in the vulnsuite-templates repo — open target issues/PRs there.

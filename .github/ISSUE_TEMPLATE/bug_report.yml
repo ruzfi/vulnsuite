@@ -1,0 +1,39 @@
+name: Bug report
+description: Something in the vulnsuite engine or CLI misbehaves
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For a **security** issue (a template affecting the host beyond its
+        container), do not file here — report it privately per SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: vulnsuite version
+      description: "`vulnsuite --version`, or the tag/commit you built."
+    validations: { required: true }
+  - type: dropdown
+    id: os
+    attributes:
+      label: Host OS
+      options: [Linux, macOS, Windows, Other]
+    validations: { required: true }
+  - type: input
+    id: engine
+    attributes:
+      label: Container engine
+      description: e.g. Docker 27.x / OrbStack / Podman (include the `docker version` server line).
+  - type: textarea
+    id: what
+    attributes:
+      label: Command, expected vs actual
+      description: The exact `vulnsuite ...` command, what you expected, and what happened.
+      render: shell
+    validations: { required: true }
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / output
+      description: Relevant output. Redact anything sensitive.
+      render: shell
