@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -242,7 +243,17 @@ func find(name string) *Command {
 }
 
 func versionString() string {
-	s := "vulnsuite " + Version
+	v := Version
+	// When built without -ldflags (e.g. `go install ...@latest`), Version is the
+	// "dev" default; fall back to the module version Go embeds in the binary.
+	if v == "dev" || v == "" {
+		if bi, ok := debug.ReadBuildInfo(); ok {
+			if mv := bi.Main.Version; mv != "" && mv != "(devel)" {
+				v = mv
+			}
+		}
+	}
+	s := "vulnsuite " + v
 	if Commit != "" {
 		s += " (" + Commit
 		if Date != "" {
