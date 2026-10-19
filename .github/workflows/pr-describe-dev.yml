@@ -1,0 +1,30 @@
+name: pr-describe-dev
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  describe:
+    # Only the maintainer's dev -> main promotion, from this repo. Any other head
+    # branch (contributor feature branches) and forks are skipped, so their PR
+    # descriptions are never touched.
+    if: >-
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.ref == 'dev' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Generate and apply the description
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 .github/scripts/pr-describe.py "$BASE" "$HEAD" "$PR"
+          gh pr edit "$PR" --body-file body.md
