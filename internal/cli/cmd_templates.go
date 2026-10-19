@@ -190,8 +190,10 @@ func cmdValidate() *Command {
 					return err
 				}
 				v.Scanners = idx
-				g.printf("cross-checking detected_by against %d nuclei templates from your checkout at %s\n", idx.Count, dir)
-			} else {
+				if !g.JSON {
+					g.printf("cross-checking detected_by against %d nuclei templates from your checkout at %s\n", idx.Count, dir)
+				}
+			} else if !g.JSON {
 				g.printf("skipping detected_by cross-check: no nuclei-templates checkout found (set -nuclei-templates, $NUCLEI_TEMPLATES, or clone to ~/nuclei-templates)\n")
 			}
 			if dir := scanners.ResolveNmapDir(nmapDir); dir != "" {
@@ -200,7 +202,9 @@ func cmdValidate() *Command {
 					return err
 				}
 				v.Nmap = idx
-				g.printf("cross-checking detected_by against %d nmap NSE scripts from your checkout at %s\n", idx.Count, dir)
+				if !g.JSON {
+					g.printf("cross-checking detected_by against %d nmap NSE scripts from your checkout at %s\n", idx.Count, dir)
+				}
 			}
 			findings := v.CheckAll(cs)
 			nerr, nwarn := validator.Count(findings)
