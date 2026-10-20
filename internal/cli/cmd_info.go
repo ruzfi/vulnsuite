@@ -108,7 +108,7 @@ writing a template and contributing it upstream.`,
 			fmt.Fprintln(g.Stdout)
 			for _, name := range c.DeclaredStates() {
 				st := c.States[name]
-				fmt.Fprintf(g.Stdout, "  %-11s %s build -> %s\n", name, c.BuildKind(name), c.ImageRef(name))
+				fmt.Fprintf(g.Stdout, "  %-11s %s -> %s\n", name, c.BuildKind(name), c.ImageRef(name))
 				for _, p := range st.Verify {
 					fmt.Fprintf(g.Stdout, "              verify %s\n", probeSummary(p))
 				}
