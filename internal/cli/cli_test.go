@@ -29,6 +29,13 @@ func run(t *testing.T, fe *enginetest.Fake, args ...string) (int, string, string
 }
 
 func TestListAndValidate(t *testing.T) {
+	// Isolate scanner-dir resolution from the developer's machine: a real
+	// ~/nuclei-templates or $NUCLEI_TEMPLATES otherwise makes `info` print the
+	// template path and breaks the assertions below. CI has no such checkout.
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	t.Setenv("NUCLEI_TEMPLATES", "")
 	root := fixtures(t)
 	code, out, _ := run(t, nil, "-T", root, "list")
 	if code != ExitOK || !strings.Contains(out, "grafana-8.3.0-cve-2021-43798") || !strings.Contains(out, "5 templates") {

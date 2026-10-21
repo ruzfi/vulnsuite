@@ -157,6 +157,7 @@ func cmdValidate() *Command {
 	var sel multiFlag
 	var all, strict, allowUnpinned bool
 	var nucleiDir string
+	var nmapDir string
 	return &Command{
 		Name:  "validate",
 		Short: "validate template contracts (structure + semantic lint)",
@@ -167,6 +168,7 @@ func cmdValidate() *Command {
 			fs.BoolVar(&strict, "strict", false, "treat warnings as errors")
 			fs.BoolVar(&allowUnpinned, "allow-unpinned", false, "an unpinned base is a warning, not an error")
 			fs.StringVar(&nucleiDir, "nuclei-templates", "", "nuclei-templates checkout to cross-check detected_by against (default: $NUCLEI_TEMPLATES or ~/nuclei-templates when present)")
+			fs.StringVar(&nmapDir, "nmap-scripts", "", "nmap NSE scripts dir to cross-check nmap: detected_by refs against (default: $NMAPDIR or the system nmap scripts dir)")
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
 			store, err := g.Store()
@@ -188,7 +190,21 @@ func cmdValidate() *Command {
 					return err
 				}
 				v.Scanners = idx
-				g.printf("cross-checking detected_by against %s (%d templates)\n", dir, idx.Count)
+				if !g.JSON {
+					g.printf("cross-checking detected_by against %d nuclei templates from your checkout at %s\n", idx.Count, dir)
+				}
+			} else if !g.JSON {
+				g.printf("skipping detected_by cross-check: no nuclei-templates checkout found (set -nuclei-templates, $NUCLEI_TEMPLATES, or clone to ~/nuclei-templates)\n")
+			}
+			if dir := scanners.ResolveNmapDir(nmapDir); dir != "" {
+				idx, err := scanners.LoadNmap(dir)
+				if err != nil {
+					return err
+				}
+				v.Nmap = idx
+				if !g.JSON {
+					g.printf("cross-checking detected_by against %d nmap NSE scripts from your checkout at %s\n", idx.Count, dir)
+				}
 			}
 			findings := v.CheckAll(cs)
 			nerr, nwarn := validator.Count(findings)
