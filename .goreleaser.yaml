@@ -31,4 +31,9 @@ changelog:
     - title: Other
       order: 999
   filters:
-    exclude: ['^docs', '^test', '^chore', '^ci']
+    exclude:
+      - '^docs'
+      - '^test'
+      - '^chore'
+      - '^ci'
+      - '^Merge '   # drop merge commits (dev -> main PR merges, branch merges)
