@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"unicode/utf8"
 
 	"github.com/ruzfi/vulnsuite/pkg/engine"
 	"github.com/ruzfi/vulnsuite/pkg/engine/engines"
@@ -166,6 +167,10 @@ func mainWithEngine(ctx context.Context, eng engine.Engine, args []string, stdou
 	}
 	rest := root.Args()
 	if len(rest) == 0 {
+		if !g.JSON {
+			printBanner(stdout)
+			fmt.Fprintln(stdout)
+		}
 		printRootHelp(stdout)
 		return ExitUsage
 	}
@@ -240,6 +245,55 @@ func find(name string) *Command {
 		}
 	}
 	return nil
+}
+
+// banner is the ASCII-art splash shown on a bare `vulnsuite` invocation.
+const banner = `            _                    _ _       
+__   __   _| |_ ___  ____  _   _(_) |__ __ 
+\ \ / /| | | |  _  \/ ___)| | | | | __| __ \
+ \ V / |_| | | | | |\__  \| |_| | | | \  __/
+  \_/ \___,|_|_| |_|(____/\____,|_|\___\___|`
+
+const bannerTagline = "build \u00b7 run \u00b7 verify"
+
+// printBanner writes the splash, tagline and version-only line, the lower two
+// centered under the art. Callers gate this behind !g.JSON.
+func printBanner(w io.Writer) {
+	width := 0
+	for _, l := range strings.Split(banner, "\n") {
+		if n := utf8.RuneCountInString(l); n > width {
+			width = n
+		}
+	}
+	center := func(str string) string {
+		n := utf8.RuneCountInString(str)
+		if n >= width {
+			return str
+		}
+		return strings.Repeat(" ", (width-n)/2) + str
+	}
+	fmt.Fprintln(w, banner)
+	fmt.Fprintln(w, center(bannerTagline))
+	fmt.Fprintln(w, center(versionTag()))
+}
+
+// versionTag is the short display version for the banner: "vX.Y.Z" (or "dev").
+func versionTag() string {
+	v := Version
+	if v == "dev" || v == "" {
+		if bi, ok := debug.ReadBuildInfo(); ok {
+			if mv := bi.Main.Version; mv != "" && mv != "(devel)" {
+				v = mv
+			}
+		}
+	}
+	if v == "" || v == "dev" {
+		return "dev"
+	}
+	if !strings.HasPrefix(v, "v") {
+		v = "v" + v
+	}
+	return v
 }
 
 func versionString() string {
