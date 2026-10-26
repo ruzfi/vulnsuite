@@ -67,6 +67,7 @@ writing a template and contributing it upstream.`,
 			kv("tags", strings.Join(m.Tags, ", "))
 			kv("maintainer", m.Maintainer)
 			kv("added", m.Added)
+			kv("updated", c.Updated())
 			kv("template", c.SourcePath)
 			base := c.Base.Kind
 			switch c.Base.Kind {

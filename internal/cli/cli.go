@@ -249,10 +249,10 @@ func find(name string) *Command {
 
 // banner is the ASCII-art splash shown on a bare `vulnsuite` invocation.
 const banner = `            _                    _ _       
-__   __   _| |_ ___  ____  _   _(_) |__ __ 
-\ \ / /| | | |  _  \/ ___)| | | | | __| __ \
- \ V / |_| | | | | |\__  \| |_| | | | \  __/
-  \_/ \___,|_|_| |_|(____/\____,|_|\___\___|`
+__   __   _| |_ ___  ____  _   _(_) |_  __ 
+\ \ / /| | | |  _  \/ ___)| | | | |  _| __ \
+ \ V / |_| | | | | |\__  \| |_| | | |_\  __/
+  \_/ \___,|_|_| |_|(____/\____,|_,\___\___|`
 
 const bannerTagline = "build \u00b7 run \u00b7 verify"
 
