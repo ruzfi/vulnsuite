@@ -78,7 +78,12 @@
           "type": "string"
         },
         "added": {
-          "type": "string"
+          "type": "string",
+          "description": "ISO date the target was first added (YYYY-MM-DD)."
+        },
+        "updated": {
+          "type": "string",
+          "description": "ISO date of the last change to this target's metadata or states (YYYY-MM-DD); bump it whenever CVE facts, versions, or probes change. Defaults to `added` when never updated."
         },
         "detected_by": {
           "type": "array",

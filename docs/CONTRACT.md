@@ -38,7 +38,8 @@ Unknown fields are rejected. The machine-readable form of this document is
 | `tags` | | free-form; `vulnsuite list -tag` filters on them |
 | `references` | | the advisory and the fix |
 | `maintainer` | | who to ask |
-| `added` | | `YYYY-MM-DD` |
+| `added` | | ISO date the target was first added (`YYYY-MM-DD`). |
+| `updated` | | ISO date of the last change to this target's metadata or states (`YYYY-MM-DD`); bump it whenever CVE facts, versions, or probes change. Defaults to `added` when never updated. |
 | `fidelity` | | `real` = runs the genuine affected software (the default and strongly preferred); `simulated` = a hand-written stand-in that reproduces the behaviour. Only use `simulated` when no public image or buildable upstream source reproduces the flaw (bare-OS/device/protocol sims). |
 | `detected_by` | | the scanner templates/scripts that detect this target, as `<scanner>:<id>`. Known scanners: `nuclei:` (template id, e.g. `nuclei:CVE-2021-41773`, `nuclei:laravel-env`) and `nmap:` (NSE script, e.g. `nmap:http-aspnet-debug`). Declaring one means "this should fire on vulnerable and stay silent on patched". A bare id (no `scanner:`) defaults to nuclei. |
 | `detection` | | `scanner`: the `detected_by` entries are **verified** (you ran the scanner against both states); `custom-only`: no public scanner template exists, the target tests your own detection. Unset with `detected_by` present = declared, not yet verified. Unset with nothing declared = a detection gap (`validate` warns; write a template and contribute it upstream). |

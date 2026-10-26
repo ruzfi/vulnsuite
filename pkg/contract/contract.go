@@ -376,6 +376,7 @@ type Metadata struct {
 	References []string `yaml:"references,omitempty" json:"references,omitempty"`
 	Maintainer string   `yaml:"maintainer,omitempty" json:"maintainer,omitempty"`
 	Added      string   `yaml:"added,omitempty" json:"added,omitempty"`
+	Updated    string   `yaml:"updated,omitempty" json:"updated,omitempty"`
 	// Fidelity says whether the target runs the genuine affected software
 	// (real) or a hand-written stand-in that reproduces its behaviour
 	// (simulated). Real is the default and strongly preferred; simulated is
@@ -431,6 +432,14 @@ type Contract struct {
 
 // ID is a shortcut for Metadata.ID.
 func (c *Contract) ID() string { return c.Metadata.ID }
+
+// Updated returns the last-updated date, defaulting to Added when unset.
+func (c *Contract) Updated() string {
+	if c.Metadata.Updated == "" {
+		return c.Metadata.Added
+	}
+	return c.Metadata.Updated
+}
 
 // Fidelity returns the declared fidelity, defaulting to real when unset.
 func (c *Contract) Fidelity() string {
