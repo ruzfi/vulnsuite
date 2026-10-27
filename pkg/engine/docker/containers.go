@@ -191,7 +191,7 @@ func (c *Client) ContainerInspect(ctx context.Context, id string) (*engine.Conta
 	out := &engine.ContainerDetail{
 		ID: d.ID, Name: strings.TrimPrefix(d.Name, "/"), Image: d.Config.Image,
 		Running: d.State.Running, ExitCode: d.State.ExitCode,
-		IPs: map[string]string{}, Ports: map[string]int{},
+		IPs: map[string]string{}, Ports: map[string]engine.HostBinding{},
 	}
 	for name, n := range d.NetworkSettings.Networks {
 		if n.IPAddress != "" {
@@ -201,7 +201,7 @@ func (c *Client) ContainerInspect(ctx context.Context, id string) (*engine.Conta
 	for key, bindings := range d.NetworkSettings.Ports {
 		if len(bindings) > 0 {
 			if p, err := strconv.Atoi(bindings[0].HostPort); err == nil {
-				out.Ports[key] = p
+				out.Ports[key] = engine.HostBinding{IP: bindings[0].HostIP, Port: p}
 			}
 		}
 	}

@@ -418,7 +418,8 @@ func (r *Runner) verify(ctx context.Context, c *contract.Contract, st *contract.
 	}
 	host, port := r.probeAddress(h, c)
 	if host == "" {
-		h.VerifyDetail = fmt.Sprintf("could not verify from this host in %s mode (normal on Docker Desktop/OrbStack and macvlan). "+
+		h.VerifyDetail = fmt.Sprintf("could not verify from this host in %s mode: the target's address lives on the Docker daemon's network, "+
+			"not this machine's (normal on Docker Desktop/OrbStack and macvlan, and whenever the daemon is remote). "+
 			"The target is up; scan it from a container on the same network, or use --expose host.", h.Exposure.Mode)
 		return
 	}
@@ -447,6 +448,7 @@ type Target struct {
 	Status    string `json:"status"`
 	Image     string `json:"image"`
 	IP        string `json:"ip,omitempty"`
+	HostIP    string `json:"host_ip,omitempty"` // host IP the port is published on (host mode)
 	HostPort  int    `json:"host_port,omitempty"`
 }
 
@@ -475,8 +477,8 @@ func (r *Runner) Running(ctx context.Context, network string) ([]Target, error) 
 					break
 				}
 			}
-			for _, hp := range det.Ports {
-				t.HostPort = hp
+			for _, b := range det.Ports {
+				t.HostIP, t.HostPort = b.IP, b.Port
 				break
 			}
 		}

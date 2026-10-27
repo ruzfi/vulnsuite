@@ -232,12 +232,12 @@ func (f *Fake) ContainerInspect(_ context.Context, id string) (*engine.Container
 	if c == nil {
 		return nil, fmt.Errorf("no such container %s", id)
 	}
-	d := &engine.ContainerDetail{ID: c.ID, Name: c.Spec.Name, Image: c.Spec.Image, Running: c.Running, IPs: map[string]string{}, Ports: map[string]int{}}
+	d := &engine.ContainerDetail{ID: c.ID, Name: c.Spec.Name, Image: c.Spec.Image, Running: c.Running, IPs: map[string]string{}, Ports: map[string]engine.HostBinding{}}
 	if c.Spec.Network != nil {
 		d.IPs[c.Spec.Network.Name] = c.IP
 	}
 	for _, p := range c.Spec.Ports {
-		d.Ports[fmt.Sprintf("%d/tcp", p.ContainerPort)] = p.HostPort
+		d.Ports[fmt.Sprintf("%d/tcp", p.ContainerPort)] = engine.HostBinding{IP: p.HostIP, Port: p.HostPort}
 	}
 	return d, nil
 }
