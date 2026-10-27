@@ -285,7 +285,7 @@ func (e *Engine) ContainerInspect(ctx context.Context, id string) (*engine.Conta
 		return nil, err
 	}
 	c := res.Container
-	out := &engine.ContainerDetail{ID: c.ID, Name: strings.TrimPrefix(c.Name, "/"), IPs: map[string]string{}, Ports: map[string]int{}}
+	out := &engine.ContainerDetail{ID: c.ID, Name: strings.TrimPrefix(c.Name, "/"), IPs: map[string]string{}, Ports: map[string]engine.HostBinding{}}
 	if c.Config != nil {
 		out.Image = c.Config.Image
 	}
@@ -302,7 +302,11 @@ func (e *Engine) ContainerInspect(ctx context.Context, id string) (*engine.Conta
 		for port, bindings := range c.NetworkSettings.Ports {
 			if len(bindings) > 0 {
 				if p, err := strconv.Atoi(bindings[0].HostPort); err == nil {
-					out.Ports[port.String()] = p
+					var ip string
+					if bindings[0].HostIP.IsValid() {
+						ip = bindings[0].HostIP.String()
+					}
+					out.Ports[port.String()] = engine.HostBinding{IP: ip, Port: p}
 				}
 			}
 		}

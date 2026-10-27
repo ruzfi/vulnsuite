@@ -227,12 +227,21 @@ many as fit and reports the rest.
 | Mode | What happens | Use when |
 | --- | --- | --- |
 | `internal` (default) | the target joins the `vulnsuite-net` Docker network; nothing is published on the host | your scanner runs as a container (`docker run --network vulnsuite-net ...`) or your host routes to container IPs (Linux, OrbStack) |
-| `host` | the port is published on `127.0.0.1` (or `-bind 0.0.0.0`); one host port per target | the scanner is on the host or elsewhere on the network |
+| `host` | the port is published on the host, by default on `127.0.0.1`; one host port per target | the scanner is on the host or elsewhere on the network |
 | `macvlan` | the target gets its own IP on the LAN via `-parent eth0` | the target must look like a separate device |
+
+In `host` mode, `-bind <address>` chooses the address the port is published on
+(default `127.0.0.1`). Pass the Docker daemon host's reachable address when the
+daemon is not the machine running your scanner — it is the single flag that
+makes a remote daemon usable. `vulnsuite targets` reports that bound address, so
+the URLs it prints work from the scanner's machine; a port bound to all
+interfaces (`-bind 0.0.0.0`) is reported as `127.0.0.1`.
 
 On Docker Desktop the host cannot reach container IPs; vulnsuite notices and
 tells you to scan from a container or use `-expose host` instead of waiting
-out the healthcheck.
+out the healthcheck. The same is true when the daemon is remote (`internal`
+targets live on the daemon host's network, not yours) — there too, `-expose
+host -bind <daemon address>` gives you a scannable URL.
 
 ### Scanning the fleet (Nuclei or anything else)
 

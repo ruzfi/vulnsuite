@@ -87,8 +87,15 @@ type ContainerDetail struct {
 	ExitCode int
 	// IPs maps network name -> IPv4 address.
 	IPs map[string]string
-	// Ports maps "containerPort/proto" -> host port (first binding).
-	Ports map[string]int
+	// Ports maps "containerPort/proto" -> the host binding (first binding).
+	Ports map[string]HostBinding
+}
+
+// HostBinding is a published port's binding on the host: the host IP it is
+// published on (empty = all interfaces) and the host port.
+type HostBinding struct {
+	IP   string
+	Port int
 }
 
 // NetworkSpec describes a network to create.

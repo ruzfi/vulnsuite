@@ -313,6 +313,18 @@ Exposure modes:
 	}
 }
 
+// reportableHostIP turns a binding's host IP into one a scanner can dial.
+// A port published on all interfaces (empty, 0.0.0.0 or ::) is reachable via
+// loopback, which is what a local scanner should use; an explicit -bind
+// address is carried through unchanged so a remote daemon's address survives.
+func reportableHostIP(ip string) string {
+	switch ip {
+	case "", "0.0.0.0", "::":
+		return "127.0.0.1"
+	}
+	return ip
+}
+
 // scanURL prefers the container IP for internal mode (what a host-side
 // scanner can use when the host routes to the Docker network).
 func scanURL(h *runner.Handle) string {
@@ -454,7 +466,7 @@ list is always correct for what is up. Scan exactly these instead of sweeping
 the subnet. Non-HTTP targets come out as host:port for network templates.`,
 		Flags: func(fs *flag.FlagSet) {
 			fs.StringVar(&file, "file", "", "write the URL list here (nuclei -l <file>)")
-			fs.StringVar(&by, "by", "ip", "address targets by container ip, network alias, or published host port")
+			fs.StringVar(&by, "by", "auto", "address targets by: auto (published host binding if any, else container ip), ip, alias, or host")
 			fs.StringVar(&network, "network", runner.DefaultNetwork, "internal network name")
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
@@ -499,8 +511,14 @@ the subnet. Non-HTTP targets come out as host:port for network templates.`,
 					if r.HostPort == 0 {
 						continue
 					}
-					host, p = "127.0.0.1", r.HostPort
-				default:
+					host, p = reportableHostIP(r.HostIP), r.HostPort
+				case "auto":
+					if r.HostPort > 0 {
+						host, p = reportableHostIP(r.HostIP), r.HostPort
+					} else {
+						host = r.IP
+					}
+				default: // "ip"
 					host = r.IP
 				}
 				if host == "" {
