@@ -9,6 +9,7 @@ import (
 
 	"github.com/ruzfi/vulnsuite/pkg/builder"
 	"github.com/ruzfi/vulnsuite/pkg/contract"
+	"github.com/ruzfi/vulnsuite/pkg/engine"
 	"github.com/ruzfi/vulnsuite/pkg/engine/enginetest"
 	"github.com/ruzfi/vulnsuite/pkg/loader"
 	"github.com/ruzfi/vulnsuite/pkg/probes"
@@ -22,6 +23,30 @@ func load(t *testing.T, id string) *contract.Contract {
 		t.Fatal(err)
 	}
 	return c
+}
+
+func TestRunningCarriesHostBinding(t *testing.T) {
+	fe := enginetest.New()
+	// A target published on a specific host address (what -bind does for a
+	// remote daemon): Running must surface that address, not just the port.
+	name := contract.ContainerNamePrefix + "grafana-8.3.0-cve-2021-43798-vulnerable"
+	fe.Containers[name] = &enginetest.Container{
+		ID: "c1", Running: true, IP: "172.17.0.2",
+		Spec: engine.ContainerSpec{
+			Name:  name,
+			Ports: []engine.PortBinding{{HostIP: "203.0.113.9", HostPort: 49154, ContainerPort: 3000, Protocol: "tcp"}},
+		},
+	}
+	rows, err := New(fe).Running(context.Background(), DefaultNetwork)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows: %+v", rows)
+	}
+	if rows[0].HostIP != "203.0.113.9" || rows[0].HostPort != 49154 {
+		t.Fatalf("host binding dropped: %+v", rows[0])
+	}
 }
 
 func TestRunInternalBuildsSpecAndFleet(t *testing.T) {
@@ -175,9 +200,9 @@ func TestRefusesHostAccessWithoutConsent(t *testing.T) {
 			Metadata: contract.Metadata{ID: "hosttest"},
 			Base:     contract.Base{Kind: contract.BaseImage, Image: "alpine"},
 			Service: contract.Service{
-				Ports:    []contract.Port{{Container: 80, Protocol: "http"}},
-				Devices:  dev,
-				CapAdd:   caps,
+				Ports:   []contract.Port{{Container: 80, Protocol: "http"}},
+				Devices: dev,
+				CapAdd:  caps,
 			},
 			States: map[string]*contract.State{
 				contract.StateVulnerable: {Name: contract.StateVulnerable, Verify: []contract.Probe{{TCP: &contract.TCPProbe{Port: 80}}}},

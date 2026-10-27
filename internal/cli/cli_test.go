@@ -8,8 +8,22 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ruzfi/vulnsuite/pkg/contract"
+	"github.com/ruzfi/vulnsuite/pkg/engine"
 	"github.com/ruzfi/vulnsuite/pkg/engine/enginetest"
 )
+
+// seedHostTarget injects a running grafana container published on hostIP:hostPort.
+func seedHostTarget(fe *enginetest.Fake, hostIP string, hostPort int) {
+	name := contract.ContainerNamePrefix + "grafana-8.3.0-cve-2021-43798-vulnerable"
+	fe.Containers[name] = &enginetest.Container{
+		ID: "c1", Running: true, IP: "172.17.0.2",
+		Spec: engine.ContainerSpec{
+			Name:  name,
+			Ports: []engine.PortBinding{{HostIP: hostIP, HostPort: hostPort, ContainerPort: 3000, Protocol: "tcp"}},
+		},
+	}
+}
 
 func fixtures(t *testing.T) string {
 	t.Helper()
@@ -146,5 +160,32 @@ func TestRunStopPs(t *testing.T) {
 	code, out, _ = run(t, fe, "-T", root, "ps")
 	if code != ExitOK || !strings.Contains(out, "no targets running") {
 		t.Fatalf("ps after stop: %d %s", code, out)
+	}
+}
+
+func TestTargetsReportsBoundHostAddress(t *testing.T) {
+	root := fixtures(t)
+
+	// A port bound to a specific address (what -bind does for a remote daemon)
+	// must be reported at that address by both the auto default and -by host, so
+	// the URL works from the scanner's machine.
+	fe := enginetest.New()
+	seedHostTarget(fe, "203.0.113.9", 49154)
+	code, out, _ := run(t, fe, "-T", root, "targets")
+	if code != ExitOK || !strings.Contains(out, "http://203.0.113.9:49154") {
+		t.Fatalf("targets auto: %d %s", code, out)
+	}
+	code, out, _ = run(t, fe, "-T", root, "targets", "-by", "host")
+	if code != ExitOK || !strings.Contains(out, "http://203.0.113.9:49154") {
+		t.Fatalf("targets -by host: %d %s", code, out)
+	}
+
+	// A port bound to all interfaces is reported as loopback, which a local
+	// scanner can dial.
+	fe = enginetest.New()
+	seedHostTarget(fe, "0.0.0.0", 49155)
+	code, out, _ = run(t, fe, "-T", root, "targets", "-by", "host")
+	if code != ExitOK || !strings.Contains(out, "http://127.0.0.1:49155") {
+		t.Fatalf("targets 0.0.0.0: %d %s", code, out)
 	}
 }
