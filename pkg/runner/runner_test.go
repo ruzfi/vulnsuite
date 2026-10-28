@@ -49,6 +49,50 @@ func TestRunningCarriesHostBinding(t *testing.T) {
 	}
 }
 
+func TestRemoteDaemonHostClassification(t *testing.T) {
+	remote := []string{"tcp://10.0.0.5:2375", "ssh://user@box", "tcp://host.example:2376", "https://10.1.2.3:2376"}
+	local := []string{"", "unix:///var/run/docker.sock", "npipe:////./pipe/docker_engine", "tcp://127.0.0.1:2375", "tcp://localhost:2375", "tcp://[::1]:2375"}
+	for _, h := range remote {
+		if !remoteDaemonHost(h) {
+			t.Errorf("%q should be remote", h)
+		}
+	}
+	for _, h := range local {
+		if remoteDaemonHost(h) {
+			t.Errorf("%q should be local", h)
+		}
+	}
+}
+
+func TestVerifyRemoteDaemonWildcardBind(t *testing.T) {
+	// Host mode, -bind 0.0.0.0 (dialed here as 127.0.0.1), against a remote
+	// daemon: the target lives on the daemon's host, so probing from here can
+	// only fail. Report it as unreachable-with-a-fix, not as a wrong state, and
+	// don't burn the healthcheck timeout doing it.
+	fe := enginetest.New()
+	fe.HostAddr = "tcp://10.0.0.5:2375"
+	r := New(fe)
+	c := load(t, "grafana-8.3.0-cve-2021-43798")
+	exp := Exposure{Mode: ModeHost, Bind: "0.0.0.0"}
+	start := time.Now()
+	h, err := r.Run(context.Background(), c, "vulnerable", exp, Options{Verify: true, ReadyTimeout: time.Minute, Build: builder.Options{Pull: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !h.DaemonRemote {
+		t.Fatal("daemon should be detected as remote")
+	}
+	if h.VerifyOK != nil {
+		t.Fatalf("verify should be reported as unverifiable, not pass/fail: %v", *h.VerifyOK)
+	}
+	if !strings.Contains(h.VerifyDetail, "-bind") || !strings.Contains(h.VerifyDetail, "remote") {
+		t.Fatalf("detail should name the fix: %q", h.VerifyDetail)
+	}
+	if elapsed := time.Since(start); elapsed > 20*time.Second {
+		t.Fatalf("burned the healthcheck timeout against an unreachable address: %s", elapsed)
+	}
+}
+
 func TestRunInternalBuildsSpecAndFleet(t *testing.T) {
 	fe := enginetest.New()
 	r := New(fe)
