@@ -74,6 +74,10 @@ type Handle struct {
 	IP           string            `json:"ip,omitempty"` // container ip (internal/macvlan)
 	Scheme       string            `json:"scheme"`       // http | https | "" (raw tcp)
 	Ready        bool              `json:"ready"`
+	// DaemonRemote is set when the engine talks to a daemon on another machine;
+	// then a host-published port on the daemon's loopback cannot be reached from
+	// here, which changes how readiness and verification are reported.
+	DaemonRemote bool `json:"daemon_remote,omitempty"`
 	// VerifyOK is nil when verification was skipped.
 	VerifyOK     *bool           `json:"verify_ok"`
 	VerifyDetail string          `json:"verify_detail,omitempty"`
@@ -221,7 +225,7 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 	}
 
 	h := &Handle{ID: c.ID(), State: state, Container: name, Image: img, Exposure: exp,
-		EndpointPort: port.Container, Scheme: port.Scheme()}
+		EndpointPort: port.Container, Scheme: port.Scheme(), DaemonRemote: engineRemote(r.Engine)}
 
 	switch exp.Mode {
 	case ModeInternal:
@@ -346,6 +350,87 @@ func (r *Runner) startSidecars(ctx context.Context, c *contract.Contract, st *co
 	return names, nil
 }
 
+// engineRemote reports whether the engine talks to a daemon on another machine.
+// Engines that don't expose their host (e.g. test fakes) are treated as local.
+func engineRemote(e engine.Engine) bool {
+	h, ok := e.(interface{ Host() string })
+	if !ok {
+		return false
+	}
+	return remoteDaemonHost(h.Host())
+}
+
+// remoteDaemonHost classifies a DOCKER_HOST-style address: a local socket or a
+// loopback tcp endpoint is local; tcp/ssh to any other host is remote.
+func remoteDaemonHost(host string) bool {
+	i := strings.Index(host, "://")
+	if i < 0 {
+		return false
+	}
+	scheme, rest := host[:i], host[i+3:]
+	switch scheme {
+	case "ssh":
+		return true
+	case "tcp", "http", "https":
+		hostOnly := rest
+		if h, _, err := net.SplitHostPort(rest); err == nil {
+			hostOnly = h
+		}
+		return !isLoopbackHost(hostOnly)
+	default: // unix, npipe, fd, ...
+		return false
+	}
+}
+
+// isLoopbackHost reports whether host names the local machine's loopback.
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// probeFromHereFutile reports that no probe run on this machine can reach the
+// target: host mode on a remote daemon that published the port on the daemon
+// host's loopback (default -bind 127.0.0.1, or -bind 0.0.0.0 which we dial as
+// 127.0.0.1). The port lives on the daemon's host, not here.
+func probeFromHereFutile(h *Handle) bool {
+	return h.Exposure.Mode == ModeHost && h.DaemonRemote && isLoopbackHost(h.EndpointHost)
+}
+
+// remoteProbeHint explains why a remote-daemon target could not be probed from
+// here and names the flag that fixes it.
+func remoteProbeHint(h *Handle) string {
+	bind := h.Exposure.Bind
+	if bind == "" {
+		bind = "127.0.0.1"
+	}
+	if isLoopbackHost(h.EndpointHost) {
+		return fmt.Sprintf("could not verify from this machine: in host mode the port is published on the Docker daemon's "+
+			"host (bind %s, reachable from here only as 127.0.0.1) and the daemon is remote, so the target is on another "+
+			"machine. The target is up; pass -bind <an address of the daemon host reachable from here> to probe and scan it "+
+			"from this machine, or scan from the daemon host.", bind)
+	}
+	return fmt.Sprintf("could not verify from this machine: nothing answered at %s, though the daemon reports the target up. "+
+		"The daemon is remote -- make sure -bind %s is an address of the daemon host reachable from this machine.",
+		h.ScannerTarget(), bind)
+}
+
+// allTransportFailures reports whether every probe failed to reach the target
+// (so this machine could not get to it), rather than any reaching it.
+func allTransportFailures(rs []probes.Result) bool {
+	if len(rs) == 0 {
+		return false
+	}
+	for _, r := range rs {
+		if !r.Transport {
+			return false
+		}
+	}
+	return true
+}
+
 // probeAddress is where a probe run on this host can reach the target, or ""
 // when it cannot (internal mode on Docker Desktop/OrbStack, macvlan).
 func (r *Runner) probeAddress(h *Handle, c *contract.Contract) (string, int) {
@@ -378,11 +463,19 @@ func (r *Runner) awaitReady(ctx context.Context, c *contract.Contract, h *Handle
 		h.Ready = running()
 		return
 	}
-	if h.Exposure.Mode != ModeHost {
-		// Docker Desktop reports container IPs the host cannot route to. A
-		// connection that is *refused* means the address is routable and the
-		// service just isn't up yet; a timeout / no-route means we can't reach
-		// it from here at all, so don't sit through the whole healthcheck.
+	if probeFromHereFutile(h) {
+		// A remote daemon's loopback-published port never comes up here; don't
+		// burn the whole healthcheck timeout against it. verify explains.
+		time.Sleep(time.Second)
+		h.Ready = running()
+		return
+	}
+	{
+		// Docker Desktop reports container IPs the host cannot route to, and a
+		// remote daemon publishes host ports on its own machine. A connection
+		// that is *refused* means the address is routable and the service just
+		// isn't up yet; a timeout / no-route means we can't reach it from here at
+		// all, so don't sit through the whole healthcheck.
 		reach := r.Reach
 		if reach == nil {
 			reach = probes.Reachability
@@ -390,7 +483,9 @@ func (r *Runner) awaitReady(ctx context.Context, c *contract.Contract, h *Handle
 		if reach(host, port, 2*time.Second) == probes.Unreachable {
 			time.Sleep(time.Second)
 			if reach(host, port, 2*time.Second) == probes.Unreachable {
-				h.IP = "" // verify will explain instead of failing
+				if h.Exposure.Mode != ModeHost {
+					h.IP = "" // verify will explain instead of failing
+				}
 				h.Ready = running()
 				return
 			}
@@ -423,6 +518,13 @@ func (r *Runner) verify(ctx context.Context, c *contract.Contract, st *contract.
 			"The target is up; scan it from a container on the same network, or use --expose host.", h.Exposure.Mode)
 		return
 	}
+	if probeFromHereFutile(h) {
+		// The probe address resolves to our own loopback but the daemon, and so
+		// the target, is elsewhere. Report it as unreachable-from-here, not as a
+		// wrong state, and name the flag that fixes it.
+		h.VerifyDetail = remoteProbeHint(h)
+		return
+	}
 	scheme := h.Scheme
 	if scheme == "" {
 		scheme = "http"
@@ -433,6 +535,14 @@ func (r *Runner) verify(ctx context.Context, c *contract.Contract, st *contract.
 			return r.Engine.ContainerExec(ctx, container, command, timeout)
 		},
 	})
+	if h.DaemonRemote && allTransportFailures(results) {
+		// Every probe failed to connect and the daemon is remote: the bound
+		// address isn't reachable from here, which is an addressing problem, not
+		// a wrong state.
+		h.Probes = results
+		h.VerifyDetail = remoteProbeHint(h)
+		return
+	}
 	h.VerifyOK = &ok
 	h.Probes = results
 	h.VerifyDetail = probes.FormatResults(results)
