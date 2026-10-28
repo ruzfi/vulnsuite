@@ -180,7 +180,7 @@ vulnsuite validate [-t SEL]... [-strict]            structure + semantic lint
 vulnsuite build -t SEL... | -all [-j N] [-push -registry REG]
 vulnsuite run [vulnerable|patched] -t SEL... | -all [-expose MODE] [-detach]
 vulnsuite ps                                        running targets (id, state, ip)
-vulnsuite targets [-file FILE] [-by ip|alias|host]  scannable URLs, right port per template
+vulnsuite targets [-file FILE] [-by auto|ip|alias|host]  scannable URLs, right port per template
 vulnsuite stop [-t SEL]... [-prune-net]             tear down
 vulnsuite images [-rm]                              locally built images
 vulnsuite update-templates                          fetch / update the community templates

@@ -110,6 +110,30 @@ func TestHTTPProbeVerbatimAndAssertions(t *testing.T) {
 	}
 }
 
+func TestResultTransportFlag(t *testing.T) {
+	host, port, seen := rawServer(t)
+	ctx := context.Background()
+
+	// Reached the server, assertion unmet: not a transport failure.
+	r := Run(ctx, contract.Probe{HTTP: &contract.HTTPProbe{Path: "/missing", Status: intp(200)}}, Target{Host: host, Port: port, Scheme: "http"})
+	<-seen
+	if r.OK || r.Transport {
+		t.Fatalf("assertion mismatch must not be a transport failure: ok=%v transport=%v %s", r.OK, r.Transport, r.Detail)
+	}
+
+	// Nothing listening: a dial failure is a transport failure.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedPort := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+	r = Run(ctx, contract.Probe{HTTP: &contract.HTTPProbe{Path: "/", Status: intp(200)}}, Target{Host: "127.0.0.1", Port: closedPort, Scheme: "http"})
+	if r.OK || !r.Transport {
+		t.Fatalf("dial failure must be a transport failure: ok=%v transport=%v %s", r.OK, r.Transport, r.Detail)
+	}
+}
+
 func TestHTTPProbePortOverrideAndTCPClosed(t *testing.T) {
 	// The HTTP server is on its own port; the probe target's primary Port is a
 	// different (closed) port, so the probe must honour the per-probe override.

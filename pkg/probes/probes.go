@@ -46,7 +46,20 @@ type Result struct {
 	OK      bool          `json:"ok"`
 	Detail  string        `json:"detail"`
 	Elapsed time.Duration `json:"elapsed"`
+	// Transport is set when the probe could not reach the target at all (dial
+	// failure), as opposed to reaching it and finding an assertion unmet. It
+	// lets a caller tell "I can't get to this address from here" from "the
+	// service answered but is in the wrong state".
+	Transport bool `json:"transport,omitempty"`
 }
+
+// connError marks a probe failure as a transport failure: the target could not
+// be reached (dial error). Its message is the wrapped error's, so probe detail
+// text is unchanged; only Run inspects the type.
+type connError struct{ err error }
+
+func (e *connError) Error() string { return e.err.Error() }
+func (e *connError) Unwrap() error { return e.err }
 
 // HTTPResponse is a parsed raw HTTP response.
 type HTTPResponse struct {
@@ -214,10 +227,13 @@ func Run(ctx context.Context, p contract.Probe, t Target) Result {
 	default:
 		err = fmt.Errorf("unknown probe kind %q", p.Kind())
 	}
+	transport := false
 	if err != nil {
 		ok, detail = false, err.Error()
+		var ce *connError
+		transport = errors.As(err, &ce)
 	}
-	return Result{Kind: p.Kind(), OK: ok, Detail: detail, Elapsed: time.Since(started)}
+	return Result{Kind: p.Kind(), OK: ok, Detail: detail, Transport: transport, Elapsed: time.Since(started)}
 }
 
 func runHTTP(ctx context.Context, s *contract.HTTPProbe, t Target) (bool, string, error) {
@@ -234,7 +250,7 @@ func runHTTP(ctx context.Context, s *contract.HTTPProbe, t Target) (bool, string
 	}
 	resp, err := RawHTTP(ctx, t.Host, port, s.Method, path, s.Headers, s.Body, secs(s.Timeout, 10*time.Second), t.Scheme == "https")
 	if err != nil {
-		return false, "", fmt.Errorf("%s -> %v", path, err)
+		return false, "", &connError{fmt.Errorf("%s -> %v", path, err)}
 	}
 	var problems []string
 	if s.Status != nil && resp.Status != *s.Status {
@@ -312,7 +328,7 @@ func runTCP(ctx context.Context, s *contract.TCPProbe, t Target) (bool, string, 
 		return false, fmt.Sprintf("tcp %d is open but was expected to be closed", port), nil
 	}
 	if err != nil {
-		return false, "", fmt.Errorf("tcp %d -> %v", port, err)
+		return false, "", &connError{fmt.Errorf("tcp %d -> %v", port, err)}
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(timeout))
@@ -339,7 +355,7 @@ func runNet(ctx context.Context, s *contract.NetProbe, t Target) (bool, string, 
 	d := net.Dialer{Timeout: timeout}
 	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(t.Host, strconv.Itoa(port)))
 	if err != nil {
-		return false, "", fmt.Errorf("net %d -> %v", port, err)
+		return false, "", &connError{fmt.Errorf("net %d -> %v", port, err)}
 	}
 	defer conn.Close()
 	if s.TLS || t.Scheme == "https" {

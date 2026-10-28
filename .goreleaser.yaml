@@ -24,16 +24,26 @@ changelog:
   groups:
     - title: Features
       regexp: '^feat'
+      order: 0
     - title: Fixes
       regexp: '^fix'
+      order: 10
     - title: Performance
       regexp: '^perf'
+      order: 50
+    - title: Docs
+      regexp: '^docs'
+      order: 100
     - title: Other
       order: 999
   filters:
     exclude:
-      - '^docs'
       - '^test'
       - '^chore'
       - '^ci'
-      - '^Merge '   # drop merge commits (dev -> main PR merges, branch merges)
+      # Contributor PRs are squash-merged into dev (one Conventional Commit each,
+      # which the changelog keeps). The dev -> main promotion is a merge commit
+      # titled from its PR ("Promote dev to main: ..."); drop it, plus any stray
+      # "Merge ..." commits, so the changelog is exactly the per-PR commits.
+      - '^Merge '
+      - '^Promote dev to main'

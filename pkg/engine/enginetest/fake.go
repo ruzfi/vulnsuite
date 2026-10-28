@@ -54,19 +54,25 @@ type Fake struct {
 	FailPull bool
 	nextIP   int
 	nextID   int
-	// Host is what Info reports (default linux/amd64).
-	Host engine.HostInfo
+	// HostInfo is what Info reports (default linux/amd64).
+	HostInfo engine.HostInfo
+	// HostAddr is the daemon address Host() reports (empty = local socket).
+	HostAddr string
 }
+
+// Host returns the configured daemon address, mirroring the real engines so the
+// runner can tell a remote daemon from a local one.
+func (f *Fake) Host() string { return f.HostAddr }
 
 // New returns an empty fake.
 func New() *Fake {
 	return &Fake{Images: map[string]bool{}, Containers: map[string]*Container{}, Networks: map[string]engine.NetworkSpec{},
-		Host: engine.HostInfo{OS: "linux", Arch: "amd64"}}
+		HostInfo: engine.HostInfo{OS: "linux", Arch: "amd64"}}
 }
 
 func (f *Fake) Ping(context.Context) (string, error) { return "fake", nil }
 
-func (f *Fake) Info(context.Context) (engine.HostInfo, error) { return f.Host, nil }
+func (f *Fake) Info(context.Context) (engine.HostInfo, error) { return f.HostInfo, nil }
 
 func (f *Fake) ImageExists(_ context.Context, ref string) (bool, error) {
 	f.mu.Lock()
