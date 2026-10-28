@@ -25,6 +25,7 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
+          ACTION: ${{ github.event.action }}
         run: |
           python3 .github/scripts/pr-describe.py "$BASE" "$HEAD" "$PR"
           gh pr edit "$PR" --body-file body.md
