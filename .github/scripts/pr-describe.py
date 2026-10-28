@@ -18,13 +18,16 @@ subjects = subprocess.check_output(
     text=True,
 ).splitlines()
 
+# Each group: display heading, the conventional-commit types it collects, and a
+# (singular, plural) label for the one-line title summary.
 GROUPS = [
-    ("Features", {"feat"}),
-    ("Fixes", {"fix"}),
-    ("Documentation", {"docs"}),
-    ("Tests", {"test"}),
-    ("Maintenance", {"chore", "ci", "build", "refactor", "perf", "style"}),
+    ("Features", {"feat"}, ("feature", "features")),
+    ("Fixes", {"fix"}, ("fix", "fixes")),
+    ("Documentation", {"docs"}, ("doc", "docs")),
+    ("Tests", {"test"}, ("test", "tests")),
+    ("Maintenance", {"chore", "ci", "build", "refactor", "perf", "style"}, ("maintenance change", "maintenance changes")),
 ]
+OTHER_LABEL = ("other change", "other changes")
 
 
 def ctype(subject):
@@ -32,11 +35,11 @@ def ctype(subject):
     return m.group(1) if m else None
 
 
-buckets = {name: [] for name, _ in GROUPS}
+buckets = {name: [] for name, *_ in GROUPS}
 other = []
 for s in subjects:
     t = ctype(s)
-    for name, types in GROUPS:
+    for name, types, _ in GROUPS:
         if t in types:
             buckets[name].append(s)
             break
@@ -44,7 +47,7 @@ for s in subjects:
         other.append(s)
 
 out = ["## What", "", "Promotes `dev` to `main`.", ""]
-for name, _ in GROUPS:
+for name, *_ in GROUPS:
     if buckets[name]:
         out.append(f"### {name}")
         out += [f"- {s}" for s in buckets[name]]
@@ -75,3 +78,27 @@ else:
 
 with open("body.md", "w") as f:
     f.write(new)
+
+
+# Title: a mechanical one-line summary, e.g. "Promote dev to main: 1 feature, 3
+# fixes". Counts follow the same grouping as the body.
+def plural(n, labels):
+    return f"{n} {labels[0] if n == 1 else labels[1]}"
+
+
+parts = [plural(len(buckets[name]), labels) for name, _, labels in GROUPS if buckets[name]]
+if other:
+    parts.append(plural(len(other), OTHER_LABEL))
+title = "Promote dev to main"
+if parts:
+    title += ": " + ", ".join(parts)
+
+# Only set the title when the maintainer hasn't given the PR one of their own --
+# it's empty or still an auto title -- so a hand-edited title survives a later
+# push (the auto body block is preserved separately, via its markers).
+cur_title = subprocess.check_output(
+    ["gh", "pr", "view", pr, "--json", "title", "-q", ".title"], text=True
+).strip()
+if cur_title in ("", "null") or cur_title.startswith("Promote dev to main"):
+    with open("title.txt", "w") as f:
+        f.write(title)

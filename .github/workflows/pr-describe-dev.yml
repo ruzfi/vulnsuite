@@ -28,3 +28,7 @@ jobs:
         run: |
           python3 .github/scripts/pr-describe.py "$BASE" "$HEAD" "$PR"
           gh pr edit "$PR" --body-file body.md
+          # title.txt is written only when the title isn't a maintainer's own.
+          if [ -s title.txt ]; then
+            gh pr edit "$PR" --title "$(cat title.txt)"
+          fi
