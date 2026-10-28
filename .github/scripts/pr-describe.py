@@ -7,24 +7,34 @@ Writes body.md. An auto-generated section lives between HTML-comment markers and
 is regenerated on every run; anything outside the markers (notes you add by
 hand) is preserved.
 """
+import os
 import re
 import subprocess
 import sys
 
 base, head, pr = sys.argv[1], sys.argv[2], sys.argv[3]
 
+# A freshly opened promotion PR carries the generic contributor PR template and,
+# on the web, whatever title was typed to satisfy the form. On "opened" we own
+# the PR outright: replace the body with the generated description and set the
+# title. Later events (synchronize/reopened) preserve the maintainer's edits.
+opened = os.environ.get("ACTION") == "opened"
+
 subjects = subprocess.check_output(
     ["git", "log", "--no-merges", "--reverse", "--format=%s", f"{base}..{head}"],
     text=True,
 ).splitlines()
 
+# Each group: display heading, the conventional-commit types it collects, and a
+# (singular, plural) label for the one-line title summary.
 GROUPS = [
-    ("Features", {"feat"}),
-    ("Fixes", {"fix"}),
-    ("Documentation", {"docs"}),
-    ("Tests", {"test"}),
-    ("Maintenance", {"chore", "ci", "build", "refactor", "perf", "style"}),
+    ("Features", {"feat"}, ("feature", "features")),
+    ("Fixes", {"fix"}, ("fix", "fixes")),
+    ("Documentation", {"docs"}, ("doc", "docs")),
+    ("Tests", {"test"}, ("test", "tests")),
+    ("Maintenance", {"chore", "ci", "build", "refactor", "perf", "style"}, ("maintenance change", "maintenance changes")),
 ]
+OTHER_LABEL = ("other change", "other changes")
 
 
 def ctype(subject):
@@ -32,11 +42,11 @@ def ctype(subject):
     return m.group(1) if m else None
 
 
-buckets = {name: [] for name, _ in GROUPS}
+buckets = {name: [] for name, *_ in GROUPS}
 other = []
 for s in subjects:
     t = ctype(s)
-    for name, types in GROUPS:
+    for name, types, _ in GROUPS:
         if t in types:
             buckets[name].append(s)
             break
@@ -44,7 +54,7 @@ for s in subjects:
         other.append(s)
 
 out = ["## What", "", "Promotes `dev` to `main`.", ""]
-for name, _ in GROUPS:
+for name, *_ in GROUPS:
     if buckets[name]:
         out.append(f"### {name}")
         out += [f"- {s}" for s in buckets[name]]
@@ -53,8 +63,8 @@ if other:
     out.append("### Other")
     out += [f"- {s}" for s in other]
     out.append("")
-# The checklist stays in the PR template (outside the markers) so ticked boxes
-# survive; the auto block is just the commit summary and is safe to regenerate.
+# The auto block is just the commit summary and is safe to regenerate. Anything
+# the maintainer adds outside the markers (notes) is preserved across pushes.
 auto = "\n".join(out).strip()
 
 START, END = "<!-- dev-pr:auto -->", "<!-- /dev-pr:auto -->"
@@ -66,7 +76,10 @@ cur = subprocess.check_output(
 if cur.strip() == "null":
     cur = ""
 
-if START in cur and END in cur:
+if opened:
+    # Discard the pre-filled contributor template; this PR is a promotion.
+    new = block + "\n"
+elif START in cur and END in cur:
     new = re.sub(re.escape(START) + r".*?" + re.escape(END), lambda _m: block, cur, flags=re.S)
 elif cur.strip():
     new = cur.rstrip() + "\n\n" + block + "\n"
@@ -75,3 +88,27 @@ else:
 
 with open("body.md", "w") as f:
     f.write(new)
+
+
+# Title: a mechanical one-line summary, e.g. "Promote dev to main: 1 feature, 3
+# fixes". Counts follow the same grouping as the body.
+def plural(n, labels):
+    return f"{n} {labels[0] if n == 1 else labels[1]}"
+
+
+parts = [plural(len(buckets[name]), labels) for name, _, labels in GROUPS if buckets[name]]
+if other:
+    parts.append(plural(len(other), OTHER_LABEL))
+title = "Promote dev to main"
+if parts:
+    title += ": " + ", ".join(parts)
+
+# On "opened" always set the title. Afterwards, only set it when the maintainer
+# hasn't given the PR one of their own (empty or still an auto title), so a
+# hand-edited title survives a later push.
+cur_title = subprocess.check_output(
+    ["gh", "pr", "view", pr, "--json", "title", "-q", ".title"], text=True
+).strip()
+if opened or cur_title in ("", "null") or cur_title.startswith("Promote dev to main"):
+    with open("title.txt", "w") as f:
+        f.write(title)
