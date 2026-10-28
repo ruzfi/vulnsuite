@@ -44,10 +44,14 @@ schemas/           JSON schema of the contract (kept in sync with pkg/contract)
 ## Branches
 
 - `main` is protected and holds the released, CI-green state. **Do not push to
-  `main` directly** — it only advances through reviewed, squash-merged pull
-  requests.
+  `main` directly.** It advances only through the maintainer's `dev` -> `main`
+  promotion pull request, which is **merged as a merge commit** — never
+  squashed, since a squash would collapse the release's per-PR commits into one
+  and empty the changelog.
 - `dev` is the integration branch. **Base all work on `dev`.** Branch from it,
-  and open your pull request against `dev`, not `main`.
+  and open your pull request against `dev`, not `main`. Contributor PRs are
+  **squash-merged** into `dev`, so each PR lands as a single Conventional Commit
+  (the PR title) — which is what the release changelog is built from.
 - Maintainers promote `dev` to `main` for releases.
 
 ```bash
