@@ -47,5 +47,3 @@ changelog:
       # "Merge ..." commits, so the changelog is exactly the per-PR commits.
       - '^Merge '
       - '^Promote dev to main'
-      - typo
-      - (?i)foo
