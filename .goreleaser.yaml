@@ -24,16 +24,23 @@ changelog:
   groups:
     - title: Features
       regexp: '^feat'
+      order: 0
     - title: Fixes
       regexp: '^fix'
+      order: 10
     - title: Performance
       regexp: '^perf'
+      order: 50
+    - title: Docs
+      regexp: '^docs'
+      order: 100
     - title: Other
       order: 999
   filters:
     exclude:
-      - '^docs'
       - '^test'
       - '^chore'
       - '^ci'
       - '^Merge '   # drop merge commits (dev -> main PR merges, branch merges)
+      - typo
+      - (?i)foo
