@@ -2,7 +2,9 @@ package runner
 
 import (
 	"context"
+	"net"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -269,5 +271,115 @@ func TestRefusesHostAccessWithoutConsent(t *testing.T) {
 	// with consent, device passthrough is honored (reaches the engine)
 	if _, err := r.Run(ctx, mk([]string{"/dev/kvm"}, nil), contract.StateVulnerable, exp, Options{AllowHostAccess: true, Build: builder.Options{Pull: true}}); err != nil && strings.Contains(err.Error(), "allow-host-access") {
 		t.Fatalf("consent should allow device passthrough: %v", err)
+	}
+}
+
+func freeTestPort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+	return p
+}
+
+func TestHostModeMultiPort(t *testing.T) {
+	fe := enginetest.New()
+	r := New(fe)
+	r.Reach = func(string, int, time.Duration) probes.Reach { return probes.Unreachable }
+	c := &contract.Contract{
+		APIVersion: contract.APIVersion,
+		Kind:       "Target",
+		Metadata:   contract.Metadata{ID: "multiport-test"},
+		Base:       contract.Base{Kind: contract.BaseImage, Image: "example:latest"},
+		Service: contract.Service{Ports: []contract.Port{
+			{Container: 9999, Protocol: "http"},
+			{Container: 8091, Protocol: "http", Publish: true},
+			{Container: 1234}, // internal-only: not published
+		}},
+		States: map[string]*contract.State{"vulnerable": {Name: "vulnerable"}},
+	}
+	ctx := context.Background()
+	mapped := freeTestPort(t)
+	exp := Exposure{Mode: ModeHost, Bind: "127.0.0.1", HostPortMap: map[int]int{8091: mapped}}
+	h, err := r.Run(ctx, c, "vulnerable", exp, Options{ReadyTimeout: time.Second, Build: builder.Options{Pull: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// the primary port plus the one publish:true port are bound on the host; the
+	// unmarked port stays internal.
+	spec := fe.Containers[h.Container].Spec
+	if len(spec.Ports) != 2 {
+		t.Fatalf("want 2 host bindings, got %+v", spec.Ports)
+	}
+	if len(h.PublishedPorts) != 2 || h.PublishedPorts[0].ContainerPort != 9999 || h.PublishedPorts[1].ContainerPort != 8091 {
+		t.Fatalf("published (primary first): %+v", h.PublishedPorts)
+	}
+	byCP := map[int]int{}
+	for _, p := range h.PublishedPorts {
+		byCP[p.ContainerPort] = p.HostPort
+	}
+	if byCP[8091] != mapped {
+		t.Fatalf("-host-port-map ignored: %+v", h.PublishedPorts)
+	}
+	if byCP[9999] == 0 || byCP[9999] == mapped {
+		t.Fatalf("primary should get a distinct free port: %+v", h.PublishedPorts)
+	}
+	if h.EndpointPort != byCP[9999] {
+		t.Fatalf("primary endpoint should stay the primary port: %d vs %d", h.EndpointPort, byCP[9999])
+	}
+	pts := h.PortTargets()
+	if len(pts) != 2 || pts[0].ContainerPort != 9999 || !strings.HasSuffix(pts[1].URL, ":"+strconv.Itoa(mapped)) {
+		t.Fatalf("port targets: %+v", pts)
+	}
+}
+
+func TestAllocateHostPorts(t *testing.T) {
+	pubs := []contract.Port{{Container: 9999}, {Container: 8091}}
+	// both unmapped -> two distinct free host ports
+	alloc, err := allocateHostPorts(Exposure{Bind: "127.0.0.1"}, pubs)
+	if err != nil || alloc[9999] == 0 || alloc[8091] == 0 || alloc[9999] == alloc[8091] {
+		t.Fatalf("auto alloc: %v %+v", err, alloc)
+	}
+	// the same host port for two container ports is rejected before create
+	p := freeTestPort(t)
+	if _, err := allocateHostPorts(Exposure{Bind: "127.0.0.1", HostPort: p, HostPortMap: map[int]int{8091: p}}, pubs); err == nil {
+		t.Fatal("duplicate host port must fail")
+	}
+	// an occupied host port is rejected
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	used := l.Addr().(*net.TCPAddr).Port
+	if _, err := allocateHostPorts(Exposure{Bind: "127.0.0.1", HostPort: used}, pubs); err == nil {
+		t.Fatal("occupied host port must fail")
+	}
+}
+
+func TestRunningCarriesAllHostBindings(t *testing.T) {
+	fe := enginetest.New()
+	name := contract.ContainerNamePrefix + "multi-vulnerable"
+	fe.Containers[name] = &enginetest.Container{
+		ID: "c1", Running: true, IP: "172.17.0.2",
+		Spec: engine.ContainerSpec{Name: name, Ports: []engine.PortBinding{
+			{HostIP: "127.0.0.1", HostPort: 40001, ContainerPort: 8091, Protocol: "tcp"},
+			{HostIP: "127.0.0.1", HostPort: 40000, ContainerPort: 9999, Protocol: "tcp"},
+		}},
+	}
+	rows, err := New(fe).Running(context.Background(), DefaultNetwork)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("rows: %v %+v", err, rows)
+	}
+	// every binding surfaces, sorted by container port; the legacy fields mirror
+	// the lowest container port deterministically.
+	if len(rows[0].Ports) != 2 || rows[0].Ports[0].ContainerPort != 8091 || rows[0].Ports[1].ContainerPort != 9999 {
+		t.Fatalf("ports: %+v", rows[0].Ports)
+	}
+	if rows[0].HostPort != 40001 {
+		t.Fatalf("legacy host port should mirror the first binding: %+v", rows[0])
 	}
 }

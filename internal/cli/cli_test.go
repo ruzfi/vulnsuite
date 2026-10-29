@@ -52,7 +52,7 @@ func TestListAndValidate(t *testing.T) {
 	t.Setenv("NUCLEI_TEMPLATES", "")
 	root := fixtures(t)
 	code, out, _ := run(t, nil, "-T", root, "list")
-	if code != ExitOK || !strings.Contains(out, "grafana-8.3.0-cve-2021-43798") || !strings.Contains(out, "5 templates") {
+	if code != ExitOK || !strings.Contains(out, "grafana-8.3.0-cve-2021-43798") || !strings.Contains(out, "6 templates") {
 		t.Fatalf("list: %d\n%s", code, out)
 	}
 	code, out, _ = run(t, nil, "list", "-T", root, "-tag", "iot")
@@ -187,5 +187,35 @@ func TestTargetsReportsBoundHostAddress(t *testing.T) {
 	code, out, _ = run(t, fe, "-T", root, "targets", "-by", "host")
 	if code != ExitOK || !strings.Contains(out, "http://127.0.0.1:49155") {
 		t.Fatalf("targets 0.0.0.0: %d %s", code, out)
+	}
+}
+
+func TestMultiPortReporting(t *testing.T) {
+	root := fixtures(t)
+	fe := enginetest.New()
+	// The multiport fixture publishes its primary (9999) plus one publish:true
+	// port (8091); seed both host bindings as the daemon would report them.
+	name := contract.ContainerNamePrefix + "multiport-console-demo-vulnerable"
+	fe.Containers[name] = &enginetest.Container{
+		ID: "c1", Running: true, IP: "172.17.0.2",
+		Spec: engine.ContainerSpec{Name: name, Ports: []engine.PortBinding{
+			{HostIP: "127.0.0.1", HostPort: 40000, ContainerPort: 9999, Protocol: "tcp"},
+			{HostIP: "127.0.0.1", HostPort: 40001, ContainerPort: 8091, Protocol: "tcp"},
+		}},
+	}
+	// ps lists every published host port.
+	code, out, _ := run(t, fe, "-T", root, "ps")
+	if code != ExitOK || !strings.Contains(out, "40000") || !strings.Contains(out, "40001") {
+		t.Fatalf("ps host ports: %d\n%s", code, out)
+	}
+	// targets -by host emits one URL per published host binding.
+	code, out, _ = run(t, fe, "-T", root, "targets", "-by", "host")
+	if code != ExitOK || !strings.Contains(out, "http://127.0.0.1:40000") || !strings.Contains(out, "http://127.0.0.1:40001") {
+		t.Fatalf("targets -by host: %d\n%s", code, out)
+	}
+	// -by alias addresses each published container port at the network alias.
+	code, out, _ = run(t, fe, "-T", root, "targets", "-by", "alias")
+	if code != ExitOK || !strings.Contains(out, "http://multiport-console-demo:9999") || !strings.Contains(out, "http://multiport-console-demo:8091") {
+		t.Fatalf("targets -by alias: %d\n%s", code, out)
 	}
 }

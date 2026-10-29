@@ -48,10 +48,14 @@ type Exposure struct {
 	Network  string `json:"network,omitempty"`
 	Bind     string `json:"bind,omitempty"`
 	HostPort int    `json:"host_port,omitempty"`
-	Parent   string `json:"parent,omitempty"` // macvlan parent interface
-	IP       string `json:"ip,omitempty"`     // macvlan static ip
-	Subnet   string `json:"subnet,omitempty"`
-	Gateway  string `json:"gateway,omitempty"`
+	// HostPortMap pins the host port for a published container port (host mode),
+	// container port -> host port. The primary port uses HostPort; additional
+	// published ports fall here, and anything unmapped gets a free host port.
+	HostPortMap map[int]int `json:"host_port_map,omitempty"`
+	Parent      string      `json:"parent,omitempty"` // macvlan parent interface
+	IP          string      `json:"ip,omitempty"`     // macvlan static ip
+	Subnet      string      `json:"subnet,omitempty"`
+	Gateway     string      `json:"gateway,omitempty"`
 	// Internal makes the bridge network host-only (no egress at all).
 	Internal bool `json:"internal,omitempty"`
 }
@@ -78,16 +82,98 @@ type Handle struct {
 	// then a host-published port on the daemon's loopback cannot be reached from
 	// here, which changes how readiness and verification are reported.
 	DaemonRemote bool `json:"daemon_remote,omitempty"`
+	// PublishedPorts is every port made reachable to a scanner: the primary port
+	// first, then any additional publish: true ports. In host mode each carries
+	// its host binding; in internal/macvlan mode only the container port.
+	PublishedPorts []PublishedPort `json:"published_ports,omitempty"`
 	// VerifyOK is nil when verification was skipped.
 	VerifyOK     *bool           `json:"verify_ok"`
 	VerifyDetail string          `json:"verify_detail,omitempty"`
 	Probes       []probes.Result `json:"probes,omitempty"`
 }
 
+// PublishedPort is one container port exposed to a scanner. In host mode HostIP
+// and HostPort are its binding on the host; in internal/macvlan mode they are
+// zero and the port is reached at the container (or macvlan) IP. Scheme is the
+// URL scheme ("" for raw TCP).
+type PublishedPort struct {
+	ContainerPort int    `json:"container_port"`
+	HostIP        string `json:"host_ip,omitempty"`
+	HostPort      int    `json:"host_port,omitempty"`
+	Scheme        string `json:"scheme,omitempty"`
+}
+
 // ScannerTarget is what a scanner should be pointed at (scheme://host:port,
-// or host:port for raw TCP services).
+// or host:port for raw TCP services). It is the primary port; ScannerTargets
+// returns every published port.
 func (h *Handle) ScannerTarget() string {
 	return FormatTarget(h.Scheme, h.EndpointHost, h.EndpointPort)
+}
+
+// PortTarget pairs a published container port with its scannable URL.
+type PortTarget struct {
+	ContainerPort int
+	URL           string
+}
+
+// PortTargets returns a scannable URL for every published port, primary first,
+// each tagged with its container port. In host mode these are the host
+// bindings; in internal/macvlan mode they are the container (or macvlan) IP and
+// the container ports. Ports this host cannot address are skipped.
+func (h *Handle) PortTargets() []PortTarget {
+	var out []PortTarget
+	for _, p := range h.PublishedPorts {
+		host, port := h.portAddress(p)
+		if host == "" {
+			continue
+		}
+		out = append(out, PortTarget{ContainerPort: p.ContainerPort, URL: FormatTarget(p.Scheme, host, port)})
+	}
+	return out
+}
+
+// ScannerTargets returns a scannable URL for every published port, primary
+// first. Falls back to the primary ScannerTarget when no published ports were
+// recorded or none is addressable from here.
+func (h *Handle) ScannerTargets() []string {
+	pts := h.PortTargets()
+	if len(pts) == 0 {
+		return []string{h.ScannerTarget()}
+	}
+	out := make([]string, len(pts))
+	for i, pt := range pts {
+		out[i] = pt.URL
+	}
+	return out
+}
+
+// portAddress resolves the address a scanner uses for one published port, per
+// exposure mode, or "" when this host cannot reach it.
+func (h *Handle) portAddress(p PublishedPort) (string, int) {
+	switch h.Exposure.Mode {
+	case ModeHost:
+		return normalizeHostIP(p.HostIP), p.HostPort
+	case ModeInternal:
+		host := h.IP
+		if host == "" {
+			host = h.EndpointHost // the network alias
+		}
+		return host, p.ContainerPort
+	case ModeMacvlan:
+		return h.EndpointHost, p.ContainerPort
+	}
+	return "", 0
+}
+
+// normalizeHostIP turns a binding's host IP into one a local scanner can dial:
+// a port on all interfaces (empty, 0.0.0.0 or ::) is reached via loopback; an
+// explicit bind address is carried through unchanged.
+func normalizeHostIP(ip string) string {
+	switch ip {
+	case "", "0.0.0.0", "::":
+		return "127.0.0.1"
+	}
+	return ip
 }
 
 // FormatTarget renders scheme://host:port (or host:port for raw TCP).
@@ -234,20 +320,25 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 		}
 		spec.Network = &engine.NetworkAttachment{Name: exp.Network, Aliases: []string{c.ID()}}
 		h.EndpointHost = c.ID()
+		for _, pp := range c.Service.HostPublishPorts() {
+			h.PublishedPorts = append(h.PublishedPorts, PublishedPort{ContainerPort: pp.Container, Scheme: pp.Scheme()})
+		}
 	case ModeHost:
-		hp := exp.HostPort
-		if hp == 0 {
-			hp, err = freePort(exp.Bind)
-			if err != nil {
-				return nil, err
-			}
-		} else if err := assertPortFree(exp.Bind, hp); err != nil {
+		pubs := c.Service.HostPublishPorts()
+		alloc, err := allocateHostPorts(exp, pubs)
+		if err != nil {
 			return nil, err
 		}
-		spec.Ports = []engine.PortBinding{{HostIP: exp.Bind, HostPort: hp, ContainerPort: port.Container, Protocol: "tcp"}}
-		h.EndpointHost, h.EndpointPort = exp.Bind, hp
-		if exp.Bind == "0.0.0.0" {
-			h.EndpointHost = "127.0.0.1"
+		for i, pp := range pubs {
+			hp := alloc[pp.Container]
+			spec.Ports = append(spec.Ports, engine.PortBinding{HostIP: exp.Bind, HostPort: hp, ContainerPort: pp.Container, Protocol: "tcp"})
+			h.PublishedPorts = append(h.PublishedPorts, PublishedPort{ContainerPort: pp.Container, HostIP: exp.Bind, HostPort: hp, Scheme: pp.Scheme()})
+			if i == 0 {
+				h.EndpointHost, h.EndpointPort = exp.Bind, hp
+				if exp.Bind == "0.0.0.0" {
+					h.EndpointHost = "127.0.0.1"
+				}
+			}
 		}
 	case ModeMacvlan:
 		if exp.Parent == "" {
@@ -264,6 +355,9 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 		h.EndpointHost = exp.IP
 		if h.EndpointHost == "" {
 			h.EndpointHost = "<macvlan-ip>"
+		}
+		for _, pp := range c.Service.HostPublishPorts() {
+			h.PublishedPorts = append(h.PublishedPorts, PublishedPort{ContainerPort: pp.Container, Scheme: pp.Scheme()})
 		}
 	default:
 		return nil, fmt.Errorf("unknown exposure mode %q", exp.Mode)
@@ -558,8 +652,12 @@ type Target struct {
 	Status    string `json:"status"`
 	Image     string `json:"image"`
 	IP        string `json:"ip,omitempty"`
-	HostIP    string `json:"host_ip,omitempty"` // host IP the port is published on (host mode)
+	HostIP    string `json:"host_ip,omitempty"` // host IP the primary port is published on (host mode)
 	HostPort  int    `json:"host_port,omitempty"`
+	// Ports is every published port's host binding (host mode), by ascending
+	// container port. HostIP/HostPort above mirror the first. Scheme is unset
+	// here (the daemon doesn't know it); callers fill it from the template.
+	Ports []PublishedPort `json:"ports,omitempty"`
 }
 
 // Running lists running vulnsuite targets (not sidecars).
@@ -587,9 +685,12 @@ func (r *Runner) Running(ctx context.Context, network string) ([]Target, error) 
 					break
 				}
 			}
-			for _, b := range det.Ports {
-				t.HostIP, t.HostPort = b.IP, b.Port
-				break
+			for portProto, b := range det.Ports {
+				t.Ports = append(t.Ports, PublishedPort{ContainerPort: containerPortOf(portProto), HostIP: b.IP, HostPort: b.Port})
+			}
+			sort.Slice(t.Ports, func(i, j int) bool { return t.Ports[i].ContainerPort < t.Ports[j].ContainerPort })
+			if len(t.Ports) > 0 {
+				t.HostIP, t.HostPort = t.Ports[0].HostIP, t.Ports[0].HostPort
 			}
 		}
 		out = append(out, t)
@@ -648,6 +749,17 @@ func mergeEnv(a, b map[string]string) []string {
 	return out
 }
 
+// containerPortOf extracts the port number from an engine port key like
+// "9999/tcp".
+func containerPortOf(portProto string) int {
+	s := portProto
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		s = s[:i]
+	}
+	n, _ := strconv.Atoi(s)
+	return n
+}
+
 func freePort(bind string) (int, error) {
 	host := bind
 	if host == "0.0.0.0" || host == "" {
@@ -659,6 +771,61 @@ func freePort(bind string) (int, error) {
 	}
 	defer l.Close()
 	return l.Addr().(*net.TCPAddr).Port, nil
+}
+
+// allocateHostPorts resolves the host port for each published container port in
+// host mode. Explicit ports (-host-port for the primary, -host-port-map for the
+// rest) are checked for duplicates and availability; the remaining ports get
+// distinct free host ports. Returns container port -> host port. All checks run
+// before any container is created, so a clash fails cleanly.
+func allocateHostPorts(exp Exposure, pubs []contract.Port) (map[int]int, error) {
+	out := make(map[int]int, len(pubs))
+	used := map[int]bool{}
+	var auto []int
+	for i, pp := range pubs {
+		want := 0
+		if i == 0 {
+			want = exp.HostPort // -host-port maps the primary
+		}
+		if m, ok := exp.HostPortMap[pp.Container]; ok {
+			want = m
+		}
+		if want == 0 {
+			auto = append(auto, pp.Container)
+			continue
+		}
+		if used[want] {
+			return nil, fmt.Errorf("host port %d is requested for more than one container port", want)
+		}
+		if err := assertPortFree(exp.Bind, want); err != nil {
+			return nil, fmt.Errorf("cannot publish container port %d: %w", pp.Container, err)
+		}
+		used[want] = true
+		out[pp.Container] = want
+	}
+	// Grab distinct free host ports for the rest, holding each listener open so
+	// the OS does not hand out the same port twice, then release them all.
+	host := exp.Bind
+	if host == "0.0.0.0" || host == "" {
+		host = "127.0.0.1"
+	}
+	var held []net.Listener
+	defer func() {
+		for _, l := range held {
+			l.Close()
+		}
+	}()
+	for _, cp := range auto {
+		l, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
+		if err != nil {
+			return nil, err
+		}
+		held = append(held, l)
+		p := l.Addr().(*net.TCPAddr).Port
+		used[p] = true
+		out[cp] = p
+	}
+	return out, nil
 }
 
 func assertPortFree(bind string, port int) error {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -19,12 +20,36 @@ import (
 // DefaultMaxConcurrent caps simultaneously running targets.
 const DefaultMaxConcurrent = 10
 
+// portMapFlag collects repeatable "container=host" pairs into a map, lazily
+// allocating it on first use.
+type portMapFlag struct{ m *map[int]int }
+
+func (p portMapFlag) String() string { return "" }
+
+func (p portMapFlag) Set(v string) error {
+	k, val, ok := strings.Cut(v, "=")
+	cp, err1 := strconv.Atoi(strings.TrimSpace(k))
+	hp, err2 := strconv.Atoi(strings.TrimSpace(val))
+	if !ok || err1 != nil || err2 != nil || cp < 1 || cp > 65535 || hp < 1 || hp > 65535 {
+		return fmt.Errorf("want container=host with ports 1..65535, got %q", v)
+	}
+	if *p.m == nil {
+		*p.m = map[int]int{}
+	}
+	if _, dup := (*p.m)[cp]; dup {
+		return fmt.Errorf("container port %d is mapped more than once", cp)
+	}
+	(*p.m)[cp] = hp
+	return nil
+}
+
 func addExposureFlags(fs *flag.FlagSet, exp *runner.Exposure) {
 	fs.StringVar(&exp.Mode, "expose", runner.ModeInternal, "exposure mode: internal, host or macvlan")
 	fs.StringVar(&exp.Network, "network", runner.DefaultNetwork, "internal network name")
 	fs.BoolVar(&exp.Internal, "no-egress", false, "create the internal network with no route off the host")
 	fs.StringVar(&exp.Bind, "bind", "127.0.0.1", "host bind address (host mode)")
-	fs.IntVar(&exp.HostPort, "host-port", 0, "host port (host mode, single target; default: a free port)")
+	fs.IntVar(&exp.HostPort, "host-port", 0, "host port for the primary port (host mode, single target; default: a free port)")
+	fs.Var(portMapFlag{&exp.HostPortMap}, "host-port-map", "pin an additional published port: container=host (host mode, single target; repeatable)")
 	fs.StringVar(&exp.Parent, "parent", "", "host interface (macvlan mode)")
 	fs.StringVar(&exp.IP, "ip", "", "static IP (macvlan mode, single target)")
 	fs.StringVar(&exp.Subnet, "subnet", "", "subnet (macvlan mode)")
@@ -123,6 +148,7 @@ Exposure modes:
 			}
 			if multi {
 				exp.HostPort = 0
+				exp.HostPortMap = nil
 			}
 			eng, err := g.Engine(ctx)
 			if err != nil {
@@ -247,12 +273,23 @@ Exposure modes:
 			} else {
 				g.printf("\nScan these with your probe:\n")
 				for _, h := range handles {
-					tag := fmt.Sprintf("%s [%s]", h.ID, h.State)
 					extra := ""
 					if h.Exposure.Mode == runner.ModeInternal && h.IP != "" {
 						extra = fmt.Sprintf("  (ip %s)", h.IP)
 					}
-					g.printf("  %-52s %s%s\n", tag, h.ScannerTarget(), extra)
+					pts := h.PortTargets()
+					if len(pts) == 0 {
+						g.printf("  %-52s %s%s\n", fmt.Sprintf("%s [%s]", h.ID, h.State), h.ScannerTarget(), extra)
+						continue
+					}
+					for _, pt := range pts {
+						tag := fmt.Sprintf("%s [%s]", h.ID, h.State)
+						note := extra
+						if len(pts) > 1 {
+							note = fmt.Sprintf("  (container port %d)%s", pt.ContainerPort, extra)
+						}
+						g.printf("  %-52s %s%s\n", tag, pt.URL, note)
+					}
 				}
 				if handles[0].Exposure.Mode == runner.ModeInternal {
 					g.printf("\n  run your scanner on the same network, e.g.:\n")
@@ -263,7 +300,14 @@ Exposure modes:
 			if targetsFile != "" {
 				var lines []string
 				for _, h := range handles {
-					lines = append(lines, fmt.Sprintf("%s  # %s %s", scanURL(h), h.ID, h.State))
+					pts := h.PortTargets()
+					if len(pts) <= 1 {
+						lines = append(lines, fmt.Sprintf("%s  # %s %s", scanURL(h), h.ID, h.State))
+						continue
+					}
+					for _, pt := range pts {
+						lines = append(lines, fmt.Sprintf("%s  # %s %s container=%d", pt.URL, h.ID, h.State, pt.ContainerPort))
+					}
 				}
 				if err := os.WriteFile(targetsFile, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
 					return err
@@ -323,6 +367,21 @@ func reportableHostIP(ip string) string {
 		return "127.0.0.1"
 	}
 	return ip
+}
+
+// hostPortsLabel renders a target's published host ports as "39841,39842", or
+// "-" when none are published (internal/macvlan mode).
+func hostPortsLabel(t runner.Target) string {
+	var ps []string
+	for _, p := range t.Ports {
+		if p.HostPort > 0 {
+			ps = append(ps, strconv.Itoa(p.HostPort))
+		}
+	}
+	if len(ps) == 0 {
+		return "-"
+	}
+	return strings.Join(ps, ",")
 }
 
 // scanURL prefers the container IP for internal mode (what a host-side
@@ -434,17 +493,13 @@ func cmdPS() *Command {
 				return nil
 			}
 			tw := tabwriter.NewWriter(g.Stdout, 2, 4, 2, ' ', 0)
-			fmt.Fprintln(tw, "ID\tSTATE\tIP\tHOST PORT\tSTATUS")
+			fmt.Fprintln(tw, "ID\tSTATE\tIP\tHOST PORTS\tSTATUS")
 			for _, r := range rows {
-				hp := "-"
-				if r.HostPort > 0 {
-					hp = fmt.Sprint(r.HostPort)
-				}
 				ip := r.IP
 				if ip == "" {
 					ip = "-"
 				}
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", r.ID, r.State, ip, hp, r.Status)
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", r.ID, r.State, ip, hostPortsLabel(r), r.Status)
 			}
 			tw.Flush()
 			g.printf("\n%d running\n", len(rows))
@@ -501,30 +556,36 @@ the subnet. Non-HTTP targets come out as host:port for network templates.`,
 					g.errorf("skip %s: template not found in %s\n", r.ID, store.Root)
 					continue
 				}
-				port := c.Service.PrimaryPort()
-				var host string
-				p := port.Container
-				switch by {
-				case "alias":
-					host = r.ID
-				case "host":
-					if r.HostPort == 0 {
-						continue
+				published := c.Service.HostPublishPorts()
+				// host mode (explicit, or auto when the target has host bindings):
+				// one row per actual host binding, primary first.
+				if by == "host" || (by == "auto" && len(r.Ports) > 0) {
+					bind := map[int]runner.PublishedPort{}
+					for _, pb := range r.Ports {
+						bind[pb.ContainerPort] = pb
 					}
-					host, p = reportableHostIP(r.HostIP), r.HostPort
-				case "auto":
-					if r.HostPort > 0 {
-						host, p = reportableHostIP(r.HostIP), r.HostPort
-					} else {
-						host = r.IP
+					for _, pp := range published {
+						pb, ok := bind[pp.Container]
+						if !ok {
+							continue
+						}
+						pairs = append(pairs, pair{r.ID, r.State,
+							runner.FormatTarget(pp.Scheme(), reportableHostIP(pb.HostIP), pb.HostPort)})
 					}
-				default: // "ip"
-					host = r.IP
-				}
-				if host == "" {
 					continue
 				}
-				pairs = append(pairs, pair{r.ID, r.State, runner.FormatTarget(port.Scheme(), host, p)})
+				// alias / ip (and auto with no host bindings): address each
+				// published container port at the alias or container IP.
+				for _, pp := range published {
+					host := r.IP
+					if by == "alias" {
+						host = r.ID
+					}
+					if host == "" {
+						continue
+					}
+					pairs = append(pairs, pair{r.ID, r.State, runner.FormatTarget(pp.Scheme(), host, pp.Container)})
+				}
 			}
 			if len(pairs) == 0 {
 				return fmt.Errorf("running targets have no resolvable address yet (try again in a moment, or -by alias)")
