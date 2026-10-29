@@ -53,10 +53,10 @@ type rawService struct {
 }
 
 type rawState struct {
-	Image       string            `yaml:"image,omitempty"`
-	Digest      string            `yaml:"digest,omitempty"`
-	Patch       string            `yaml:"patch,omitempty"`
-	Overlay     []OverlayFile     `yaml:"overlay,omitempty"`
+	Image       string                     `yaml:"image,omitempty"`
+	Digest      string                     `yaml:"digest,omitempty"`
+	Patch       string                     `yaml:"patch,omitempty"`
+	Overlay     []OverlayFile              `yaml:"overlay,omitempty"`
 	Environment map[string]string          `yaml:"environment,omitempty"`
 	Command     Command                    `yaml:"command,omitempty"`
 	Sidecars    map[string]SidecarOverride `yaml:"sidecars,omitempty"`
@@ -229,6 +229,7 @@ func (c *Contract) checkStructure() error {
 	if len(s.Ports) == 0 {
 		return se("service/ports", "at least one port is required")
 	}
+	seenPort := map[int]bool{}
 	for i, p := range s.Ports {
 		if p.Container < 1 || p.Container > 65535 {
 			return se(fmt.Sprintf("service/ports/%d/container", i), "must be 1..65535")
@@ -236,6 +237,10 @@ func (c *Contract) checkStructure() error {
 		if p.Protocol != "" && !protocols[p.Protocol] {
 			return se(fmt.Sprintf("service/ports/%d/protocol", i), "%q is not a known protocol", p.Protocol)
 		}
+		if seenPort[p.Container] {
+			return se(fmt.Sprintf("service/ports/%d/container", i), "port %d is declared more than once", p.Container)
+		}
+		seenPort[p.Container] = true
 	}
 	if s.User != "" && !userRe.MatchString(s.User) {
 		return se("service/user", "must be uid or uid:gid")
@@ -368,4 +373,3 @@ func dangerousDevice(d string) bool {
 	}
 	return false
 }
-

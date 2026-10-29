@@ -85,6 +85,10 @@ func ParseDuration(text string, def time.Duration) (time.Duration, error) {
 type Port struct {
 	Container int    `yaml:"container" json:"container"`
 	Protocol  string `yaml:"protocol,omitempty" json:"protocol,omitempty"`
+	// Publish also publishes this port on the host (host mode) and includes it
+	// in scanner target lists. The primary port is always published; this opts a
+	// secondary port in. Ignored on the primary port, which is always published.
+	Publish bool `yaml:"publish,omitempty" json:"publish,omitempty"`
 }
 
 // IsHTTP reports whether the port speaks HTTP(S).
@@ -265,11 +269,11 @@ func pinRef(image, digest string) string {
 
 // State describes how one state (vulnerable or patched) is reached from the base.
 type State struct {
-	Name        string            `yaml:"-" json:"name"`
-	Image       string            `yaml:"image,omitempty" json:"image,omitempty"`
-	Digest      string            `yaml:"digest,omitempty" json:"digest,omitempty"`
-	Patch       string            `yaml:"patch,omitempty" json:"patch,omitempty"`
-	Overlay     []OverlayFile     `yaml:"overlay,omitempty" json:"overlay,omitempty"`
+	Name        string                     `yaml:"-" json:"name"`
+	Image       string                     `yaml:"image,omitempty" json:"image,omitempty"`
+	Digest      string                     `yaml:"digest,omitempty" json:"digest,omitempty"`
+	Patch       string                     `yaml:"patch,omitempty" json:"patch,omitempty"`
+	Overlay     []OverlayFile              `yaml:"overlay,omitempty" json:"overlay,omitempty"`
 	Environment map[string]string          `yaml:"environment,omitempty" json:"environment,omitempty"`
 	Command     []string                   `yaml:"command,omitempty" json:"command,omitempty"`
 	Sidecars    map[string]SidecarOverride `yaml:"sidecars,omitempty" json:"sidecars,omitempty"`
@@ -363,6 +367,28 @@ func (s Service) PrimaryPort() Port {
 		return s.Ports[0]
 	}
 	return Port{}
+}
+
+// HostPublishPorts returns the ports made reachable to a scanner: the primary
+// port (always, first), then every additional port marked publish: true, in
+// declared order. Deduplicated by container port. This is the same set in every
+// exposure mode -- published on the host in host mode, reached at the container
+// (or macvlan) IP otherwise.
+func (s Service) HostPublishPorts() []Port {
+	primary := s.PrimaryPort()
+	seen := map[int]bool{}
+	var out []Port
+	if primary.Container != 0 {
+		out = append(out, primary)
+		seen[primary.Container] = true
+	}
+	for _, p := range s.Ports {
+		if p.Publish && !seen[p.Container] {
+			out = append(out, p)
+			seen[p.Container] = true
+		}
+	}
+	return out
 }
 
 // Metadata identifies and documents the target.

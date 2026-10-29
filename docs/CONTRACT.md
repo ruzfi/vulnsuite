@@ -65,7 +65,7 @@ base: { kind: build, context: src, dockerfile: Dockerfile, build_args: {} }
 
 | Field | Notes |
 | --- | --- |
-| `ports` | required; `{ container: 80, protocol: http }`. Protocols: `http`, `https`, `tcp`, `ssh`, `ftp`, `smtp`, `redis`, `mysql`, `postgres`. The first HTTP port (else the first port) is the one a scanner is pointed at. |
+| `ports` | required; `{ container: 80, protocol: http }`. Protocols: `http`, `https`, `tcp`, `ssh`, `ftp`, `smtp`, `redis`, `mysql`, `postgres`. The first HTTP port (else the first port) is the **primary** port a scanner is pointed at, always published. Add `publish: true` to a secondary port to publish it too (host mode) and include it in scanner target lists; unmarked secondary ports stay internal. Container ports must be unique. |
 | `command` | string or list; overrides the image command |
 | `environment` | map; merged with the state's environment (state wins) |
 | `healthcheck` | `{ http: { path, status }, timeout: 60s }` or `{ tcp: { port }, timeout }`; `timeout` is `<n>s|m|h` |

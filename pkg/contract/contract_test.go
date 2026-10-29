@@ -79,6 +79,27 @@ func TestFidelity(t *testing.T) {
 	}
 }
 
+func TestHostPublishPorts(t *testing.T) {
+	doc := strings.Replace(minimal,
+		"ports: [ { container: 80, protocol: http } ]",
+		"ports:\n    - { container: 9999, protocol: http }\n    - { container: 8091, protocol: http, publish: true }\n    - { container: 1234 }",
+		1)
+	c, err := Parse([]byte(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The primary (first HTTP port) is always published and comes first; a
+	// secondary port joins only with publish: true; an unmarked port stays
+	// internal.
+	pub := c.Service.HostPublishPorts()
+	if len(pub) != 2 || pub[0].Container != 9999 || pub[1].Container != 8091 {
+		t.Fatalf("published ports: %+v", pub)
+	}
+	if c.Service.PrimaryPort().Container != 9999 {
+		t.Fatalf("primary: %+v", c.Service.PrimaryPort())
+	}
+}
+
 func TestParseRejects(t *testing.T) {
 	cases := map[string]string{
 		"unknown field":   strings.Replace(minimal, "summary: demo", "summary: demo\n  bogus: 1", 1),
@@ -90,6 +111,7 @@ func TestParseRejects(t *testing.T) {
 		"two probe kinds": strings.Replace(minimal, "- http: { raw_path: \"/a/..%2e/etc/passwd\", status: 200, body_matches: \"root:\" }", "- { http: { path: / }, tcp: { port: 80 } }", 1),
 		"unknown state":   strings.Replace(minimal, "  patched:", "  fixed:", 1),
 		"image+context":   strings.Replace(minimal, "  image: httpd:2.4.49", "  image: httpd:2.4.49\n  context: src", 1),
+		"duplicate port":  strings.Replace(minimal, "ports: [ { container: 80, protocol: http } ]", "ports: [ { container: 80, protocol: http }, { container: 80 } ]", 1),
 	}
 	for name, doc := range cases {
 		if _, err := Parse([]byte(doc)); err == nil {

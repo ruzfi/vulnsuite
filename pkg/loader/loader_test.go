@@ -19,7 +19,7 @@ func testStore(t *testing.T) *Store {
 func TestAllAndLoad(t *testing.T) {
 	s := testStore(t)
 	paths, err := s.All()
-	if err != nil || len(paths) != 5 {
+	if err != nil || len(paths) != 6 {
 		t.Fatalf("All: %v %v", err, paths)
 	}
 	c, err := s.LoadSelector("apache-httpd-2.4.49-cve-2021-41773")
@@ -78,7 +78,7 @@ func TestFind(t *testing.T) {
 		t.Fatalf("FindMany dedup: %v %v", err, many)
 	}
 	byID, err := s.ByID()
-	if err != nil || len(byID) != 5 {
+	if err != nil || len(byID) != 6 {
 		t.Fatalf("ByID: %v %d", err, len(byID))
 	}
 }

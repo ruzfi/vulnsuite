@@ -221,6 +221,10 @@
                   "mysql",
                   "postgres"
                 ]
+              },
+              "publish": {
+                "type": "boolean",
+                "description": "Also publish this secondary port on the host and include it in scanner target lists. The primary port is always published; this opts an additional port in."
               }
             }
           }

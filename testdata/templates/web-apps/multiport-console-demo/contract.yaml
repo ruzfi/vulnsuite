@@ -1,0 +1,29 @@
+apiVersion: vulnsuite/v1
+kind: Target
+
+metadata:
+  id: multiport-console-demo
+  summary: Two-port service that publishes a console port alongside the primary.
+  vuln_refs: [VS-MULTIPORT-1]
+  severity: medium
+  tags: [multiport]
+  maintainer: ruzfi
+  added: "2026-10-29"
+
+base:
+  kind: image
+  image: example/multiport:1.0
+  digest: sha256:1111111111111111111111111111111111111111111111111111111111111111
+
+service:
+  ports:
+    - { container: 9999, protocol: http }
+    - { container: 8091, protocol: http, publish: true }
+  healthcheck:
+    http: { path: /, status: 200 }
+    timeout: 30s
+
+states:
+  vulnerable:
+    verify:
+      - http: { path: /, status: 200 }
