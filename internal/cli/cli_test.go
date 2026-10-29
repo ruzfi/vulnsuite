@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -217,5 +219,38 @@ func TestMultiPortReporting(t *testing.T) {
 	code, out, _ = run(t, fe, "-T", root, "targets", "-by", "alias")
 	if code != ExitOK || !strings.Contains(out, "http://multiport-console-demo:9999") || !strings.Contains(out, "http://multiport-console-demo:8091") {
 		t.Fatalf("targets -by alias: %d\n%s", code, out)
+	}
+}
+
+// Regression for #25: `run -targets-file` must emit bare URLs that `nuclei -l`
+// can consume. A target with two published ports writes two lines, each a clean
+// URL with no inline metadata (the old writer appended "  # id state container=N",
+// which nuclei treats as part of the target and silently fails to match).
+func TestRunTargetsFileEmitsCleanURLs(t *testing.T) {
+	root := fixtures(t)
+	fe := enginetest.New()
+	targetsFile := filepath.Join(t.TempDir(), "targets.txt")
+	code, out, errOut := run(t, fe, "-T", root, "run", "vulnerable",
+		"-t", "multiport-console-demo", "-expose", "host", "-bind", "127.0.0.1",
+		"-detach", "-no-verify", "-ready-timeout", "1s", "-targets-file", targetsFile)
+	if code != ExitOK {
+		t.Fatalf("run: %d\n%s\n%s", code, out, errOut)
+	}
+	data, err := os.ReadFile(targetsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("want two target lines for two published ports, got %d:\n%s", len(lines), data)
+	}
+	for _, line := range lines {
+		if strings.ContainsAny(line, "# \t") {
+			t.Fatalf("line carries inline metadata, nuclei -l cannot parse it: %q", line)
+		}
+		u, err := url.Parse(line)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			t.Fatalf("line is not a bare URL: %q (%v)", line, err)
+		}
 	}
 }
