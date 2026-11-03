@@ -1,0 +1,5 @@
+# CISA Known Exploited Vulnerabilities (CVE-id snapshot) -- test fixture.
+# One CVE id per line; '#' starts a comment. The real list is kept fresh by the
+# templates repo's cisa-kev-sync Action.
+CVE-2021-41773
+CVE-2017-5638

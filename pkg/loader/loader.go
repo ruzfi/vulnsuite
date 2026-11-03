@@ -136,6 +136,25 @@ func (s *Store) FindMany(selectors []string, all bool) ([]string, error) {
 	return out, nil
 }
 
+// Category returns the product-surface category of a contract: the top
+// directory level under the store root (e.g. web-apps, databases, iot). It is
+// "" when the contract sits directly in the root or outside it.
+func (s *Store) Category(contractPath string) string {
+	abs, err := filepath.Abs(contractPath)
+	if err != nil {
+		abs = contractPath
+	}
+	rel, err := filepath.Rel(s.Root, filepath.Dir(abs))
+	if err != nil {
+		return ""
+	}
+	rel = filepath.ToSlash(rel)
+	if rel == "." || rel == "" || strings.HasPrefix(rel, "..") {
+		return ""
+	}
+	return strings.SplitN(rel, "/", 2)[0]
+}
+
 // Load parses one contract file.
 func (s *Store) Load(path string) (*contract.Contract, error) {
 	data, err := os.ReadFile(path)

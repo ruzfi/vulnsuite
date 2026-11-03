@@ -6,6 +6,7 @@ metadata:
   vuln_refs: [VS-REDIS-NOAUTH]
   cwe: [CWE-306]
   severity: high
+  class: [misconfig, exposure]
   tags: [redis, authentication, exposure, database]
   references: [https://redis.io/docs/management/security/]
   maintainer: ruzfi

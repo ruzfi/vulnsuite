@@ -6,6 +6,7 @@ metadata:
   summary: Two-port service that publishes a console port alongside the primary.
   vuln_refs: [VS-MULTIPORT-1]
   severity: medium
+  class: [exposure]
   tags: [multiport]
   maintainer: ruzfi
   added: "2026-10-29"

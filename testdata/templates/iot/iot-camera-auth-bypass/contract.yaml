@@ -7,6 +7,7 @@ metadata:
   vuln_refs: [VS-IOT-AUTHZ-001]
   cwe: [CWE-306]
   severity: high
+  class: [vuln, exposure]
   tags: [iot, auth-bypass, camera, information-disclosure, simulated]
   references:
     - https://cwe.mitre.org/data/definitions/306.html
