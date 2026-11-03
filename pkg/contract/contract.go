@@ -510,6 +510,21 @@ func (c *Contract) Classes() []string { return c.Metadata.Class }
 // HasClass reports whether the target carries the given finding class.
 func (c *Contract) HasClass(class string) bool { return has(c.Metadata.Class, class) }
 
+// IsVulnRef reports whether s is shaped like a vuln_refs id (CVE-, GHSA-, GO-,
+// or a PREFIX-ID such as VS-...), case-insensitively. Callers use it to treat a
+// ref-shaped selector as a reference lookup.
+func IsVulnRef(s string) bool { return refShapeRe.MatchString(strings.TrimSpace(s)) }
+
+// HasRef reports whether any vuln_ref equals ref, case-insensitively.
+func (c *Contract) HasRef(ref string) bool {
+	for _, r := range c.Metadata.VulnRefs {
+		if strings.EqualFold(r, ref) {
+			return true
+		}
+	}
+	return false
+}
+
 // CVEs returns the CVE ids among vuln_refs, in declared order.
 func (c *Contract) CVEs() []string {
 	var out []string

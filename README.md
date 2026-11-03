@@ -175,7 +175,7 @@ schema for editors and CI is [schemas/contract.schema.json](schemas/contract.sch
 ## Commands
 
 ```
-vulnsuite list [selector] [-class C]... [-category P] [-cve] [-kev] [-year Y]  filter templates
+vulnsuite list [selector] [-ref ID]... [-class C]... [-category P] [-cve] [-kev] [-year Y]  filter templates
 vulnsuite search ...                                alias for list
 vulnsuite validate [-t SEL]... [-strict]            structure + semantic lint
 vulnsuite build -t SEL... | -all [-j N] [-push -registry REG]
@@ -316,6 +316,8 @@ is a single axis — the **product surface** you scan (`web-apps`, `web-servers`
 from the contract, so `list` / `search` can filter by any of it and compose:
 
 ```bash
+vulnsuite list --ref CVE-2026-109619            # the template(s) for a specific CVE/ref
+vulnsuite search CVE-2026-109619                 # the same -- a bare ref works as a selector
 vulnsuite list --class misconfig --kev          # misconfigs on the CISA KEV catalog
 vulnsuite list --category web-apps --cve        # CVE-tracked web-app targets
 vulnsuite search --class exposure --no-cve      # exposures without a CVE
@@ -323,10 +325,16 @@ vulnsuite list --year 2021                       # disclosed in 2021 (or CVE-id 
 vulnsuite list --since 2023-01-01                # disclosed on or after a date
 ```
 
+- `--ref <id>` (repeatable, match any; case-insensitive): a specific `vuln_refs`
+  id — `CVE-…`, `GHSA-…`, `GO-…` or a `VS-…` prefix id. Finds secondary refs
+  that appear in no template id. A bare ref-shaped selector
+  (`search CVE-2026-109619`) resolves against `vuln_refs` too when it matches no
+  id/file/folder.
 - `--class` (repeatable, match any): `vuln`, `misconfig`, `exposure`,
   `default-login`, `weak-crypto`.
 - `--category` / `--product`: the product surface (top directory level).
-- `--cve` / `--no-cve`: has (not) a `CVE-…` in `vuln_refs`.
+- `--cve` / `--no-cve`: has (not) any `CVE-…` in `vuln_refs` (boolean; use
+  `--ref` for a specific id).
 - `--kev` / `--no-kev`: on (not on) the CISA **Known Exploited Vulnerabilities**
   catalog — derived by cross-referencing the target's CVEs. The catalog is read
   from the templates checkout's `data/cisa-kev.txt`; `--refresh-kev` fetches the

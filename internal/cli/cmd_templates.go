@@ -55,23 +55,27 @@ type listRow struct {
 
 func cmdList() *Command {
 	var tag, fidelity, arch, category, year, since string
-	var class multiFlag
+	var class, ref multiFlag
 	var onlyKEV, noKEV, cve, noCVE, refreshKEV bool
 	return &Command{
 		Name: "list", Aliases: []string{"ls", "search"},
 		Short: "list and filter templates by class, KEV, product surface, CVE and year",
-		Usage: "[selector...] [-class C]... [-kev] [-category P] [-cve] [-year YYYY]",
+		Usage: "[selector...] [-ref ID]... [-class C]... [-kev] [-category P] [-cve] [-year YYYY]",
 		Long: `A selector is a folder, a contract file, or a template id (substring match
-when unique). With no selector every template is listed.
+when unique). A ref-shaped selector (CVE-..., GHSA-..., GO-..., VS-...) that
+matches no id/file/folder resolves against vuln_refs instead, so
+` + "`search CVE-2026-109619`" + ` just works. With no selector every template is listed.
 
 Filters compose (all must match). Finding class, CVE and KEV status are derived
 from contract metadata (taxonomy v2) and shown as columns:
 
+  -ref         a specific vuln_refs id -- CVE-, GHSA-, GO- or VS-... (repeatable;
+               match any; case-insensitive). Finds secondary refs that are in no id.
   -class       finding class: vuln, misconfig, exposure, default-login,
                weak-crypto (repeatable; a template matches if it carries any)
   -category    product surface -- the top directory level (web-apps,
                web-servers, databases, network-services, iot, misc). Alias -product.
-  -cve/-no-cve has / has no CVE id in vuln_refs
+  -cve/-no-cve has / has no CVE id in vuln_refs (boolean; use -ref for a specific id)
   -kev/-no-kev on / not on the CISA Known Exploited Vulnerabilities catalog
   -year        disclosure year (metadata.disclosed, else the CVE-id year)
   -since       disclosed on or after this ISO date (YYYY-MM-DD)
@@ -90,6 +94,7 @@ shown as "?" and -kev/-no-kev cannot be used.`,
 			fs.StringVar(&category, "product", "", "alias for -category")
 			fs.BoolVar(&cve, "cve", false, "only templates with a CVE id in vuln_refs")
 			fs.BoolVar(&noCVE, "no-cve", false, "only templates without a CVE id")
+			fs.Var(&ref, "ref", "only templates whose vuln_refs contains this id (repeatable; match any; case-insensitive): CVE-, GHSA-, GO-, VS-...")
 			fs.BoolVar(&onlyKEV, "kev", false, "only templates on the CISA KEV catalog")
 			fs.BoolVar(&noKEV, "no-kev", false, "only templates not on the CISA KEV catalog")
 			fs.StringVar(&year, "year", "", "only templates disclosed in this year (YYYY)")
@@ -148,6 +153,9 @@ shown as "?" and -kev/-no-kev cannot be used.`,
 					continue
 				}
 				if len(class) > 0 && !anyClass(c, class) {
+					continue
+				}
+				if len(ref) > 0 && !anyRef(c, ref) {
 					continue
 				}
 				if cve && !c.IsCVETracked() {
@@ -242,6 +250,16 @@ shown as "?" and -kev/-no-kev cannot be used.`,
 func anyClass(c *contract.Contract, want []string) bool {
 	for _, cl := range want {
 		if c.HasClass(cl) {
+			return true
+		}
+	}
+	return false
+}
+
+// anyRef reports whether c's vuln_refs contains any of the requested ids.
+func anyRef(c *contract.Contract, want []string) bool {
+	for _, r := range want {
+		if c.HasRef(r) {
 			return true
 		}
 	}

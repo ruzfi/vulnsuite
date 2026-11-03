@@ -76,22 +76,38 @@ func (s *Store) Find(selector string) ([]string, error) {
 			return found, nil
 		}
 	}
-	// Treat it as an id (exact), then as an id prefix/substring if unique.
+	// Treat it as an id (exact), then as a reference in vuln_refs if the
+	// selector is ref-shaped, then as an id prefix/substring if unique.
 	all, err := s.All()
 	if err != nil {
 		return nil, err
 	}
-	var exact, fuzzy []string
+	refShaped := contract.IsVulnRef(selector)
+	var exact, fuzzy, refMatch []string
 	for _, f := range all {
-		id := peekID(f)
-		if id == selector {
+		id, refs := peekMeta(f)
+		switch {
+		case id == selector:
 			exact = append(exact, f)
-		} else if strings.Contains(id, selector) {
+		case strings.Contains(id, selector):
 			fuzzy = append(fuzzy, f)
+		}
+		if refShaped {
+			for _, r := range refs {
+				if strings.EqualFold(r, selector) {
+					refMatch = append(refMatch, f)
+					break
+				}
+			}
 		}
 	}
 	if len(exact) > 0 {
 		return exact, nil
+	}
+	// A ref-shaped selector that matches vuln_refs resolves to those templates,
+	// even when several match (a clean multi-row list, not an ambiguity error).
+	if len(refMatch) > 0 {
+		return refMatch, nil
 	}
 	if len(fuzzy) == 1 {
 		return fuzzy, nil
@@ -103,7 +119,7 @@ func (s *Store) Find(selector string) ([]string, error) {
 		}
 		return nil, &Error{Path: selector, Message: "ambiguous selector; matches " + strings.Join(ids, ", ")}
 	}
-	return nil, &Error{Path: selector, Message: "no template found (folder, file or id)"}
+	return nil, &Error{Path: selector, Message: "no template found (folder, file, id or vuln_ref)"}
 }
 
 // FindMany resolves several selectors, de-duplicated, preserving order. With
@@ -251,19 +267,27 @@ func contractsIn(folder string) ([]string, error) {
 
 // peekID reads just metadata.id without full validation.
 func peekID(path string) string {
+	id, _ := peekMeta(path)
+	return id
+}
+
+// peekMeta reads metadata.id and metadata.vuln_refs without full validation,
+// for cheap id/reference resolution over a whole tree.
+func peekMeta(path string) (id string, refs []string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return ""
+		return "", nil
 	}
 	var doc struct {
 		Metadata struct {
-			ID string `yaml:"id"`
+			ID       string   `yaml:"id"`
+			VulnRefs []string `yaml:"vuln_refs"`
 		} `yaml:"metadata"`
 	}
 	if err := yaml.Unmarshal(data, &doc); err != nil {
-		return ""
+		return "", nil
 	}
-	return doc.Metadata.ID
+	return doc.Metadata.ID, doc.Metadata.VulnRefs
 }
 
 // PeekID exposes peekID for callers that only need ids (e.g. listing).

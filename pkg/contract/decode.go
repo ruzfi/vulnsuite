@@ -74,8 +74,11 @@ type SchemaError struct {
 func (e *SchemaError) Error() string { return fmt.Sprintf("schema: %s: %s", e.Loc, e.Message) }
 
 var (
-	idRe        = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{2,79}$`)
-	vulnRefRe   = regexp.MustCompile(`^(CVE-\d{4}-\d{4,7}|GHSA-[a-z0-9-]+|[A-Z]{2,8}-[A-Z0-9-]+)$`)
+	idRe      = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{2,79}$`)
+	vulnRefRe = regexp.MustCompile(`^(CVE-\d{4}-\d{4,7}|GHSA-[a-z0-9-]+|[A-Z]{2,8}-[A-Z0-9-]+)$`)
+	// refShapeRe is vulnRefRe case-insensitively, for recognising a ref-shaped
+	// selector or filter value (CVE-, GHSA-, GO-, VS-... in any case).
+	refShapeRe  = regexp.MustCompile(`(?i)^(CVE-\d{4}-\d{4,7}|GHSA-[a-z0-9-]+|[A-Z]{2,8}-[A-Z0-9-]+)$`)
 	cweRe       = regexp.MustCompile(`^CWE-\d+$`)
 	disclosedRe = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
 	digestRe    = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)

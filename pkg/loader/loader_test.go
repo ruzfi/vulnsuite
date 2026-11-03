@@ -66,6 +66,19 @@ func TestFind(t *testing.T) {
 	if p, err := s.Find("grafana"); err != nil || len(p) != 1 {
 		t.Fatalf("substring: %v %v", err, p)
 	}
+	// a ref-shaped selector resolves against vuln_refs when no id/file/folder
+	// matches: the shared secondary CVE is in grafana and apache, in neither id.
+	if p, err := s.Find("CVE-2026-109619"); err != nil || len(p) != 2 {
+		t.Fatalf("by vuln_ref: %v %v", err, p)
+	}
+	// case-insensitive.
+	if p, err := s.Find("cve-2026-109619"); err != nil || len(p) != 2 {
+		t.Fatalf("by vuln_ref lowercase: %v %v", err, p)
+	}
+	// a ref-shaped selector with no vuln_ref match still errors.
+	if _, err := s.Find("CVE-2000-0000"); err == nil {
+		t.Fatal("expected not-found error for unmatched ref")
+	}
 	// ambiguous substring
 	if _, err := s.Find("e"); err == nil {
 		t.Fatal("expected ambiguity error")

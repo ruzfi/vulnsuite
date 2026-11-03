@@ -197,6 +197,28 @@ func TestClassAndDisclosed(t *testing.T) {
 	if !c.IsCVETracked() || len(c.CVEs()) != 1 || c.CVEs()[0] != "CVE-2021-41773" {
 		t.Fatalf("CVEs = %v", c.CVEs())
 	}
+	// HasRef matches any vuln_refs entry, case-insensitively, across forms.
+	if !c.HasRef("CVE-2021-41773") || !c.HasRef("cve-2021-41773") || !c.HasRef("vs-demo-1") || !c.HasRef("GHSA-abcd-1234") {
+		t.Fatalf("HasRef missed a ref: %v", c.Metadata.VulnRefs)
+	}
+	if c.HasRef("CVE-2000-0000") {
+		t.Fatal("HasRef matched a ref not present")
+	}
+	// IsVulnRef recognises ref-shaped tokens (any case) and rejects others.
+	for _, ok := range []string{"CVE-2021-41773", "cve-2021-41773", "GHSA-abcd-1234", "GO-2024-1234", "VS-REDIS-NOAUTH"} {
+		if !IsVulnRef(ok) {
+			t.Fatalf("IsVulnRef(%q) = false", ok)
+		}
+	}
+	// Non-ref-shaped: no PREFIX-ID form (no dash, single-letter prefix, or a
+	// digit prefix). The PREFIX-ID shape is deliberately loose (it mirrors
+	// vuln_refs), but the selector fallback only reaches it after folder/id
+	// resolution, so a hyphenated id/category is resolved before ref matching.
+	for _, no := range []string{"grafana", "", "nodash", "x-1", "123-456"} {
+		if IsVulnRef(no) {
+			t.Fatalf("IsVulnRef(%q) = true", no)
+		}
+	}
 	if c.Year() != "2021" || c.DisclosedDate() != "2021-10-05" {
 		t.Fatalf("year=%q disclosed=%q", c.Year(), c.DisclosedDate())
 	}
