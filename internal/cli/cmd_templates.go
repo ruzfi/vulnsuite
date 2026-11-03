@@ -8,6 +8,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/ruzfi/vulnsuite/pkg/contract"
+	"github.com/ruzfi/vulnsuite/pkg/kev"
 	"github.com/ruzfi/vulnsuite/pkg/loader"
 	"github.com/ruzfi/vulnsuite/pkg/runner"
 	"github.com/ruzfi/vulnsuite/pkg/scanners"
@@ -32,7 +33,13 @@ func gather(store *loader.Store, selectors []string, all bool) ([]*contract.Cont
 
 type listRow struct {
 	ID         string   `json:"id"`
+	Category   string   `json:"category,omitempty"`
 	Severity   string   `json:"severity"`
+	Class      []string `json:"class,omitempty"`
+	CVE        bool     `json:"cve"`
+	KEV        *bool    `json:"kev,omitempty"`
+	Year       string   `json:"year,omitempty"`
+	Disclosed  string   `json:"disclosed,omitempty"`
 	States     []string `json:"states"`
 	BuildKind  string   `json:"build_kind"`
 	Fidelity   string   `json:"fidelity"`
@@ -47,22 +54,73 @@ type listRow struct {
 }
 
 func cmdList() *Command {
-	var tag, fidelity, arch string
+	var tag, fidelity, arch, category, year, since string
+	var class multiFlag
+	var onlyKEV, noKEV, cve, noCVE, refreshKEV bool
 	return &Command{
-		Name: "list", Aliases: []string{"ls"},
-		Short: "list templates (with state availability)",
-		Usage: "[selector...] [-tag TAG]",
+		Name: "list", Aliases: []string{"ls", "search"},
+		Short: "list and filter templates by class, KEV, product surface, CVE and year",
+		Usage: "[selector...] [-class C]... [-kev] [-category P] [-cve] [-year YYYY]",
 		Long: `A selector is a folder, a contract file, or a template id (substring match
-when unique). With no selector every template is listed.`,
+when unique). With no selector every template is listed.
+
+Filters compose (all must match). Finding class, CVE and KEV status are derived
+from contract metadata (taxonomy v2) and shown as columns:
+
+  -class       finding class: vuln, misconfig, exposure, default-login,
+               weak-crypto (repeatable; a template matches if it carries any)
+  -category    product surface -- the top directory level (web-apps,
+               web-servers, databases, network-services, iot, misc). Alias -product.
+  -cve/-no-cve has / has no CVE id in vuln_refs
+  -kev/-no-kev on / not on the CISA Known Exploited Vulnerabilities catalog
+  -year        disclosure year (metadata.disclosed, else the CVE-id year)
+  -since       disclosed on or after this ISO date (YYYY-MM-DD)
+
+KEV membership is derived by cross-referencing a target's CVEs against the CISA
+KEV catalog. The catalog is read from the templates checkout's data/cisa-kev.txt
+(kept fresh upstream); -refresh-kev fetches the live CISA feed and caches it at
+` + "`~/.cache/vulnsuite/cisa-kev.json`" + `. Offline with neither present, KEV is
+shown as "?" and -kev/-no-kev cannot be used.`,
 		Flags: func(fs *flag.FlagSet) {
 			fs.StringVar(&tag, "tag", "", "only templates carrying this tag")
 			fs.StringVar(&fidelity, "fidelity", "", "only templates of this fidelity (real or simulated)")
 			fs.StringVar(&arch, "arch", "", "only templates that run on this host arch (e.g. amd64, arm64), honouring requires")
+			fs.Var(&class, "class", "only templates of this finding class (repeatable; match any): vuln, misconfig, exposure, default-login, weak-crypto")
+			fs.StringVar(&category, "category", "", "only templates in this product surface (top directory level), e.g. web-apps")
+			fs.StringVar(&category, "product", "", "alias for -category")
+			fs.BoolVar(&cve, "cve", false, "only templates with a CVE id in vuln_refs")
+			fs.BoolVar(&noCVE, "no-cve", false, "only templates without a CVE id")
+			fs.BoolVar(&onlyKEV, "kev", false, "only templates on the CISA KEV catalog")
+			fs.BoolVar(&noKEV, "no-kev", false, "only templates not on the CISA KEV catalog")
+			fs.StringVar(&year, "year", "", "only templates disclosed in this year (YYYY)")
+			fs.StringVar(&since, "since", "", "only templates disclosed on or after this ISO date (YYYY-MM-DD)")
+			fs.BoolVar(&refreshKEV, "refresh-kev", false, "fetch the live CISA KEV feed and refresh the local cache before filtering")
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
+			if cve && noCVE {
+				return usageError{"-cve and -no-cve are mutually exclusive"}
+			}
+			if onlyKEV && noKEV {
+				return usageError{"-kev and -no-kev are mutually exclusive"}
+			}
+			for _, cl := range class {
+				if !has(contract.Classes, cl) {
+					return usageError{fmt.Sprintf("unknown -class %q; want one of %s", cl, strings.Join(contract.Classes, ", "))}
+				}
+			}
 			store, err := g.Store()
 			if err != nil {
 				return err
+			}
+			// Resolve the KEV set when it is needed: always, to populate the
+			// column, and definitively when -kev/-no-kev filters on it.
+			kevSet, kevSrc, err := kev.Resolve(ctx, kev.Options{TemplatesDir: store.Root, Refresh: refreshKEV})
+			if err != nil {
+				return err
+			}
+			kevKnown := kevSrc.Origin != kev.OriginNone
+			if (onlyKEV || noKEV) && !kevKnown {
+				return fmt.Errorf("cannot filter by KEV: catalog unavailable (offline and no cache). Run with -refresh-kev, or point -templates at a checkout with data/cisa-kev.txt")
 			}
 			var paths []string
 			if len(args) == 0 {
@@ -86,6 +144,34 @@ when unique). With no selector every template is listed.`,
 				if fidelity != "" && c.Fidelity() != fidelity {
 					continue
 				}
+				if category != "" && store.Category(p) != category {
+					continue
+				}
+				if len(class) > 0 && !anyClass(c, class) {
+					continue
+				}
+				if cve && !c.IsCVETracked() {
+					continue
+				}
+				if noCVE && c.IsCVETracked() {
+					continue
+				}
+				onKEV := kevSet.Any(c.CVEs())
+				if onlyKEV && !onKEV {
+					continue
+				}
+				if noKEV && onKEV {
+					continue
+				}
+				if year != "" && c.Year() != year {
+					continue
+				}
+				if since != "" {
+					d := c.DisclosedDate()
+					if d == "" || d < since {
+						continue
+					}
+				}
 				if arch != "" {
 					// a target runs on <arch> if it has no arch requirement, lists
 					// it, or can emulate it on linux
@@ -95,13 +181,20 @@ when unique). With no selector every template is listed.`,
 						continue
 					}
 				}
-				rows = append(rows, listRow{
-					ID: c.ID(), Severity: c.Metadata.Severity, States: c.DeclaredStates(),
-					BuildKind: c.BuildKind(contract.StateVulnerable), Fidelity: c.Fidelity(), VulnRefs: c.Metadata.VulnRefs,
+				row := listRow{
+					ID: c.ID(), Category: store.Category(p), Severity: c.Metadata.Severity,
+					Class: c.Classes(), CVE: c.IsCVETracked(), Year: c.Year(), Disclosed: c.Metadata.Disclosed,
+					States: c.DeclaredStates(), BuildKind: c.BuildKind(contract.StateVulnerable),
+					Fidelity: c.Fidelity(), VulnRefs: c.Metadata.VulnRefs,
 					Detection: c.Metadata.Detection, DetectedBy: c.Metadata.DetectedBy, Tags: c.Metadata.Tags,
 					HostAccess: runner.HostAccessReason(c) != "",
 					Summary:    c.Metadata.Summary, Path: p,
-				})
+				}
+				if kevKnown {
+					v := onKEV
+					row.KEV = &v
+				}
+				rows = append(rows, row)
 			}
 			if g.JSON {
 				return g.emitJSON(rows)
@@ -111,10 +204,10 @@ when unique). With no selector every template is listed.`,
 				return nil
 			}
 			tw := tabwriter.NewWriter(g.Stdout, 2, 4, 2, ' ', 0)
-			fmt.Fprintln(tw, "ID\tSEV\tFIDELITY\tKIND\tREFS\tDETECTED BY")
+			fmt.Fprintln(tw, "ID\tCATEGORY\tSEV\tCLASS\tCVE\tKEV\tFIDELITY\tKIND\tREFS\tDETECTED BY")
 			for _, r := range rows {
 				if r.Error != "" {
-					fmt.Fprintf(tw, "%s\t-\t-\t-\t-\t(unloadable: %s)\n", r.ID, r.Error)
+					fmt.Fprintf(tw, "%s\t-\t-\t-\t-\t-\t-\t-\t-\t(unloadable: %s)\n", r.ID, r.Error)
 					continue
 				}
 				det := strings.Join(r.DetectedBy, ",")
@@ -130,16 +223,51 @@ when unique). With no selector every template is listed.`,
 				if r.HostAccess {
 					kind += "*"
 				}
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", r.ID, r.Severity, r.Fidelity, kind, strings.Join(r.VulnRefs, ","), det)
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+					r.ID, dash(r.Category), r.Severity, dash(strings.Join(r.Class, ",")),
+					yesNo(r.CVE), kevCell(r.KEV), r.Fidelity, kind, strings.Join(r.VulnRefs, ","), det)
 			}
 			tw.Flush()
 			g.printf("\n%d templates in %s\n", len(rows), store.Root)
+			g.printf("KEV source: %s\n", kevSrc)
 			if anyHostAccess(rows) {
 				g.printf("* needs host access (device/elevated capability); run with -allow-host-access, and only for templates you trust.\n")
 			}
 			return nil
 		},
 	}
+}
+
+// anyClass reports whether c carries any of the requested finding classes.
+func anyClass(c *contract.Contract, want []string) bool {
+	for _, cl := range want {
+		if c.HasClass(cl) {
+			return true
+		}
+	}
+	return false
+}
+
+func dash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+func yesNo(b bool) string {
+	if b {
+		return "yes"
+	}
+	return "-"
+}
+
+// kevCell renders the KEV column: yes/-, or "?" when the catalog is unavailable.
+func kevCell(b *bool) string {
+	if b == nil {
+		return "?"
+	}
+	return yesNo(*b)
 }
 
 func has(list []string, v string) bool {

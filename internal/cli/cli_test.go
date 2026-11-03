@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -97,6 +99,113 @@ func TestListAndValidate(t *testing.T) {
 	code, out, _ = run(t, nil, "help", "build")
 	if code != ExitOK || !strings.Contains(out, "-registry") {
 		t.Fatalf("help: %d %s", code, out)
+	}
+}
+
+func TestListFilters(t *testing.T) {
+	root := fixtures(t)
+
+	// ids returns the matching template ids for a `-json list ...` invocation.
+	ids := func(args ...string) []string {
+		t.Helper()
+		full := append([]string{"-json", "-T", root, "list"}, args...)
+		code, out, errOut := run(t, nil, full...)
+		if code != ExitOK {
+			t.Fatalf("list %v: code %d\n%s\n%s", args, code, out, errOut)
+		}
+		var rows []listRow
+		if err := json.Unmarshal([]byte(out), &rows); err != nil {
+			t.Fatalf("list %v: bad json: %v\n%s", args, err, out)
+		}
+		var got []string
+		for _, r := range rows {
+			got = append(got, r.ID)
+		}
+		return got
+	}
+	has := func(list []string, v string) bool {
+		for _, x := range list {
+			if x == v {
+				return true
+			}
+		}
+		return false
+	}
+	sameSet := func(got, want []string) bool {
+		if len(got) != len(want) {
+			return false
+		}
+		for _, w := range want {
+			if !has(got, w) {
+				return false
+			}
+		}
+		return true
+	}
+
+	const (
+		grafana = "grafana-8.3.0-cve-2021-43798"
+		apache  = "apache-httpd-2.4.49-cve-2021-41773"
+		redis   = "redis-unauthenticated-access"
+		dotenv  = "exposed-dotenv-file"
+		iot     = "iot-camera-auth-bypass"
+		multi   = "multiport-console-demo"
+	)
+
+	// --class (match any)
+	if got := ids("--class", "exposure"); !sameSet(got, []string{redis, dotenv, iot, multi}) {
+		t.Fatalf("--class exposure: %v", got)
+	}
+	if got := ids("--class", "vuln", "--class", "misconfig"); !sameSet(got, []string{grafana, apache, redis, iot}) {
+		t.Fatalf("--class vuln|misconfig: %v", got)
+	}
+
+	// --category / --product
+	if got := ids("--category", "databases"); !sameSet(got, []string{redis}) {
+		t.Fatalf("--category databases: %v", got)
+	}
+	if got := ids("--product", "web-apps"); !sameSet(got, []string{grafana, multi}) {
+		t.Fatalf("--product web-apps: %v", got)
+	}
+
+	// --cve / --no-cve
+	if got := ids("--cve"); !sameSet(got, []string{grafana, apache}) {
+		t.Fatalf("--cve: %v", got)
+	}
+	if got := ids("--no-cve"); !sameSet(got, []string{redis, dotenv, iot, multi}) {
+		t.Fatalf("--no-cve: %v", got)
+	}
+
+	// --kev / --no-kev (fixture KEV set lists CVE-2021-41773 only)
+	if got := ids("--kev"); !sameSet(got, []string{apache}) {
+		t.Fatalf("--kev: %v", got)
+	}
+	if got := ids("--no-kev"); !sameSet(got, []string{grafana, redis, dotenv, iot, multi}) {
+		t.Fatalf("--no-kev: %v", got)
+	}
+
+	// --year (disclosed, else CVE-id year)
+	if got := ids("--year", "2021"); !sameSet(got, []string{grafana, apache}) {
+		t.Fatalf("--year 2021: %v", got)
+	}
+
+	// --since compares the effective disclosure date; apache (2021-10-05) is
+	// before the cutoff, grafana (2021-12-07) is not.
+	if got := ids("--since", "2021-11-01"); !sameSet(got, []string{grafana}) {
+		t.Fatalf("--since: %v", got)
+	}
+
+	// Filters compose.
+	if got := ids("--category", "web-apps", "--class", "vuln", "--no-kev"); !sameSet(got, []string{grafana}) {
+		t.Fatalf("composed: %v", got)
+	}
+
+	// mutually exclusive flags and an unknown class are usage errors.
+	if code, _, _ := run(t, nil, "-T", root, "list", "--kev", "--no-kev"); code != ExitUsage {
+		t.Fatalf("kev+no-kev should be usage error, got %d", code)
+	}
+	if code, _, errOut := run(t, nil, "-T", root, "list", "--class", "nope"); code != ExitUsage || !strings.Contains(errOut, "unknown -class") {
+		t.Fatalf("bad class: %d %s", code, errOut)
 	}
 }
 
@@ -217,5 +326,38 @@ func TestMultiPortReporting(t *testing.T) {
 	code, out, _ = run(t, fe, "-T", root, "targets", "-by", "alias")
 	if code != ExitOK || !strings.Contains(out, "http://multiport-console-demo:9999") || !strings.Contains(out, "http://multiport-console-demo:8091") {
 		t.Fatalf("targets -by alias: %d\n%s", code, out)
+	}
+}
+
+// Regression for #25: `run -targets-file` must emit bare URLs that `nuclei -l`
+// can consume. A target with two published ports writes two lines, each a clean
+// URL with no inline metadata (the old writer appended "  # id state container=N",
+// which nuclei treats as part of the target and silently fails to match).
+func TestRunTargetsFileEmitsCleanURLs(t *testing.T) {
+	root := fixtures(t)
+	fe := enginetest.New()
+	targetsFile := filepath.Join(t.TempDir(), "targets.txt")
+	code, out, errOut := run(t, fe, "-T", root, "run", "vulnerable",
+		"-t", "multiport-console-demo", "-expose", "host", "-bind", "127.0.0.1",
+		"-detach", "-no-verify", "-ready-timeout", "1s", "-targets-file", targetsFile)
+	if code != ExitOK {
+		t.Fatalf("run: %d\n%s\n%s", code, out, errOut)
+	}
+	data, err := os.ReadFile(targetsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("want two target lines for two published ports, got %d:\n%s", len(lines), data)
+	}
+	for _, line := range lines {
+		if strings.ContainsAny(line, "# \t") {
+			t.Fatalf("line carries inline metadata, nuclei -l cannot parse it: %q", line)
+		}
+		u, err := url.Parse(line)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			t.Fatalf("line is not a bare URL: %q (%v)", line, err)
+		}
 	}
 }

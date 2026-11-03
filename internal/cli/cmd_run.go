@@ -302,11 +302,11 @@ Exposure modes:
 				for _, h := range handles {
 					pts := h.PortTargets()
 					if len(pts) <= 1 {
-						lines = append(lines, fmt.Sprintf("%s  # %s %s", scanURL(h), h.ID, h.State))
+						lines = append(lines, scanURL(h))
 						continue
 					}
 					for _, pt := range pts {
-						lines = append(lines, fmt.Sprintf("%s  # %s %s container=%d", pt.URL, h.ID, h.State, pt.ContainerPort))
+						lines = append(lines, pt.URL)
 					}
 				}
 				if err := os.WriteFile(targetsFile, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {

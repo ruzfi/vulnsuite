@@ -54,6 +54,24 @@ const (
 // Fidelities lists the allowed fidelity values.
 var Fidelities = []string{FidelityReal, FidelitySimulated}
 
+// Finding-class values. A target may carry one or more (taxonomy v2): the class
+// is the *kind* of finding, orthogonal to the product surface it lives on (the
+// top directory level).
+const (
+	ClassVuln         = "vuln"          // a tracked software vulnerability (usually a CVE)
+	ClassMisconfig    = "misconfig"     // an insecure configuration of otherwise-sound software
+	ClassExposure     = "exposure"      // sensitive data or an interface reachable that should not be
+	ClassDefaultLogin = "default-login" // ships with, or accepts, default/weak credentials
+	ClassWeakCrypto   = "weak-crypto"   // weak or broken cryptography
+)
+
+// Classes lists the allowed finding-class values, in canonical order.
+var Classes = []string{ClassVuln, ClassMisconfig, ClassExposure, ClassDefaultLogin, ClassWeakCrypto}
+
+// cveIDRe matches a bare CVE id (and captures its year), for CVE/KEV/year
+// derivation from vuln_refs.
+var cveIDRe = regexp.MustCompile(`^CVE-(\d{4})-\d{4,7}$`)
+
 // ImageRepoPrefix is the local repository prefix for images vulnsuite builds.
 const ImageRepoPrefix = "vulnsuite"
 
@@ -393,11 +411,19 @@ func (s Service) HostPublishPorts() []Port {
 
 // Metadata identifies and documents the target.
 type Metadata struct {
-	ID         string   `yaml:"id" json:"id"`
-	Summary    string   `yaml:"summary" json:"summary"`
-	VulnRefs   []string `yaml:"vuln_refs,omitempty" json:"vuln_refs,omitempty"`
-	CWE        []string `yaml:"cwe,omitempty" json:"cwe,omitempty"`
-	Severity   string   `yaml:"severity,omitempty" json:"severity,omitempty"`
+	ID       string   `yaml:"id" json:"id"`
+	Summary  string   `yaml:"summary" json:"summary"`
+	VulnRefs []string `yaml:"vuln_refs,omitempty" json:"vuln_refs,omitempty"`
+	CWE      []string `yaml:"cwe,omitempty" json:"cwe,omitempty"`
+	Severity string   `yaml:"severity,omitempty" json:"severity,omitempty"`
+	// Class is the finding class(es) this target carries (taxonomy v2):
+	// vuln, misconfig, exposure, default-login, weak-crypto. Orthogonal to the
+	// product surface (the top directory level); `list --class` filters on it.
+	Class []string `yaml:"class,omitempty" json:"class,omitempty"`
+	// Disclosed is the optional public-disclosure date (YYYY-MM-DD); it drives
+	// the year/since filters and a timeline view, falling back to the CVE-id
+	// year when unset.
+	Disclosed  string   `yaml:"disclosed,omitempty" json:"disclosed,omitempty"`
 	Tags       []string `yaml:"tags,omitempty" json:"tags,omitempty"`
 	References []string `yaml:"references,omitempty" json:"references,omitempty"`
 	Maintainer string   `yaml:"maintainer,omitempty" json:"maintainer,omitempty"`
@@ -477,6 +503,66 @@ func (c *Contract) Fidelity() string {
 
 // IsSimulated reports whether the target is a stand-in rather than the real software.
 func (c *Contract) IsSimulated() bool { return c.Fidelity() == FidelitySimulated }
+
+// Classes returns the declared finding classes (taxonomy v2).
+func (c *Contract) Classes() []string { return c.Metadata.Class }
+
+// HasClass reports whether the target carries the given finding class.
+func (c *Contract) HasClass(class string) bool { return has(c.Metadata.Class, class) }
+
+// CVEs returns the CVE ids among vuln_refs, in declared order.
+func (c *Contract) CVEs() []string {
+	var out []string
+	for _, r := range c.Metadata.VulnRefs {
+		if cveIDRe.MatchString(r) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// IsCVETracked reports whether any vuln_ref is a CVE id.
+func (c *Contract) IsCVETracked() bool { return len(c.CVEs()) > 0 }
+
+// Year returns the four-digit disclosure year: metadata.disclosed's year when
+// set, otherwise the earliest CVE-id year, otherwise "".
+func (c *Contract) Year() string {
+	if len(c.Metadata.Disclosed) >= 4 {
+		return c.Metadata.Disclosed[:4]
+	}
+	earliest := ""
+	for _, r := range c.CVEs() {
+		if m := cveIDRe.FindStringSubmatch(r); m != nil {
+			if earliest == "" || m[1] < earliest {
+				earliest = m[1]
+			}
+		}
+	}
+	return earliest
+}
+
+// DisclosedDate returns the effective ISO date used by the since filter:
+// metadata.disclosed when set, otherwise Jan 1 of the derived CVE-id year,
+// otherwise "". ISO dates sort lexicographically, so callers compare strings.
+func (c *Contract) DisclosedDate() string {
+	if c.Metadata.Disclosed != "" {
+		return c.Metadata.Disclosed
+	}
+	if y := c.Year(); y != "" {
+		return y + "-01-01"
+	}
+	return ""
+}
+
+// has reports membership in a string slice.
+func has(list []string, v string) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
 
 // HasState reports whether the contract declares the named state.
 func (c *Contract) HasState(name string) bool {
