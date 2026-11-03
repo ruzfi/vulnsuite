@@ -182,6 +182,47 @@ func TestRequires(t *testing.T) {
 	}
 }
 
+func TestClassAndDisclosed(t *testing.T) {
+	// valid class + disclosed parse and expose derivation helpers.
+	src := strings.Replace(minimal, "  severity: high\n",
+		"  severity: high\n  class: [vuln, exposure]\n  disclosed: \"2021-10-05\"\n", 1)
+	c, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.HasClass("vuln") || !c.HasClass("exposure") || c.HasClass("misconfig") {
+		t.Fatalf("classes = %v", c.Classes())
+	}
+	// minimal carries CVE-2021-41773 in vuln_refs.
+	if !c.IsCVETracked() || len(c.CVEs()) != 1 || c.CVEs()[0] != "CVE-2021-41773" {
+		t.Fatalf("CVEs = %v", c.CVEs())
+	}
+	if c.Year() != "2021" || c.DisclosedDate() != "2021-10-05" {
+		t.Fatalf("year=%q disclosed=%q", c.Year(), c.DisclosedDate())
+	}
+
+	// With no disclosed date, Year/DisclosedDate fall back to the CVE-id year.
+	noDate := strings.Replace(minimal, "  severity: high\n", "  severity: high\n  class: [vuln]\n", 1)
+	c2, err := Parse([]byte(noDate))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.Year() != "2021" || c2.DisclosedDate() != "2021-01-01" {
+		t.Fatalf("fallback year=%q disclosed=%q", c2.Year(), c2.DisclosedDate())
+	}
+
+	// rejections
+	if _, err := Parse([]byte(strings.Replace(minimal, "  severity: high\n", "  severity: high\n  class: [bogus]\n", 1))); err == nil {
+		t.Fatal("unknown class must reject")
+	}
+	if _, err := Parse([]byte(strings.Replace(minimal, "  severity: high\n", "  severity: high\n  class: [vuln, vuln]\n", 1))); err == nil {
+		t.Fatal("duplicate class must reject")
+	}
+	if _, err := Parse([]byte(strings.Replace(minimal, "  severity: high\n", "  severity: high\n  disclosed: \"10-05-2021\"\n", 1))); err == nil {
+		t.Fatal("bad disclosed date must reject")
+	}
+}
+
 func TestDurations(t *testing.T) {
 	for in, want := range map[string]string{"60s": "1m0s", "5m": "5m0s", "1h": "1h0m0s", "": "1m0s"} {
 		d, err := ParseDuration(in, 60e9)

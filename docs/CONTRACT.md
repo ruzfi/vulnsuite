@@ -35,6 +35,8 @@ Unknown fields are rejected. The machine-readable form of this document is
 | `vuln_refs` | | `CVE-YYYY-NNNN`, `GHSA-...`, or `PREFIX-ID` for flaws without a CVE (community templates use `VS-...`) |
 | `cwe` | | `CWE-NN` |
 | `severity` | | `info`, `low`, `medium`, `high`, `critical` |
+| `class` | | finding class(es) (taxonomy v2), orthogonal to the product surface (the top directory level): `vuln` (a tracked software vulnerability, usually a CVE), `misconfig` (an insecure configuration), `exposure` (data/interface reachable that should not be), `default-login` (default/weak credentials), `weak-crypto`. One or more, unique. `vulnsuite list --class` filters on it. |
+| `disclosed` | | optional public-disclosure date (`YYYY-MM-DD`); drives `list --year`/`--since` and a timeline view, falling back to the CVE-id year when unset. |
 | `tags` | | free-form; `vulnsuite list -tag` filters on them |
 | `references` | | the advisory and the fix |
 | `maintainer` | | who to ask |

@@ -74,20 +74,22 @@ type SchemaError struct {
 func (e *SchemaError) Error() string { return fmt.Sprintf("schema: %s: %s", e.Loc, e.Message) }
 
 var (
-	idRe       = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{2,79}$`)
-	vulnRefRe  = regexp.MustCompile(`^(CVE-\d{4}-\d{4,7}|GHSA-[a-z0-9-]+|[A-Z]{2,8}-[A-Z0-9-]+)$`)
-	cweRe      = regexp.MustCompile(`^CWE-\d+$`)
-	digestRe   = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
-	userRe     = regexp.MustCompile(`^[0-9]+(:[0-9]+)?$`)
-	capRe      = regexp.MustCompile(`^[A-Z_]+$`)
-	deviceRe   = regexp.MustCompile(`^/dev/[a-zA-Z0-9/_-]+$`)
-	modeRe     = regexp.MustCompile(`^0[0-7]{3}$`)
-	timeoutRe  = regexp.MustCompile(`^\d+[smh]$`)
-	severities = map[string]bool{"info": true, "low": true, "medium": true, "high": true, "critical": true}
-	protocols  = map[string]bool{"http": true, "https": true, "tcp": true, "ssh": true, "ftp": true,
+	idRe        = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{2,79}$`)
+	vulnRefRe   = regexp.MustCompile(`^(CVE-\d{4}-\d{4,7}|GHSA-[a-z0-9-]+|[A-Z]{2,8}-[A-Z0-9-]+)$`)
+	cweRe       = regexp.MustCompile(`^CWE-\d+$`)
+	disclosedRe = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
+	digestRe    = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	userRe      = regexp.MustCompile(`^[0-9]+(:[0-9]+)?$`)
+	capRe       = regexp.MustCompile(`^[A-Z_]+$`)
+	deviceRe    = regexp.MustCompile(`^/dev/[a-zA-Z0-9/_-]+$`)
+	modeRe      = regexp.MustCompile(`^0[0-7]{3}$`)
+	timeoutRe   = regexp.MustCompile(`^\d+[smh]$`)
+	severities  = map[string]bool{"info": true, "low": true, "medium": true, "high": true, "critical": true}
+	protocols   = map[string]bool{"http": true, "https": true, "tcp": true, "ssh": true, "ftp": true,
 		"smtp": true, "redis": true, "mysql": true, "postgres": true}
 	detections = map[string]bool{"scanner": true, "custom-only": true}
 	fidelities = map[string]bool{"real": true, "simulated": true}
+	classes    = map[string]bool{"vuln": true, "misconfig": true, "exposure": true, "default-login": true, "weak-crypto": true}
 	hostOSes   = map[string]bool{"linux": true, "windows": true}
 	arches     = map[string]bool{"amd64": true, "arm64": true, "386": true, "arm": true, "ppc64le": true, "s390x": true, "riscv64": true}
 )
@@ -179,6 +181,19 @@ func (c *Contract) checkStructure() error {
 	}
 	if m.Fidelity != "" && !fidelities[m.Fidelity] {
 		return se("metadata/fidelity", "%q is not one of real, simulated", m.Fidelity)
+	}
+	seenClass := map[string]bool{}
+	for i, cl := range m.Class {
+		if !classes[cl] {
+			return se(fmt.Sprintf("metadata/class/%d", i), "%q is not one of vuln, misconfig, exposure, default-login, weak-crypto", cl)
+		}
+		if seenClass[cl] {
+			return se(fmt.Sprintf("metadata/class/%d", i), "class %q is listed more than once", cl)
+		}
+		seenClass[cl] = true
+	}
+	if m.Disclosed != "" && !disclosedRe.MatchString(m.Disclosed) {
+		return se("metadata/disclosed", "%q must be an ISO date (YYYY-MM-DD)", m.Disclosed)
 	}
 
 	b := c.Base

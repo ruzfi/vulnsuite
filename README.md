@@ -175,7 +175,8 @@ schema for editors and CI is [schemas/contract.schema.json](schemas/contract.sch
 ## Commands
 
 ```
-vulnsuite list [selector] [-tag TAG]                templates, with state availability
+vulnsuite list [selector] [-class C]... [-category P] [-cve] [-kev] [-year Y]  filter templates
+vulnsuite search ...                                alias for list
 vulnsuite validate [-t SEL]... [-strict]            structure + semantic lint
 vulnsuite build -t SEL... | -all [-j N] [-push -registry REG]
 vulnsuite run [vulnerable|patched] -t SEL... | -all [-expose MODE] [-detach]
@@ -306,6 +307,35 @@ ready-made, verified test bed for writing one. The template catalog therefore
 doubles as a to-do list for the detection ecosystem — `vulnsuite list` shows
 the DETECTED BY column, and `custom-only` marks targets that exist purely to
 test your own detection.
+
+## Finding the right target
+
+Classification is metadata, not folders (taxonomy v2). The top directory level
+is a single axis — the **product surface** you scan (`web-apps`, `web-servers`,
+`databases`, `network-services`, `iot`, `misc`) — and everything else is derived
+from the contract, so `list` / `search` can filter by any of it and compose:
+
+```bash
+vulnsuite list --class misconfig --kev          # misconfigs on the CISA KEV catalog
+vulnsuite list --category web-apps --cve        # CVE-tracked web-app targets
+vulnsuite search --class exposure --no-cve      # exposures without a CVE
+vulnsuite list --year 2021                       # disclosed in 2021 (or CVE-id year)
+vulnsuite list --since 2023-01-01                # disclosed on or after a date
+```
+
+- `--class` (repeatable, match any): `vuln`, `misconfig`, `exposure`,
+  `default-login`, `weak-crypto`.
+- `--category` / `--product`: the product surface (top directory level).
+- `--cve` / `--no-cve`: has (not) a `CVE-…` in `vuln_refs`.
+- `--kev` / `--no-kev`: on (not on) the CISA **Known Exploited Vulnerabilities**
+  catalog — derived by cross-referencing the target's CVEs. The catalog is read
+  from the templates checkout's `data/cisa-kev.txt`; `--refresh-kev` fetches the
+  live CISA feed and caches it at `~/.cache/vulnsuite/cisa-kev.json`. Offline
+  with neither present, KEV shows as `?` and `--kev`/`--no-kev` are unavailable.
+- `--year` / `--since`: from `metadata.disclosed`, falling back to the CVE-id
+  year.
+
+`list` surfaces CATEGORY, CLASS, CVE and KEV as columns.
 
 ## Fidelity and host requirements
 
