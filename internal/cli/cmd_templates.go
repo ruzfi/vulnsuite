@@ -17,11 +17,14 @@ import (
 )
 
 // gather resolves -t selectors / -all into loaded contracts (plus load errors).
-func gather(store *loader.Store, selectors []string, all bool) ([]*contract.Contract, []error, error) {
+// With variants set, a selector that names a group expands to all its members,
+// and -all returns the full matrix; otherwise a group resolves to its primary
+// and -all returns one target per family (primaries) plus all ungrouped targets.
+func gather(store *loader.Store, selectors []string, all, variants bool) ([]*contract.Contract, []error, error) {
 	if !all && len(selectors) == 0 {
 		return nil, nil, usageError{"pass -t <template> (repeatable) or -all"}
 	}
-	paths, err := store.FindMany(selectors, all)
+	paths, err := store.FindMany(selectors, all, variants)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -33,6 +36,10 @@ func gather(store *loader.Store, selectors []string, all bool) ([]*contract.Cont
 
 type listRow struct {
 	ID         string   `json:"id"`
+	Group      string   `json:"group,omitempty"`
+	Variant    string   `json:"variant,omitempty"`
+	Primary    bool     `json:"primary,omitempty"`
+	GroupSize  int      `json:"group_size,omitempty"`
 	Category   string   `json:"category,omitempty"`
 	Severity   string   `json:"severity"`
 	Class      []string `json:"class,omitempty"`
@@ -54,13 +61,13 @@ type listRow struct {
 }
 
 func cmdList() *Command {
-	var tag, fidelity, arch, category, year, since string
+	var tag, fidelity, arch, category, year, since, groupFilter string
 	var class, ref multiFlag
-	var onlyKEV, noKEV, cve, noCVE, refreshKEV bool
+	var onlyKEV, noKEV, cve, noCVE, refreshKEV, variants bool
 	return &Command{
 		Name: "list", Aliases: []string{"ls", "search"},
 		Short: "list and filter templates by class, KEV, product surface, CVE and year",
-		Usage: "[selector...] [-ref ID]... [-class C]... [-kev] [-category P] [-cve] [-year YYYY]",
+		Usage: "[selector...] [-group H] [-variants] [-ref ID]... [-class C]... [-kev] [-category P] [-cve] [-year YYYY]",
 		Long: `A selector is a folder, a contract file, or a template id (substring match
 when unique). A ref-shaped selector (CVE-..., GHSA-..., GO-..., VS-...) that
 matches no id/file/folder resolves against vuln_refs instead, so
@@ -88,6 +95,8 @@ shown as "?" and -kev/-no-kev cannot be used.`,
 		Flags: func(fs *flag.FlagSet) {
 			fs.StringVar(&tag, "tag", "", "only templates carrying this tag")
 			fs.StringVar(&fidelity, "fidelity", "", "only templates of this fidelity (real or simulated)")
+			fs.StringVar(&groupFilter, "group", "", "only members of this variant group (shows the whole family)")
+			fs.BoolVar(&variants, "variants", false, "expand variant groups to all members (default: collapse each group to its primary)")
 			fs.StringVar(&arch, "arch", "", "only templates that run on this host arch (e.g. amd64, arm64), honouring requires")
 			fs.Var(&class, "class", "only templates of this finding class (repeatable; match any): vuln, misconfig, exposure, default-login, weak-crypto")
 			fs.StringVar(&category, "category", "", "only templates in this product surface (top directory level), e.g. web-apps")
@@ -127,11 +136,28 @@ shown as "?" and -kev/-no-kev cannot be used.`,
 			if (onlyKEV || noKEV) && !kevKnown {
 				return fmt.Errorf("cannot filter by KEV: catalog unavailable (offline and no cache). Run with -refresh-kev, or point -templates at a checkout with data/cisa-kev.txt")
 			}
+			groupSizes, err := store.Groups()
+			if err != nil {
+				return err
+			}
+			expanded := variants || groupFilter != ""
 			var paths []string
-			if len(args) == 0 {
-				paths, err = store.All()
-			} else {
-				paths, err = store.FindMany(args, false)
+			switch {
+			case groupFilter != "":
+				members, ok, gerr := store.GroupMembers(groupFilter)
+				if gerr != nil {
+					return gerr
+				}
+				if !ok {
+					return fmt.Errorf("no variant group %q (see the GROUP column in `vulnsuite list`)", groupFilter)
+				}
+				for _, m := range members {
+					paths = append(paths, m.Path)
+				}
+			case len(args) == 0:
+				paths, err = store.FindMany(nil, true, variants)
+			default:
+				paths, err = store.FindMany(args, false, variants)
 			}
 			if err != nil {
 				return err
@@ -190,7 +216,9 @@ shown as "?" and -kev/-no-kev cannot be used.`,
 					}
 				}
 				row := listRow{
-					ID: c.ID(), Category: store.Category(p), Severity: c.Metadata.Severity,
+					ID: c.ID(), Group: c.Group(), Variant: c.Variant(), Primary: c.IsPrimary(),
+					GroupSize: len(groupSizes[c.Group()]),
+					Category:  store.Category(p), Severity: c.Metadata.Severity,
 					Class: c.Classes(), CVE: c.IsCVETracked(), Year: c.Year(), Disclosed: c.Metadata.Disclosed,
 					States: c.DeclaredStates(), BuildKind: c.BuildKind(contract.StateVulnerable),
 					Fidelity: c.Fidelity(), VulnRefs: c.Metadata.VulnRefs,
@@ -212,10 +240,10 @@ shown as "?" and -kev/-no-kev cannot be used.`,
 				return nil
 			}
 			tw := tabwriter.NewWriter(g.Stdout, 2, 4, 2, ' ', 0)
-			fmt.Fprintln(tw, "ID\tCATEGORY\tSEV\tCLASS\tCVE\tKEV\tFIDELITY\tKIND\tREFS\tDETECTED BY")
+			fmt.Fprintln(tw, "ID\tCATEGORY\tGROUP\tSEV\tCLASS\tCVE\tKEV\tFIDELITY\tKIND\tREFS\tDETECTED BY")
 			for _, r := range rows {
 				if r.Error != "" {
-					fmt.Fprintf(tw, "%s\t-\t-\t-\t-\t-\t-\t-\t-\t(unloadable: %s)\n", r.ID, r.Error)
+					fmt.Fprintf(tw, "%s\t-\t-\t-\t-\t-\t-\t-\t-\t-\t(unloadable: %s)\n", r.ID, r.Error)
 					continue
 				}
 				det := strings.Join(r.DetectedBy, ",")
@@ -231,8 +259,8 @@ shown as "?" and -kev/-no-kev cannot be used.`,
 				if r.HostAccess {
 					kind += "*"
 				}
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-					r.ID, dash(r.Category), r.Severity, dash(strings.Join(r.Class, ",")),
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+					r.ID, dash(r.Category), groupCell(r, expanded), r.Severity, dash(strings.Join(r.Class, ",")),
 					yesNo(r.CVE), kevCell(r.KEV), r.Fidelity, kind, strings.Join(r.VulnRefs, ","), det)
 			}
 			tw.Flush()
@@ -271,6 +299,29 @@ func dash(s string) string {
 		return "-"
 	}
 	return s
+}
+
+// groupCell renders the GROUP column. Collapsed, a primary with siblings shows
+// "handle (+N)" so the family's size is visible without expanding; expanded,
+// each member shows its handle annotated with its variant (or "primary").
+func groupCell(r listRow, expanded bool) string {
+	if r.Group == "" {
+		return "-"
+	}
+	if expanded {
+		switch {
+		case r.Primary:
+			return r.Group + " (primary)"
+		case r.Variant != "":
+			return r.Group + " (" + r.Variant + ")"
+		default:
+			return r.Group
+		}
+	}
+	if r.GroupSize > 1 {
+		return fmt.Sprintf("%s (+%d)", r.Group, r.GroupSize-1)
+	}
+	return r.Group
 }
 
 func yesNo(b bool) string {
@@ -325,11 +376,16 @@ func cmdValidate() *Command {
 			if len(sel) == 0 {
 				all = true
 			}
-			cs, loadErrs, err := gather(store, sel, all)
+			// Always expand groups when validating: the per-group rules
+			// (one primary, unique variants) need every member in view.
+			cs, loadErrs, err := gather(store, sel, all, true)
 			if err != nil {
 				return err
 			}
-			v := &validator.Validator{AllowUnpinned: allowUnpinned}
+			v := &validator.Validator{
+				AllowUnpinned: allowUnpinned,
+				CategoryOf:    func(c *contract.Contract) string { return store.Category(c.SourcePath) },
+			}
 			if dir := scanners.ResolveDir(nucleiDir); dir != "" {
 				idx, err := scanners.Load(dir)
 				if err != nil {

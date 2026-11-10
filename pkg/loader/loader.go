@@ -76,24 +76,28 @@ func (s *Store) Find(selector string) ([]string, error) {
 			return found, nil
 		}
 	}
-	// Treat it as an id (exact), then as a reference in vuln_refs if the
-	// selector is ref-shaped, then as an id prefix/substring if unique.
+	// Resolution precedence for a non-path selector: exact id -> exact group
+	// (yields the primary) -> matching vuln_ref -> unique id substring.
 	all, err := s.All()
 	if err != nil {
 		return nil, err
 	}
 	refShaped := contract.IsVulnRef(selector)
 	var exact, fuzzy, refMatch []string
+	var group []GroupMember
 	for _, f := range all {
-		id, refs := peekMeta(f)
+		p := peek(f)
 		switch {
-		case id == selector:
+		case p.ID == selector:
 			exact = append(exact, f)
-		case strings.Contains(id, selector):
+		case strings.Contains(p.ID, selector):
 			fuzzy = append(fuzzy, f)
 		}
+		if p.Group == selector {
+			group = append(group, GroupMember{Path: f, ID: p.ID, Variant: p.Variant, Primary: p.Primary})
+		}
 		if refShaped {
-			for _, r := range refs {
+			for _, r := range p.Refs {
 				if strings.EqualFold(r, selector) {
 					refMatch = append(refMatch, f)
 					break
@@ -103,6 +107,20 @@ func (s *Store) Find(selector string) ([]string, error) {
 	}
 	if len(exact) > 0 {
 		return exact, nil
+	}
+	// An exact group handle resolves to the group's primary (expand with
+	// -variants via FindMany).
+	if len(group) > 0 {
+		primary, ok := primaryOf(group)
+		if !ok {
+			ids := make([]string, 0, len(group))
+			for _, m := range group {
+				ids = append(ids, m.ID)
+			}
+			sort.Strings(ids)
+			return nil, &Error{Path: selector, Message: fmt.Sprintf("group %q has no primary; mark exactly one member primary: true (members: %s)", selector, strings.Join(ids, ", "))}
+		}
+		return []string{primary}, nil
 	}
 	// A ref-shaped selector that matches vuln_refs resolves to those templates,
 	// even when several match (a clean multi-row list, not an ambiguity error).
@@ -119,21 +137,48 @@ func (s *Store) Find(selector string) ([]string, error) {
 		}
 		return nil, &Error{Path: selector, Message: "ambiguous selector; matches " + strings.Join(ids, ", ")}
 	}
-	return nil, &Error{Path: selector, Message: "no template found (folder, file, id or vuln_ref)"}
+	return nil, &Error{Path: selector, Message: "no template found (folder, file, id, group or vuln_ref)"}
 }
 
-// FindMany resolves several selectors, de-duplicated, preserving order. With
-// all set, every template is returned.
-func (s *Store) FindMany(selectors []string, all bool) ([]string, error) {
+// FindMany resolves several selectors, de-duplicated, preserving order.
+//
+// With all set, every template is returned when variants is set; otherwise each
+// group is collapsed to its primary (one target per family) while ungrouped
+// targets are all kept. With explicit selectors, variants expands a selector
+// that names a group to all its members; it is a no-op on any selector that
+// resolves to a single target.
+func (s *Store) FindMany(selectors []string, all, variants bool) ([]string, error) {
 	var paths []string
 	if all {
 		p, err := s.All()
 		if err != nil {
 			return nil, err
 		}
-		paths = p
+		if variants {
+			paths = p
+		} else {
+			if paths, err = s.collapseToPrimaries(p); err != nil {
+				return nil, err
+			}
+		}
 	} else {
+		var grps map[string][]GroupMember
+		if variants {
+			g, err := s.groups()
+			if err != nil {
+				return nil, err
+			}
+			grps = g
+		}
 		for _, sel := range selectors {
+			if variants {
+				if members, ok := grps[strings.TrimSpace(sel)]; ok {
+					for _, m := range members {
+						paths = append(paths, m.Path)
+					}
+					continue
+				}
+			}
 			p, err := s.Find(sel)
 			if err != nil {
 				return nil, err
@@ -146,6 +191,40 @@ func (s *Store) FindMany(selectors []string, all bool) ([]string, error) {
 	for _, p := range paths {
 		if !seen[p] {
 			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	return out, nil
+}
+
+// collapseToPrimaries keeps every ungrouped path and, for grouped paths, only
+// each group's primary; order is preserved. A group with no resolvable primary
+// (invalid; the validator flags it) keeps all its members so nothing silently
+// vanishes.
+func (s *Store) collapseToPrimaries(paths []string) ([]string, error) {
+	grps, err := s.groups()
+	if err != nil {
+		return nil, err
+	}
+	handleOf := map[string]string{} // path -> group handle
+	primary := map[string]string{}  // handle -> primary path
+	for h, members := range grps {
+		if p, ok := primaryOf(members); ok {
+			primary[h] = p
+		}
+		for _, m := range members {
+			handleOf[m.Path] = h
+		}
+	}
+	var out []string
+	for _, p := range paths {
+		h, grouped := handleOf[p]
+		if !grouped {
+			out = append(out, p)
+			continue
+		}
+		pp, ok := primary[h]
+		if !ok || p == pp {
 			out = append(out, p)
 		}
 	}
@@ -265,30 +344,106 @@ func contractsIn(folder string) ([]string, error) {
 	return out, nil
 }
 
-// peekID reads just metadata.id without full validation.
-func peekID(path string) string {
-	id, _ := peekMeta(path)
-	return id
+// peeked is the subset of metadata read for cheap resolution over a whole tree,
+// without a full parse or validation.
+type peeked struct {
+	ID      string
+	Refs    []string
+	Group   string
+	Variant string
+	Primary bool
 }
 
-// peekMeta reads metadata.id and metadata.vuln_refs without full validation,
-// for cheap id/reference resolution over a whole tree.
-func peekMeta(path string) (id string, refs []string) {
+// peekID reads just metadata.id without full validation.
+func peekID(path string) string { return peek(path).ID }
+
+// peek reads the resolution-relevant metadata (id, vuln_refs, group, variant,
+// primary) without full validation, for cheap id/reference/group resolution
+// over a whole tree.
+func peek(path string) peeked {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", nil
+		return peeked{}
 	}
 	var doc struct {
 		Metadata struct {
 			ID       string   `yaml:"id"`
 			VulnRefs []string `yaml:"vuln_refs"`
+			Group    string   `yaml:"group"`
+			Variant  string   `yaml:"variant"`
+			Primary  bool     `yaml:"primary"`
 		} `yaml:"metadata"`
 	}
 	if err := yaml.Unmarshal(data, &doc); err != nil {
-		return "", nil
+		return peeked{}
 	}
-	return doc.Metadata.ID, doc.Metadata.VulnRefs
+	m := doc.Metadata
+	return peeked{ID: m.ID, Refs: m.VulnRefs, Group: m.Group, Variant: m.Variant, Primary: m.Primary}
 }
 
 // PeekID exposes peekID for callers that only need ids (e.g. listing).
 func PeekID(path string) string { return peekID(path) }
+
+// GroupMember is one target within a variant group.
+type GroupMember struct {
+	Path    string
+	ID      string
+	Variant string
+	Primary bool
+}
+
+// groups indexes every grouped contract under the root by its group handle.
+// Members within a handle are sorted by path (the order All returns).
+func (s *Store) groups() (map[string][]GroupMember, error) {
+	all, err := s.All()
+	if err != nil {
+		return nil, err
+	}
+	out := map[string][]GroupMember{}
+	for _, f := range all {
+		p := peek(f)
+		if p.Group == "" {
+			continue
+		}
+		out[p.Group] = append(out[p.Group], GroupMember{Path: f, ID: p.ID, Variant: p.Variant, Primary: p.Primary})
+	}
+	return out, nil
+}
+
+// Groups returns every variant group under the root, indexed by handle.
+func (s *Store) Groups() (map[string][]GroupMember, error) { return s.groups() }
+
+// GroupMembers returns the members of a group handle and whether the handle
+// names a known group. Members are ordered by path, primary first.
+func (s *Store) GroupMembers(handle string) ([]GroupMember, bool, error) {
+	grps, err := s.groups()
+	if err != nil {
+		return nil, false, err
+	}
+	members, ok := grps[strings.TrimSpace(handle)]
+	if !ok {
+		return nil, false, nil
+	}
+	sort.SliceStable(members, func(i, j int) bool {
+		if members[i].Primary != members[j].Primary {
+			return members[i].Primary
+		}
+		return members[i].Path < members[j].Path
+	})
+	return members, true, nil
+}
+
+// primaryOf returns the primary member's path: the one marked primary, or the
+// lone member of a single-member group (a nickname). ok is false when a
+// multi-member group marks no primary.
+func primaryOf(members []GroupMember) (path string, ok bool) {
+	if len(members) == 1 {
+		return members[0].Path, true
+	}
+	for _, m := range members {
+		if m.Primary {
+			return m.Path, true
+		}
+	}
+	return "", false
+}
