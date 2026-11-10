@@ -121,6 +121,20 @@
           },
           "description": "finding class(es) (taxonomy v2), orthogonal to the product surface (the top directory level): vuln = a tracked software vulnerability (usually a CVE); misconfig = an insecure configuration; exposure = data/interface reachable that should not be; default-login = default/weak credentials; weak-crypto = weak or broken cryptography. `vulnsuite list --class` filters on it."
         },
+        "group": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+          "description": "Variant-family handle. Targets sharing a group are variants of one vulnerability; a selector naming the group resolves to its primary, and -variants expands to all members. A lone target with a group is a nickname for its id."
+        },
+        "primary": {
+          "type": "boolean",
+          "description": "Marks the canonical member of a group. Exactly one member of a multi-member group must set it; a single-member group needs none."
+        },
+        "variant": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+          "description": "Discriminates this member within its group (e.g. waf-evasion); unique within the group."
+        },
         "disclosed": {
           "type": "string",
           "pattern": "^\\d{4}-\\d{2}-\\d{2}$",

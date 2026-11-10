@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/ruzfi/vulnsuite/pkg/contract"
@@ -50,6 +51,10 @@ type Validator struct {
 	// Nmap, when set, cross-checks nmap: detected_by refs against a directory
 	// of nmap NSE scripts.
 	Nmap *scanners.Index
+	// CategoryOf, when set, returns a contract's product-surface category (the
+	// top directory level). It lets the group check flag a family that spans
+	// more than one surface; when nil, that check is skipped.
+	CategoryOf func(*contract.Contract) string
 }
 
 // Check lints one contract.
@@ -80,7 +85,8 @@ func (v *Validator) requires(c *contract.Contract) []Finding {
 	return out
 }
 
-// CheckAll lints a set of contracts, also catching duplicate ids.
+// CheckAll lints a set of contracts, also catching duplicate ids and the
+// cross-contract variant-group rules.
 func (v *Validator) CheckAll(contracts []*contract.Contract) []Finding {
 	var out []Finding
 	seen := map[string]string{}
@@ -91,7 +97,110 @@ func (v *Validator) CheckAll(contracts []*contract.Contract) []Finding {
 		seen[c.ID()] = c.SourcePath
 		out = append(out, v.Check(c)...)
 	}
+	out = append(out, v.groupChecks(contracts)...)
 	return out
+}
+
+// groupChecks enforces the variant-group rules over a set of contracts: one
+// primary per group, unique variants, no group/id collision, a single product
+// surface per group, and consistent vuln_refs. It operates on whatever set it
+// is given; `validate` expands groups so a family is seen whole.
+func (v *Validator) groupChecks(contracts []*contract.Contract) []Finding {
+	var out []Finding
+	ids := map[string]bool{}
+	groups := map[string][]*contract.Contract{}
+	var order []string
+	for _, c := range contracts {
+		ids[c.ID()] = true
+		h := c.Metadata.Group
+		if h == "" {
+			continue
+		}
+		if _, seen := groups[h]; !seen {
+			order = append(order, h)
+		}
+		groups[h] = append(groups[h], c)
+	}
+	for _, h := range order {
+		members := groups[h]
+		if ids[h] {
+			out = append(out, Finding{Error, h, "group-id-collision",
+				fmt.Sprintf("group handle %q is also a template id; a group handle must not equal any id", h)})
+		}
+		// Unique variants (every non-primary member of a multi-member group
+		// needs one); a single-member group is a nickname and needs none.
+		if len(members) > 1 {
+			var primaries []string
+			for _, m := range members {
+				if m.Metadata.Primary {
+					primaries = append(primaries, m.ID())
+				}
+			}
+			switch {
+			case len(primaries) == 0:
+				out = append(out, Finding{Error, h, "group-no-primary",
+					fmt.Sprintf("group %q has %d members but none is primary; mark exactly one primary: true", h, len(members))})
+			case len(primaries) > 1:
+				out = append(out, Finding{Error, h, "group-multiple-primaries",
+					fmt.Sprintf("group %q has %d primaries (%s); exactly one member may be primary", h, len(primaries), strings.Join(primaries, ", "))})
+			}
+			seenVar := map[string]string{}
+			for _, m := range members {
+				vr := m.Metadata.Variant
+				if vr == "" {
+					if !m.Metadata.Primary {
+						out = append(out, Finding{Error, m.ID(), "group-variant-missing",
+							fmt.Sprintf("member of group %q sets no variant; every non-primary member needs a unique variant", h)})
+					}
+					continue
+				}
+				if prev, dup := seenVar[vr]; dup {
+					out = append(out, Finding{Error, m.ID(), "group-duplicate-variant",
+						fmt.Sprintf("variant %q in group %q is also used by %s", vr, h, prev)})
+				}
+				seenVar[vr] = m.ID()
+			}
+		}
+		// Single product surface per group (warn; -strict escalates it).
+		if v.CategoryOf != nil && len(members) > 1 {
+			cats := map[string]bool{}
+			for _, m := range members {
+				cats[v.CategoryOf(m)] = true
+			}
+			if len(cats) > 1 {
+				var names []string
+				for cat := range cats {
+					if cat == "" {
+						cat = "(root)"
+					}
+					names = append(names, cat)
+				}
+				sort.Strings(names)
+				out = append(out, Finding{Warning, h, "group-multi-category",
+					fmt.Sprintf("group %q spans more than one product surface (%s); a variant family should share one", h, strings.Join(names, ", "))})
+			}
+		}
+		// Divergent vuln_refs across a group (soft warn).
+		if len(members) > 1 {
+			base := refKey(members[0])
+			for _, m := range members[1:] {
+				if refKey(m) != base {
+					out = append(out, Finding{Warning, h, "group-divergent-refs",
+						fmt.Sprintf("members of group %q have differing vuln_refs; variants of one vulnerability usually share them", h)})
+					break
+				}
+			}
+		}
+	}
+	return out
+}
+
+// refKey is an order-independent key for a contract's vuln_refs, for comparing
+// whether group members cite the same references.
+func refKey(c *contract.Contract) string {
+	refs := append([]string{}, c.Metadata.VulnRefs...)
+	sort.Strings(refs)
+	return strings.Join(refs, "\x00")
 }
 
 func (v *Validator) pinning(c *contract.Contract) []Finding {

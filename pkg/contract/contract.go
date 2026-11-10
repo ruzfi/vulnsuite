@@ -420,6 +420,19 @@ type Metadata struct {
 	// vuln, misconfig, exposure, default-login, weak-crypto. Orthogonal to the
 	// product surface (the top directory level); `list --class` filters on it.
 	Class []string `yaml:"class,omitempty" json:"class,omitempty"`
+	// Group is the variant-family handle this target belongs to. Targets that
+	// share a group are variants of one vulnerability: `-t <group>` resolves to
+	// the group's primary, and `-variants` expands to every member. A lone
+	// target that sets a group is simply a nickname for its id. Pattern:
+	// ^[a-z0-9]+(-[a-z0-9]+)*$.
+	Group string `yaml:"group,omitempty" json:"group,omitempty"`
+	// Primary marks the canonical member of a group. Exactly one member of a
+	// multi-member group must set it; in a single-member group the lone member
+	// is the primary implicitly.
+	Primary bool `yaml:"primary,omitempty" json:"primary,omitempty"`
+	// Variant discriminates this member within its group (e.g. waf-evasion),
+	// and must be unique within the group. Pattern: ^[a-z0-9]+(-[a-z0-9]+)*$.
+	Variant string `yaml:"variant,omitempty" json:"variant,omitempty"`
 	// Disclosed is the optional public-disclosure date (YYYY-MM-DD); it drives
 	// the year/since filters and a timeline view, falling back to the CVE-id
 	// year when unset.
@@ -509,6 +522,18 @@ func (c *Contract) Classes() []string { return c.Metadata.Class }
 
 // HasClass reports whether the target carries the given finding class.
 func (c *Contract) HasClass(class string) bool { return has(c.Metadata.Class, class) }
+
+// Group returns the variant-family handle this target belongs to ("" when the
+// target is not part of a group).
+func (c *Contract) Group() string { return c.Metadata.Group }
+
+// Variant returns the target's discriminator within its group ("" when unset).
+func (c *Contract) Variant() string { return c.Metadata.Variant }
+
+// IsPrimary reports whether the target is explicitly marked the canonical
+// member of its group. A single-member group's lone member is primary
+// implicitly, which this does not report; resolution handles that case.
+func (c *Contract) IsPrimary() bool { return c.Metadata.Primary }
 
 // IsVulnRef reports whether s is shaped like a vuln_refs id (CVE-, GHSA-, GO-,
 // or a PREFIX-ID such as VS-...), case-insensitively. Callers use it to treat a

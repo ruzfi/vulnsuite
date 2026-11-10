@@ -81,14 +81,17 @@ var (
 	refShapeRe  = regexp.MustCompile(`(?i)^(CVE-\d{4}-\d{4,7}|GHSA-[a-z0-9-]+|[A-Z]{2,8}-[A-Z0-9-]+)$`)
 	cweRe       = regexp.MustCompile(`^CWE-\d+$`)
 	disclosedRe = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
-	digestRe    = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
-	userRe      = regexp.MustCompile(`^[0-9]+(:[0-9]+)?$`)
-	capRe       = regexp.MustCompile(`^[A-Z_]+$`)
-	deviceRe    = regexp.MustCompile(`^/dev/[a-zA-Z0-9/_-]+$`)
-	modeRe      = regexp.MustCompile(`^0[0-7]{3}$`)
-	timeoutRe   = regexp.MustCompile(`^\d+[smh]$`)
-	severities  = map[string]bool{"info": true, "low": true, "medium": true, "high": true, "critical": true}
-	protocols   = map[string]bool{"http": true, "https": true, "tcp": true, "ssh": true, "ftp": true,
+	// handleRe is the pattern for a group handle and a variant discriminator:
+	// lower-case alphanumerics in dash-separated segments.
+	handleRe   = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
+	digestRe   = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	userRe     = regexp.MustCompile(`^[0-9]+(:[0-9]+)?$`)
+	capRe      = regexp.MustCompile(`^[A-Z_]+$`)
+	deviceRe   = regexp.MustCompile(`^/dev/[a-zA-Z0-9/_-]+$`)
+	modeRe     = regexp.MustCompile(`^0[0-7]{3}$`)
+	timeoutRe  = regexp.MustCompile(`^\d+[smh]$`)
+	severities = map[string]bool{"info": true, "low": true, "medium": true, "high": true, "critical": true}
+	protocols  = map[string]bool{"http": true, "https": true, "tcp": true, "ssh": true, "ftp": true,
 		"smtp": true, "redis": true, "mysql": true, "postgres": true}
 	detections = map[string]bool{"scanner": true, "custom-only": true}
 	fidelities = map[string]bool{"real": true, "simulated": true}
@@ -197,6 +200,15 @@ func (c *Contract) checkStructure() error {
 	}
 	if m.Disclosed != "" && !disclosedRe.MatchString(m.Disclosed) {
 		return se("metadata/disclosed", "%q must be an ISO date (YYYY-MM-DD)", m.Disclosed)
+	}
+	if m.Group != "" && !handleRe.MatchString(m.Group) {
+		return se("metadata/group", "%q must match %s", m.Group, handleRe)
+	}
+	if m.Variant != "" && !handleRe.MatchString(m.Variant) {
+		return se("metadata/variant", "%q must match %s", m.Variant, handleRe)
+	}
+	if m.Variant != "" && m.Group == "" {
+		return se("metadata/variant", "a variant needs a group")
 	}
 
 	b := c.Base

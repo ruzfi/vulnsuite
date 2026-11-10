@@ -5,8 +5,10 @@ import (
 	"flag"
 	"fmt"
 	"strings"
+	"text/tabwriter"
 
 	"github.com/ruzfi/vulnsuite/pkg/contract"
+	"github.com/ruzfi/vulnsuite/pkg/loader"
 	"github.com/ruzfi/vulnsuite/pkg/runner"
 	"github.com/ruzfi/vulnsuite/pkg/scanners"
 )
@@ -38,6 +40,11 @@ writing a template and contributing it upstream.`,
 			store, err := g.Store()
 			if err != nil {
 				return err
+			}
+			// A selector that names a multi-member group prints the family
+			// (primary + variants) rather than a single target's detail.
+			if members, ok, gerr := store.GroupMembers(args[0]); gerr == nil && ok && len(members) > 1 {
+				return printFamily(g, store, args[0], members)
 			}
 			c, err := store.LoadSelector(args[0])
 			if err != nil {
@@ -130,6 +137,64 @@ writing a template and contributing it upstream.`,
 			return nil
 		},
 	}
+}
+
+// familyMember is one row of an `info <group>` family listing.
+type familyMember struct {
+	ID       string   `json:"id"`
+	Variant  string   `json:"variant,omitempty"`
+	Primary  bool     `json:"primary"`
+	Severity string   `json:"severity,omitempty"`
+	Class    []string `json:"class,omitempty"`
+	VulnRefs []string `json:"vuln_refs,omitempty"`
+	Summary  string   `json:"summary"`
+}
+
+// printFamily renders a variant group: the primary first, then each variant,
+// with the discriminator that selects it individually.
+func printFamily(g *Global, store *loader.Store, handle string, members []loader.GroupMember) error {
+	type familyOut struct {
+		Group   string         `json:"group"`
+		Primary string         `json:"primary,omitempty"`
+		Members []familyMember `json:"members"`
+	}
+	out := familyOut{Group: handle}
+	for _, m := range members {
+		c, err := store.Load(m.Path)
+		if err != nil {
+			out.Members = append(out.Members, familyMember{ID: m.ID, Variant: m.Variant, Primary: m.Primary, Summary: "(unloadable: " + err.Error() + ")"})
+			continue
+		}
+		if m.Primary {
+			out.Primary = c.ID()
+		}
+		out.Members = append(out.Members, familyMember{
+			ID: c.ID(), Variant: c.Variant(), Primary: m.Primary,
+			Severity: c.Metadata.Severity, Class: c.Classes(),
+			VulnRefs: c.Metadata.VulnRefs, Summary: c.Metadata.Summary,
+		})
+	}
+	if g.JSON {
+		return g.emitJSON(out)
+	}
+	fmt.Fprintf(g.Stdout, "%s  (variant group, %d members)\n", handle, len(members))
+	fmt.Fprintf(g.Stdout, "  `-t %s` runs the primary; `-t %s -variants` runs every member.\n\n", handle, handle)
+	tw := tabwriter.NewWriter(g.Stdout, 2, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "  VARIANT\tID\tSEV\tREFS\tSUMMARY")
+	for _, m := range out.Members {
+		label := m.Variant
+		if m.Primary {
+			if label == "" {
+				label = "primary"
+			} else {
+				label += " (primary)"
+			}
+		}
+		fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\t%s\n", dash(label), m.ID, dash(m.Severity), dash(strings.Join(m.VulnRefs, ",")), m.Summary)
+	}
+	tw.Flush()
+	fmt.Fprintf(g.Stdout, "\nInspect one with:  vulnsuite info <id>\n")
+	return nil
 }
 
 func probeSummary(p contract.Probe) string {

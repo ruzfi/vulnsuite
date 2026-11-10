@@ -72,7 +72,7 @@ func reportVerify(g *Global, h *runner.Handle, indent string) {
 
 func cmdRun() *Command {
 	var sel multiFlag
-	var all, detach, noVerify, noPull, noCache, force bool
+	var all, variants, detach, noVerify, noPull, noCache, force bool
 	var maxConcurrent int
 	var targetsFile, platform, readyTimeout, nucleiDir string
 	var ignoreRequires, allowHostAccess bool
@@ -95,7 +95,8 @@ Exposure modes:
   macvlan   give the target its own IP on the LAN (needs -parent IFACE).`,
 		Flags: func(fs *flag.FlagSet) {
 			fs.Var(&sel, "t", "template selector: folder, file or id (repeatable)")
-			fs.BoolVar(&all, "all", false, "run every template")
+			fs.BoolVar(&all, "all", false, "run every template (one target per variant group; add -variants for the full matrix)")
+			fs.BoolVar(&variants, "variants", false, "expand a selected group to all its members (and -all to every variant); a group selector alone runs only its primary")
 			fs.IntVar(&maxConcurrent, "max-concurrent", DefaultMaxConcurrent, "cap on simultaneously running targets")
 			addExposureFlags(fs, &exp)
 			fs.StringVar(&targetsFile, "targets-file", "", "write the scannable target URLs here (one per line)")
@@ -121,7 +122,7 @@ Exposure modes:
 			if err != nil {
 				return err
 			}
-			cs, loadErrs, err := gather(store, sel, all)
+			cs, loadErrs, err := gather(store, sel, all, variants)
 			if err != nil {
 				return err
 			}
@@ -398,14 +399,15 @@ func scanURL(h *runner.Handle) string {
 func cmdStop() *Command {
 	var sel multiFlag
 	var network string
-	var pruneNet bool
+	var pruneNet, variantsStop bool
 	return &Command{
 		Name: "stop", Aliases: []string{"down"},
 		Short: "tear down running targets (all, or selected templates)",
-		Usage: "[-t SELECTOR]... [-prune-net]",
+		Usage: "[-t SELECTOR]... [-variants] [-prune-net]",
 		Flags: func(fs *flag.FlagSet) {
 			fs.Var(&sel, "t", "only this template/selector (repeatable; default: everything vulnsuite started)")
 			fs.StringVar(&network, "network", runner.DefaultNetwork, "internal network name")
+			fs.BoolVar(&variantsStop, "variants", false, "when a selector names a group, stop every member (default: just its primary)")
 			fs.BoolVar(&pruneNet, "prune-net", false, "also remove the internal network when stopping everything")
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
@@ -421,7 +423,7 @@ func cmdStop() *Command {
 				if err != nil {
 					return err
 				}
-				cs, _, err := gather(store, sel, false)
+				cs, _, err := gather(store, sel, false, variantsStop)
 				if err != nil {
 					return err
 				}
