@@ -209,6 +209,84 @@ func TestListFilters(t *testing.T) {
 	}
 }
 
+func TestRefFilterAndSelector(t *testing.T) {
+	root := fixtures(t)
+	const (
+		grafana = "grafana-8.3.0-cve-2021-43798"
+		apache  = "apache-httpd-2.4.49-cve-2021-41773"
+	)
+	// grafana and apache share a secondary CVE present in neither id.
+	const secondary = "CVE-2026-109619"
+
+	ids := func(args ...string) ([]string, int, string) {
+		t.Helper()
+		full := append([]string{"-json", "-T", root, "list"}, args...)
+		code, out, errOut := run(t, nil, full...)
+		var got []string
+		if code == ExitOK {
+			var rows []listRow
+			if err := json.Unmarshal([]byte(out), &rows); err != nil {
+				t.Fatalf("list %v: bad json: %v\n%s", args, err, out)
+			}
+			for _, r := range rows {
+				got = append(got, r.ID)
+			}
+		}
+		return got, code, errOut
+	}
+	sameSet := func(got, want []string) bool {
+		if len(got) != len(want) {
+			return false
+		}
+		seen := map[string]bool{}
+		for _, g := range got {
+			seen[g] = true
+		}
+		for _, w := range want {
+			if !seen[w] {
+				return false
+			}
+		}
+		return true
+	}
+
+	// -ref on a secondary CVE (in no id) lists every template carrying it.
+	if got, _, _ := ids("-ref", secondary); !sameSet(got, []string{grafana, apache}) {
+		t.Fatalf("-ref secondary: %v", got)
+	}
+	// case-insensitive.
+	if got, _, _ := ids("-ref", "cve-2026-109619"); !sameSet(got, []string{grafana, apache}) {
+		t.Fatalf("-ref lowercase: %v", got)
+	}
+	// -ref on a primary CVE matches just that template.
+	if got, _, _ := ids("-ref", "CVE-2021-43798"); !sameSet(got, []string{grafana}) {
+		t.Fatalf("-ref primary: %v", got)
+	}
+	// repeatable, match-any.
+	if got, _, _ := ids("-ref", "CVE-2021-43798", "-ref", "CVE-2021-41773"); !sameSet(got, []string{grafana, apache}) {
+		t.Fatalf("-ref repeatable: %v", got)
+	}
+	// composes with other filters.
+	if got, _, _ := ids("-ref", secondary, "-category", "web-apps"); !sameSet(got, []string{grafana}) {
+		t.Fatalf("-ref compose: %v", got)
+	}
+
+	// A bare ref-shaped selector resolves against vuln_refs (clean multi-row
+	// list, not an "ambiguous selector" error).
+	if got, code, errOut := ids(secondary); code != ExitOK || !sameSet(got, []string{grafana, apache}) {
+		t.Fatalf("bare ref selector: code=%d %v %s", code, got, errOut)
+	}
+	// The issue's exact formerly-broken command now works: -cve is boolean, the
+	// CVE is a positional selector resolved via vuln_refs.
+	if got, code, _ := ids("-cve", secondary); code != ExitOK || !sameSet(got, []string{grafana, apache}) {
+		t.Fatalf("-cve + ref selector: code=%d %v", code, got)
+	}
+	// A ref-shaped selector that matches nothing errors, mentioning vuln_ref.
+	if _, code, errOut := ids("CVE-2000-0000"); code != ExitFail || !strings.Contains(errOut, "vuln_ref") {
+		t.Fatalf("unmatched ref selector: code=%d %s", code, errOut)
+	}
+}
+
 func TestBuildAndImages(t *testing.T) {
 	root := fixtures(t)
 	fe := enginetest.New()

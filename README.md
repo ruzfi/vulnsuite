@@ -175,11 +175,11 @@ schema for editors and CI is [schemas/contract.schema.json](schemas/contract.sch
 ## Commands
 
 ```
-vulnsuite list [selector] [-class C]... [-category P] [-cve] [-kev] [-year Y]  filter templates
+vulnsuite list [selector] [-group H] [-variants] [-ref ID]... [-class C]... [-category P] [-cve] [-kev] [-year Y]  filter templates
 vulnsuite search ...                                alias for list
 vulnsuite validate [-t SEL]... [-strict]            structure + semantic lint
-vulnsuite build -t SEL... | -all [-j N] [-push -registry REG]
-vulnsuite run [vulnerable|patched] -t SEL... | -all [-expose MODE] [-detach]
+vulnsuite build -t SEL... | -all [-variants] [-j N] [-push -registry REG]
+vulnsuite run [vulnerable|patched] -t SEL... | -all [-variants] [-expose MODE] [-detach]
 vulnsuite ps                                        running targets (id, state, ip)
 vulnsuite targets [-file FILE] [-by auto|ip|alias|host]  scannable URLs, right port per template
 vulnsuite stop [-t SEL]... [-prune-net]             tear down
@@ -192,6 +192,33 @@ vulnsuite update-templates                          fetch / update the community
 SDK by default, or the built-in API client.
 A selector is a folder (`web-servers`), a contract file, or a template id (a
 unique substring works: `-t grafana`).
+
+### Variant groups and `-variants`
+
+Templates that are the same vulnerability expressed differently — a canonical
+reproduction plus, say, a WAF-evasion or chunked-encoding variant — can share a
+`metadata.group` handle. One member is the **primary** (`primary: true`). A
+selector that names a group resolves to its primary; `-variants` expands it to
+every member:
+
+```
+vulnsuite run -t php2shell                 # just the primary
+vulnsuite run -t php2shell -variants       # every member of the family
+vulnsuite run -t php2shell-waf-evasion     # one exact variant (an id; -variants is a no-op)
+vulnsuite list -group php2shell            # the whole family, one row per member
+vulnsuite info php2shell                   # the family: primary + each variant
+```
+
+Resolution precedence: **exact id → exact group (→ its primary) → category folder
+→ unique substring.** A lone target that sets a `group` is just a nickname for
+its id (no `primary`/`variant` needed), so `-t php2shell` works without renaming
+the target.
+
+`-all` operates per family: by default it takes one target per group (the
+primary) plus every ungrouped target; `-all -variants` is the full matrix. This
+keeps `build -all` / `run -all` lean while `-all -variants` gives you everything.
+`validate` always checks every member, with or without `-variants`, so a family's
+rules (exactly one primary, unique variants) are enforced whole.
 
 ### Building images
 
@@ -316,6 +343,8 @@ is a single axis — the **product surface** you scan (`web-apps`, `web-servers`
 from the contract, so `list` / `search` can filter by any of it and compose:
 
 ```bash
+vulnsuite list --ref CVE-2026-109619            # the template(s) for a specific CVE/ref
+vulnsuite search CVE-2026-109619                 # the same -- a bare ref works as a selector
 vulnsuite list --class misconfig --kev          # misconfigs on the CISA KEV catalog
 vulnsuite list --category web-apps --cve        # CVE-tracked web-app targets
 vulnsuite search --class exposure --no-cve      # exposures without a CVE
@@ -323,10 +352,16 @@ vulnsuite list --year 2021                       # disclosed in 2021 (or CVE-id 
 vulnsuite list --since 2023-01-01                # disclosed on or after a date
 ```
 
+- `--ref <id>` (repeatable, match any; case-insensitive): a specific `vuln_refs`
+  id — `CVE-…`, `GHSA-…`, `GO-…` or a `VS-…` prefix id. Finds secondary refs
+  that appear in no template id. A bare ref-shaped selector
+  (`search CVE-2026-109619`) resolves against `vuln_refs` too when it matches no
+  id/file/folder.
 - `--class` (repeatable, match any): `vuln`, `misconfig`, `exposure`,
   `default-login`, `weak-crypto`.
 - `--category` / `--product`: the product surface (top directory level).
-- `--cve` / `--no-cve`: has (not) a `CVE-…` in `vuln_refs`.
+- `--cve` / `--no-cve`: has (not) any `CVE-…` in `vuln_refs` (boolean; use
+  `--ref` for a specific id).
 - `--kev` / `--no-kev`: on (not on) the CISA **Known Exploited Vulnerabilities**
   catalog — derived by cross-referencing the target's CVEs. The catalog is read
   from the templates checkout's `data/cisa-kev.txt`; `--refresh-kev` fetches the

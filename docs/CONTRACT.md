@@ -37,6 +37,9 @@ Unknown fields are rejected. The machine-readable form of this document is
 | `severity` | | `info`, `low`, `medium`, `high`, `critical` |
 | `class` | | finding class(es) (taxonomy v2), orthogonal to the product surface (the top directory level): `vuln` (a tracked software vulnerability, usually a CVE), `misconfig` (an insecure configuration), `exposure` (data/interface reachable that should not be), `default-login` (default/weak credentials), `weak-crypto`. One or more, unique. `vulnsuite list --class` filters on it. |
 | `disclosed` | | optional public-disclosure date (`YYYY-MM-DD`); drives `list --year`/`--since` and a timeline view, falling back to the CVE-id year when unset. |
+| `group` | | variant-family handle (`^[a-z0-9]+(-[a-z0-9]+)*$`). Targets that share a `group` are variants of one vulnerability: `-t <group>` resolves to the group's **primary**, and `-variants` expands to every member. A lone target that sets a `group` is simply a nickname for its id (no `primary`/`variant` needed). A handle must not equal any target `id`. |
+| `primary` | | `true` marks the canonical member of a group. Exactly one member of a multi-member group must set it; a single-member group's lone member is the primary implicitly. |
+| `variant` | | discriminator within a group (`^[a-z0-9]+(-[a-z0-9]+)*$`), e.g. `waf-evasion`; unique within the group. Every non-primary member of a multi-member group needs one. Requires `group`. |
 | `tags` | | free-form; `vulnsuite list -tag` filters on them |
 | `references` | | the advisory and the fix |
 | `maintainer` | | who to ask |
@@ -196,6 +199,11 @@ rather than failed; use `-expose host` or scan from a container.
 | `empty-verify` | error | an http probe asserts nothing |
 | `bad-regex`, `bad-timeout` | error | malformed values |
 | `duplicate-id` | error | two templates share an id |
+| `group-no-primary`, `group-multiple-primaries` | error | a multi-member group has zero or more than one `primary` |
+| `group-duplicate-variant`, `group-variant-missing` | error | two members share a `variant`, or a non-primary member has none |
+| `group-id-collision` | error | a group handle equals a template `id` |
+| `group-multi-category` | warning | a group spans more than one product surface |
+| `group-divergent-refs` | warning | members of a group cite differing `vuln_refs` |
 | `no-patched`, `no-verify`, `weak-verify`, `identical-states` | warning | the template proves less than it could |
 | `source-no-diff` | warning | a source base where states have no patch/image difference |
 | `no-healthcheck`, `no-vuln-ref`, `no-references`, `scanner-unnamed` | warning | missing provenance |

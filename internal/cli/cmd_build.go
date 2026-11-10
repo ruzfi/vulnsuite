@@ -45,7 +45,7 @@ type buildResult struct {
 
 func cmdBuild() *Command {
 	var sel multiFlag
-	var all, noCache, force, noPull, push, showLog, ignoreRequires bool
+	var all, variants, noCache, force, noPull, push, showLog, ignoreRequires bool
 	var states, registry, platform string
 	var jobs int
 	return &Command{
@@ -61,7 +61,8 @@ With -push, each image is also tagged <registry>/<id>:<state> and
 VULNSUITE_REGISTRY_USER / VULNSUITE_REGISTRY_TOKEN or ~/.docker/config.json.`,
 		Flags: func(fs *flag.FlagSet) {
 			fs.Var(&sel, "t", "template selector: folder, file or id (repeatable)")
-			fs.BoolVar(&all, "all", false, "build every template")
+			fs.BoolVar(&all, "all", false, "build every template (one target per variant group; add -variants for the full matrix)")
+			fs.BoolVar(&variants, "variants", false, "expand a selected group to all its members (and -all to every variant); a group selector alone builds only its primary")
 			fs.StringVar(&states, "state", "all", "which states: vulnerable, patched, or all")
 			fs.IntVar(&jobs, "j", defaultJobs(), "parallel builds")
 			fs.BoolVar(&noCache, "no-cache", false, "disable the engine's layer cache")
@@ -86,7 +87,7 @@ VULNSUITE_REGISTRY_USER / VULNSUITE_REGISTRY_TOKEN or ~/.docker/config.json.`,
 			if err != nil {
 				return err
 			}
-			cs, loadErrs, err := gather(store, sel, all)
+			cs, loadErrs, err := gather(store, sel, all, variants)
 			if err != nil {
 				return err
 			}
