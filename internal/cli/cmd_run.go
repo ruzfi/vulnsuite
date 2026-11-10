@@ -71,7 +71,8 @@ func reportVerify(g *Global, h *runner.Handle, indent string) {
 }
 
 func cmdRun() *Command {
-	var sel multiFlag
+	var sel, files multiFlag
+	var flt filters
 	var all, variants, detach, noVerify, noPull, noCache, force bool
 	var maxConcurrent int
 	var targetsFile, platform, readyTimeout, nucleiDir string
@@ -80,7 +81,7 @@ func cmdRun() *Command {
 	return &Command{
 		Name:  "run",
 		Short: "build if needed, then run target(s) in a state and verify them",
-		Usage: "[vulnerable|patched] -t SELECTOR... | -all [-expose MODE] [-detach] [-targets-file FILE]",
+		Usage: "[vulnerable|patched] -t SEL... | -f FILE | <filter> | -all [-variants] [-expose MODE] [-detach] [-targets-file FILE]",
 		Long: `Stands targets up (default state: vulnerable), waits until they are ready,
 and runs each state's verify probes so you know the target is genuinely in the
 declared state before you scan it. Many targets can run at once; each gets its
@@ -94,9 +95,11 @@ Exposure modes:
   host      publish the port on the host (one host port serves one target).
   macvlan   give the target its own IP on the LAN (needs -parent IFACE).`,
 		Flags: func(fs *flag.FlagSet) {
-			fs.Var(&sel, "t", "template selector: folder, file or id (repeatable)")
+			fs.Var(&sel, "t", "template selector: id, group handle, folder, file or suite:<name> (repeatable)")
+			fs.Var(&files, "f", "read selectors from a file, one per line (# comments allowed); repeatable")
 			fs.BoolVar(&all, "all", false, "run every template (one target per variant group; add -variants for the full matrix)")
 			fs.BoolVar(&variants, "variants", false, "expand a selected group to all its members (and -all to every variant); a group selector alone runs only its primary")
+			flt.register(fs)
 			fs.IntVar(&maxConcurrent, "max-concurrent", DefaultMaxConcurrent, "cap on simultaneously running targets")
 			addExposureFlags(fs, &exp)
 			fs.StringVar(&targetsFile, "targets-file", "", "write the scannable target URLs here (one per line)")
@@ -122,7 +125,7 @@ Exposure modes:
 			if err != nil {
 				return err
 			}
-			cs, loadErrs, err := gather(store, sel, all, variants)
+			cs, loadErrs, err := gatherSet(ctx, store, sel, files, all, variants, flt)
 			if err != nil {
 				return err
 			}
