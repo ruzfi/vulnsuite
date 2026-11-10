@@ -61,9 +61,9 @@ type listRow struct {
 }
 
 func cmdList() *Command {
-	var tag, fidelity, arch, category, year, since, groupFilter string
-	var class, ref multiFlag
-	var onlyKEV, noKEV, cve, noCVE, refreshKEV, variants bool
+	var f filters
+	var groupFilter string
+	var variants bool
 	return &Command{
 		Name: "list", Aliases: []string{"ls", "search"},
 		Short: "list and filter templates by class, KEV, product surface, CVE and year",
@@ -93,47 +93,26 @@ KEV catalog. The catalog is read from the templates checkout's data/cisa-kev.txt
 ` + "`~/.cache/vulnsuite/cisa-kev.json`" + `. Offline with neither present, KEV is
 shown as "?" and -kev/-no-kev cannot be used.`,
 		Flags: func(fs *flag.FlagSet) {
-			fs.StringVar(&tag, "tag", "", "only templates carrying this tag")
-			fs.StringVar(&fidelity, "fidelity", "", "only templates of this fidelity (real or simulated)")
+			f.register(fs)
 			fs.StringVar(&groupFilter, "group", "", "only members of this variant group (shows the whole family)")
 			fs.BoolVar(&variants, "variants", false, "expand variant groups to all members (default: collapse each group to its primary)")
-			fs.StringVar(&arch, "arch", "", "only templates that run on this host arch (e.g. amd64, arm64), honouring requires")
-			fs.Var(&class, "class", "only templates of this finding class (repeatable; match any): vuln, misconfig, exposure, default-login, weak-crypto")
-			fs.StringVar(&category, "category", "", "only templates in this product surface (top directory level), e.g. web-apps")
-			fs.StringVar(&category, "product", "", "alias for -category")
-			fs.BoolVar(&cve, "cve", false, "only templates with a CVE id in vuln_refs")
-			fs.BoolVar(&noCVE, "no-cve", false, "only templates without a CVE id")
-			fs.Var(&ref, "ref", "only templates whose vuln_refs contains this id (repeatable; match any; case-insensitive): CVE-, GHSA-, GO-, VS-...")
-			fs.BoolVar(&onlyKEV, "kev", false, "only templates on the CISA KEV catalog")
-			fs.BoolVar(&noKEV, "no-kev", false, "only templates not on the CISA KEV catalog")
-			fs.StringVar(&year, "year", "", "only templates disclosed in this year (YYYY)")
-			fs.StringVar(&since, "since", "", "only templates disclosed on or after this ISO date (YYYY-MM-DD)")
-			fs.BoolVar(&refreshKEV, "refresh-kev", false, "fetch the live CISA KEV feed and refresh the local cache before filtering")
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
-			if cve && noCVE {
-				return usageError{"-cve and -no-cve are mutually exclusive"}
-			}
-			if onlyKEV && noKEV {
-				return usageError{"-kev and -no-kev are mutually exclusive"}
-			}
-			for _, cl := range class {
-				if !has(contract.Classes, cl) {
-					return usageError{fmt.Sprintf("unknown -class %q; want one of %s", cl, strings.Join(contract.Classes, ", "))}
-				}
+			if err := f.validate(); err != nil {
+				return err
 			}
 			store, err := g.Store()
 			if err != nil {
 				return err
 			}
-			// Resolve the KEV set when it is needed: always, to populate the
-			// column, and definitively when -kev/-no-kev filters on it.
-			kevSet, kevSrc, err := kev.Resolve(ctx, kev.Options{TemplatesDir: store.Root, Refresh: refreshKEV})
+			// Resolve the KEV set always, to populate the column; -kev/-no-kev
+			// additionally require it to be known.
+			kevSet, kevSrc, err := kev.Resolve(ctx, kev.Options{TemplatesDir: store.Root, Refresh: f.refreshKEV})
 			if err != nil {
 				return err
 			}
 			kevKnown := kevSrc.Origin != kev.OriginNone
-			if (onlyKEV || noKEV) && !kevKnown {
+			if f.needsKEV() && !kevKnown {
 				return fmt.Errorf("cannot filter by KEV: catalog unavailable (offline and no cache). Run with -refresh-kev, or point -templates at a checkout with data/cisa-kev.txt")
 			}
 			groupSizes, err := store.Groups()
@@ -169,52 +148,10 @@ shown as "?" and -kev/-no-kev cannot be used.`,
 					rows = append(rows, listRow{ID: loader.PeekID(p), Path: p, Error: err.Error()})
 					continue
 				}
-				if tag != "" && !has(c.Metadata.Tags, tag) {
-					continue
-				}
-				if fidelity != "" && c.Fidelity() != fidelity {
-					continue
-				}
-				if category != "" && store.Category(p) != category {
-					continue
-				}
-				if len(class) > 0 && !anyClass(c, class) {
-					continue
-				}
-				if len(ref) > 0 && !anyRef(c, ref) {
-					continue
-				}
-				if cve && !c.IsCVETracked() {
-					continue
-				}
-				if noCVE && c.IsCVETracked() {
+				if !f.match(store, c, p, kevSet, kevKnown) {
 					continue
 				}
 				onKEV := kevSet.Any(c.CVEs())
-				if onlyKEV && !onKEV {
-					continue
-				}
-				if noKEV && onKEV {
-					continue
-				}
-				if year != "" && c.Year() != year {
-					continue
-				}
-				if since != "" {
-					d := c.DisclosedDate()
-					if d == "" || d < since {
-						continue
-					}
-				}
-				if arch != "" {
-					// a target runs on <arch> if it has no arch requirement, lists
-					// it, or can emulate it on linux
-					req := c.Requires
-					ok := len(req.Arch) == 0 || has(req.Arch, arch) || (req.EmulationAllowed() && !req.KVM)
-					if !ok {
-						continue
-					}
-				}
 				row := listRow{
 					ID: c.ID(), Group: c.Group(), Variant: c.Variant(), Primary: c.IsPrimary(),
 					GroupSize: len(groupSizes[c.Group()]),

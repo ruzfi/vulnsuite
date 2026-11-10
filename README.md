@@ -178,8 +178,8 @@ schema for editors and CI is [schemas/contract.schema.json](schemas/contract.sch
 vulnsuite list [selector] [-group H] [-variants] [-ref ID]... [-class C]... [-category P] [-cve] [-kev] [-year Y]  filter templates
 vulnsuite search ...                                alias for list
 vulnsuite validate [-t SEL]... [-strict]            structure + semantic lint
-vulnsuite build -t SEL... | -all [-variants] [-j N] [-push -registry REG]
-vulnsuite run [vulnerable|patched] -t SEL... | -all [-variants] [-expose MODE] [-detach]
+vulnsuite build -t SEL... | -f FILE | <filter> | -all [-variants] [-j N] [-push -registry REG]
+vulnsuite run [vulnerable|patched] -t SEL... | -f FILE | <filter> | -all [-variants] [-expose MODE] [-detach]
 vulnsuite ps                                        running targets (id, state, ip)
 vulnsuite targets [-file FILE] [-by auto|ip|alias|host]  scannable URLs, right port per template
 vulnsuite stop [-t SEL]... [-prune-net]             tear down
@@ -219,6 +219,40 @@ primary) plus every ungrouped target; `-all -variants` is the full matrix. This
 keeps `build -all` / `run -all` lean while `-all -variants` gives you everything.
 `validate` always checks every member, with or without `-variants`, so a family's
 rules (exactly one primary, unique variants) are enforced whole.
+
+### Standing up a set: filters and suites as selectors
+
+`run` and `build` take the same filters as `list` — `-class`, `-tag`,
+`-category`/`-product`, `-cve`/`-no-cve`, `-year`, `-since`, `-fidelity`, `-ref`,
+`-kev`/`-no-kev`. Every `-t`, every filter, and every line of a `-f` file selects
+a set of targets; the run stands up their **union**, de-duplicated:
+
+```
+vulnsuite run -t sshole -t php2shell -class misconfig   # both group primaries + every misconfig
+vulnsuite build -class exposure -no-cve                 # all exposures without a CVE
+vulnsuite run -f targets.txt                            # a mixed file of selectors
+```
+
+Filters *within one line* combine with AND (`-category web-apps -class exposure`
+is web-apps **and** exposure); separate selectors and filter lines union with OR.
+
+A **`-f` file** lists one selector per line — an id, a group handle, a category, a
+`suite:<name>`, or a filter line (begins with `-`). Blank lines and `#` comments
+are ignored:
+
+```
+# my regression set
+php2shell            # a group handle -> its primary
+redis-unauth-access
+-class misconfig     # a filter line: every misconfig
+suite:web-basics     # pull in a named suite
+```
+
+A **suite** is a named selectors file (`<templates>/suites/<name>.txt`, same
+format) reached explicitly with `-t suite:<name>` or a `suite:` line in a file —
+never by a bare handle, so standing up a whole curated set is always deliberate.
+A group handle inside a suite resolves to its primary, or to all members when you
+pass `-variants`. Overlapping selectors never start the same target twice.
 
 ### Building images
 

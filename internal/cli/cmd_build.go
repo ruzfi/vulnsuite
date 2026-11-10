@@ -44,14 +44,15 @@ type buildResult struct {
 }
 
 func cmdBuild() *Command {
-	var sel multiFlag
+	var sel, files multiFlag
+	var flt filters
 	var all, variants, noCache, force, noPull, push, showLog, ignoreRequires bool
 	var states, registry, platform string
 	var jobs int
 	return &Command{
 		Name:  "build",
 		Short: "build (or pull) the images for templates, content-addressed, in parallel",
-		Usage: "-t SELECTOR... | -all [-state vulnerable|patched|all] [-j N] [-push -registry REG]",
+		Usage: "-t SEL... | -f FILE | <filter> | -all [-variants] [-state vulnerable|patched|all] [-j N] [-push -registry REG]",
 		Long: `Every state's image is tagged ` + contract.ImageRepoPrefix + `/<id>:<state>-<hash> where the hash
 covers the base, patches, overlays and environment. Identical inputs are never
 rebuilt. Prebuilt (image-kind) states are pulled, not built.
@@ -60,9 +61,11 @@ With -push, each image is also tagged <registry>/<id>:<state> and
 <registry>/<id>:<state>-<hash> and pushed. Credentials come from
 VULNSUITE_REGISTRY_USER / VULNSUITE_REGISTRY_TOKEN or ~/.docker/config.json.`,
 		Flags: func(fs *flag.FlagSet) {
-			fs.Var(&sel, "t", "template selector: folder, file or id (repeatable)")
+			fs.Var(&sel, "t", "template selector: id, group handle, folder, file or suite:<name> (repeatable)")
+			fs.Var(&files, "f", "read selectors from a file, one per line (# comments allowed); repeatable")
 			fs.BoolVar(&all, "all", false, "build every template (one target per variant group; add -variants for the full matrix)")
 			fs.BoolVar(&variants, "variants", false, "expand a selected group to all its members (and -all to every variant); a group selector alone builds only its primary")
+			flt.register(fs)
 			fs.StringVar(&states, "state", "all", "which states: vulnerable, patched, or all")
 			fs.IntVar(&jobs, "j", defaultJobs(), "parallel builds")
 			fs.BoolVar(&noCache, "no-cache", false, "disable the engine's layer cache")
@@ -87,7 +90,7 @@ VULNSUITE_REGISTRY_USER / VULNSUITE_REGISTRY_TOKEN or ~/.docker/config.json.`,
 			if err != nil {
 				return err
 			}
-			cs, loadErrs, err := gather(store, sel, all, variants)
+			cs, loadErrs, err := gatherSet(ctx, store, sel, files, all, variants, flt)
 			if err != nil {
 				return err
 			}
