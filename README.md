@@ -488,8 +488,11 @@ vulnsuite list --since 2023-01-01                # disclosed on or after a date
 - `--kev` / `--no-kev`: on (not on) the CISA **Known Exploited Vulnerabilities**
   catalog — derived by cross-referencing the target's CVEs. The catalog is read
   from the templates checkout's `data/cisa-kev.txt`; `--refresh-kev` fetches the
-  live CISA feed and caches it at `~/.cache/vulnsuite/cisa-kev.json`. Offline
-  with neither present, KEV shows as `?` and `--kev`/`--no-kev` are unavailable.
+  live CISA feed and caches it at `~/.cache/vulnsuite/cisa-kev.json`, which is
+  used instead whenever it holds a newer catalog than the checkout. `list`
+  prints the source and its age (`kev_source` in `-json`) and warns when the
+  data is more than 30 days old. Offline with neither present, KEV shows as `?`
+  and `--kev`/`--no-kev` are unavailable.
 - `--year` / `--since`: from `metadata.disclosed`, falling back to the CVE-id
   year.
 
