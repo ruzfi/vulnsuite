@@ -1,7 +1,8 @@
 // Package docker implements engine.Engine against the Docker Engine HTTP API,
 // spoken directly over the daemon socket with the standard library. It works
 // with Docker Engine, Docker Desktop, OrbStack, Colima and Podman's
-// Docker-compatible socket, and honours DOCKER_HOST.
+// Docker-compatible socket, and honours DOCKER_HOST, DOCKER_TLS_VERIFY,
+// DOCKER_CERT_PATH and docker contexts (DOCKER_CONTEXT / currentContext).
 package docker
 
 import (
@@ -92,11 +93,24 @@ func DefaultHost() string {
 	return "unix:///var/run/docker.sock"
 }
 
-// New connects to host (empty = DefaultHost()).
+// New connects to host. An empty host resolves like the docker CLI (see
+// ResolveEndpoint): DOCKER_HOST, then the docker context, then the local
+// socket. A tcp:// host uses TLS as DOCKER_TLS_VERIFY / DOCKER_CERT_PATH ask.
 func New(host string) (*Client, error) {
 	if host == "" {
-		host = DefaultHost()
+		ep, err := ResolveEndpoint()
+		if err != nil {
+			return nil, err
+		}
+		return NewEndpoint(ep)
 	}
+	return NewEndpoint(Endpoint{Host: host, TLS: envTLS()})
+}
+
+// NewEndpoint connects to an explicit endpoint. Its TLS settings apply to a
+// tcp:// host (an https:// host always uses TLS); sockets ignore them.
+func NewEndpoint(ep Endpoint) (*Client, error) {
+	host := ep.Host
 	c := &Client{host: host}
 	transport := &http.Transport{
 		MaxIdleConns:          8,
@@ -112,12 +126,27 @@ func New(host string) (*Client, error) {
 			return d.DialContext(ctx, "unix", path)
 		}
 		c.baseURL = "http://docker"
-	case strings.HasPrefix(host, "tcp://"), strings.HasPrefix(host, "http://"):
+	case strings.HasPrefix(host, "tcp://"), strings.HasPrefix(host, "http://"), strings.HasPrefix(host, "https://"):
 		u, err := url.Parse(host)
 		if err != nil {
 			return nil, err
 		}
-		c.baseURL = "http://" + u.Host
+		files := ep.TLS
+		if u.Scheme == "http" {
+			files = nil
+		} else if u.Scheme == "https" && files == nil {
+			files = &TLSFiles{}
+		}
+		if files == nil {
+			c.baseURL = "http://" + u.Host
+			break
+		}
+		cfg, err := files.tlsConfig(u.Hostname())
+		if err != nil {
+			return nil, fmt.Errorf("TLS for %s: %w", host, err)
+		}
+		transport.TLSClientConfig = cfg
+		c.baseURL = "https://" + u.Host
 	case strings.HasPrefix(host, "npipe://"):
 		return nil, fmt.Errorf("npipe DOCKER_HOST is not supported yet; expose the daemon over tcp:// or use WSL")
 	default:

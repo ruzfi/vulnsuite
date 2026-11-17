@@ -200,7 +200,11 @@ vulnsuite update-templates [-ref REF] [-force]      fetch / update the community
 
 `-json` on any command gives machine-readable output (progress goes to stderr).
 `-engine sdk|api` (or `$VULNSUITE_ENGINE`) picks the daemon client: the Moby
-SDK by default, or the built-in API client.
+SDK by default, or the built-in API client. The API client also follows the
+docker CLI's context (`DOCKER_CONTEXT`, else `currentContext` in
+`~/.docker/config.json`) when `DOCKER_HOST` is unset, and speaks TLS to a
+`tcp://` daemon with `DOCKER_TLS_VERIFY` / `DOCKER_CERT_PATH` (`ca.pem`,
+`cert.pem`, `key.pem`).
 A selector is a folder (`web-servers`), a contract file, or a template id (a
 unique substring works: `-t grafana`).
 

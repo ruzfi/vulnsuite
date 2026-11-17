@@ -39,9 +39,10 @@ The state name is not in the hash on purpose.
 **Two engine clients behind one interface.** The default is the official
 Moby SDK (`github.com/moby/moby/client`, the modern, modular successor of
 `github.com/docker/docker/client`): API-version negotiation, `DOCKER_HOST` /
-TLS / context handling and error typing come for free and track the daemon.
+TLS handling and error typing come for free and track the daemon.
 `engine/docker` is a few hundred lines over the unix socket with `net/http`
-only, kept as a fallback (`-engine api`) and as proof that the interface is
+only (it resolves `DOCKER_HOST`, `DOCKER_TLS_VERIFY` / `DOCKER_CERT_PATH` and
+docker contexts itself, the way the docker CLI does), kept as a fallback (`-engine api`) and as proof that the interface is
 small: everything the builder and runner need is build, pull, push, tag,
 create/start/remove/inspect/exec/logs/wait and networks. Both run the same
 end-to-end test. Podman's native API or a remote builder would be a third
