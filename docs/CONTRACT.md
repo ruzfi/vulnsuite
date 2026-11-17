@@ -132,7 +132,7 @@ scanner's discrimination cannot be checked). Each state:
 | `environment` | baked into built images and passed at run time |
 | `command` | per-state command override |
 | `sidecars` | per-state sidecar image overrides, `{ <name>: { image, digest } }` -- swap a sidecar to another version for this state (e.g. the fixed release on every node of a multi-node cluster, which will not form across mixed versions) |
-| `seed` | `[{ run: "..." }]` shell steps executed inside the container once it is up |
+| `seed` | `[{ run: "..." }]` shell steps executed inside the container once it is ready (skipped if it never becomes ready). A step that exits non-zero stops the rest, fails verify and fails `run` |
 | `verify` | probes that prove the state; when present, at least one |
 
 How a state's image is produced (`vulnsuite list` shows it as KIND):

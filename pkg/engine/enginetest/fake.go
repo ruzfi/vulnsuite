@@ -48,6 +48,9 @@ type Fake struct {
 	ExecFn func(container, command string) (int, string, error)
 	// LogsFn answers ContainerLogs when set (receives the container spec).
 	LogsFn func(spec engine.ContainerSpec) string
+	// StartFn runs when a container starts (receives its spec), e.g. to stand
+	// up a listener on a published host port. An error fails the start.
+	StartFn func(spec engine.ContainerSpec) error
 	// FailBuild makes every build fail with this message when set.
 	FailBuild string
 	// FailPull makes pulls fail.
@@ -194,12 +197,17 @@ func (f *Fake) byIDOrName(id string) *Container {
 
 func (f *Fake) ContainerStart(_ context.Context, id string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	c := f.byIDOrName(id)
 	if c == nil {
+		f.mu.Unlock()
 		return fmt.Errorf("no such container %s", id)
 	}
 	c.Running = true
+	spec, fn := c.Spec, f.StartFn
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(spec)
+	}
 	return nil
 }
 

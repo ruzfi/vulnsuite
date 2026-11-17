@@ -208,6 +208,9 @@ Exposure modes:
 			}
 			var handles []*runner.Handle
 			var failures, skippedReq, skippedHost []string
+			// unhealthy: targets that came up but must not be handed out as-is
+			// (not ready, a seed failed, or verify failed). They fail the run.
+			var unhealthy []string
 			for _, c := range runnable {
 				if multi {
 					g.printf("\n=== [%s] %s ===\n", c.ID(), state)
@@ -257,7 +260,18 @@ Exposure modes:
 				if !h.Ready {
 					g.printf("  ready: NO -- the healthcheck did not pass in time\n")
 				}
+				if noVerify {
+					// verify folds seed failures into its detail; without it, say so here.
+					for _, sr := range h.Seeds {
+						if !sr.OK {
+							g.printf("  seed: FAILED -- %q: %s\n", sr.Run, sr.Error)
+						}
+					}
+				}
 				reportVerify(g, h, "  ")
+				if p := h.Problem(); p != "" {
+					unhealthy = append(unhealthy, fmt.Sprintf("%s [%s] (%s)", c.ID(), state, p))
+				}
 				g.printf("  scanner templates:\n")
 				for _, line := range scanners.Match(c, idx).Lines(c) {
 					g.printf("  %s\n", line)
@@ -321,6 +335,15 @@ Exposure modes:
 			if len(failures) > 0 {
 				g.errorf("\n%d failed to start: %s\n", len(failures), strings.Join(failures, ", "))
 			}
+			if len(unhealthy) > 0 {
+				g.errorf("\n%d not confirmed in the requested state: %s\n", len(unhealthy), strings.Join(unhealthy, ", "))
+			}
+			runErr := func() error {
+				if n := len(failures) + len(unhealthy); n > 0 {
+					return fmt.Errorf("%d target(s) failed", n)
+				}
+				return nil
+			}
 			if len(skippedReq) > 0 {
 				g.printf("\n%d skipped (host does not meet requires): %s\n", len(skippedReq), strings.Join(skippedReq, ", "))
 				g.printf("  override with -ignore-requires, or run on a matching host.\n")
@@ -340,10 +363,7 @@ Exposure modes:
 				g.printf("\nTear down:  vulnsuite stop   (brings down all %d target(s))\n", len(handles))
 			}
 			if detach {
-				if len(failures) > 0 {
-					return fmt.Errorf("%d target(s) failed", len(failures))
-				}
-				return nil
+				return runErr()
 			}
 			g.printf("\nHolding. Ctrl-C to tear down this batch.\n")
 			sigCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
@@ -353,10 +373,7 @@ Exposure modes:
 			for _, h := range handles {
 				r.Stop(context.Background(), h)
 			}
-			if len(failures) > 0 {
-				return fmt.Errorf("%d target(s) failed", len(failures))
-			}
-			return nil
+			return runErr()
 		},
 	}
 }

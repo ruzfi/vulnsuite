@@ -154,3 +154,29 @@ type Engine interface {
 	NetworkExists(ctx context.Context, name string) (bool, error)
 	NetworkRemove(ctx context.Context, name string) error
 }
+
+// CappedBuffer is an io.Writer that keeps the first Max bytes written and
+// silently discards the rest while still reporting a full write, so a reader
+// can be drained to EOF without holding unbounded output.
+type CappedBuffer struct {
+	Max int
+	buf []byte
+	// Truncated is set once anything was discarded.
+	Truncated bool
+}
+
+// Write keeps what fits under Max and drops the remainder.
+func (b *CappedBuffer) Write(p []byte) (int, error) {
+	if room := b.Max - len(b.buf); room > 0 {
+		if len(p) <= room {
+			b.buf = append(b.buf, p...)
+			return len(p), nil
+		}
+		b.buf = append(b.buf, p[:room]...)
+	}
+	b.Truncated = true
+	return len(p), nil
+}
+
+// String returns the kept bytes.
+func (b *CappedBuffer) String() string { return string(b.buf) }

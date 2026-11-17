@@ -414,6 +414,7 @@ func TestMultiPortReporting(t *testing.T) {
 func TestRunTargetsFileEmitsCleanURLs(t *testing.T) {
 	root := fixtures(t)
 	fe := enginetest.New()
+	serveOnPublishedPorts(t, fe, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n") // so it becomes ready
 	targetsFile := filepath.Join(t.TempDir(), "targets.txt")
 	code, out, errOut := run(t, fe, "-T", root, "run", "vulnerable",
 		"-t", "multiport-console-demo", "-expose", "host", "-bind", "127.0.0.1",
