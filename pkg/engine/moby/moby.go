@@ -450,6 +450,14 @@ func (e *Engine) NetworkRemove(ctx context.Context, name string) error {
 	return err
 }
 
+func (e *Engine) NetworkConnect(ctx context.Context, networkName, container string, aliases []string) error {
+	_, err := e.cli.NetworkConnect(ctx, networkName, client.NetworkConnectOptions{
+		Container:      container,
+		EndpointConfig: &network.EndpointSettings{Aliases: aliases},
+	})
+	return err
+}
+
 // -- helpers --------------------------------------------------------------------
 
 func authConfigs() map[string]registry.AuthConfig {
@@ -497,6 +505,11 @@ func drain(ctx context.Context, msgs func(func(jsonstream.Message, error) bool),
 		}
 		return ctx.Err() == nil
 	})
+	if failed == nil {
+		// The stream stopped because ctx was cancelled (or the iterator itself
+		// gave up on it): the pull/push did not finish, so it is not a success.
+		failed = ctx.Err()
+	}
 	return failed
 }
 

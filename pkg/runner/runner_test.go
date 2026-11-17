@@ -35,8 +35,9 @@ func TestRunningCarriesHostBinding(t *testing.T) {
 	fe.Containers[name] = &enginetest.Container{
 		ID: "c1", Running: true, IP: "172.17.0.2",
 		Spec: engine.ContainerSpec{
-			Name:  name,
-			Ports: []engine.PortBinding{{HostIP: "203.0.113.9", HostPort: 49154, ContainerPort: 3000, Protocol: "tcp"}},
+			Name:   name,
+			Labels: map[string]string{LabelManaged: "true"},
+			Ports:  []engine.PortBinding{{HostIP: "203.0.113.9", HostPort: 49154, ContainerPort: 3000, Protocol: "tcp"}},
 		},
 	}
 	rows, err := New(fe).Running(context.Background(), DefaultNetwork)
@@ -107,17 +108,17 @@ func TestRunInternalBuildsSpecAndFleet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h.Container != "vulnsuite-apache-httpd-2.4.49-cve-2021-41773-vulnerable" || h.EndpointHost != c.ID() || h.EndpointPort != 80 || h.Scheme != "http" {
+	if h.Container != "vulnsuite-apache-httpd-2.4.49-cve-2021-41773-vulnerable" || h.EndpointHost != c.ID()+"-vulnerable" || h.EndpointPort != 80 || h.Scheme != "http" {
 		t.Fatalf("handle: %+v", h)
 	}
-	if h.ScannerTarget() != "http://apache-httpd-2.4.49-cve-2021-41773:80" {
+	if h.ScannerTarget() != "http://apache-httpd-2.4.49-cve-2021-41773-vulnerable:80" {
 		t.Fatal(h.ScannerTarget())
 	}
 	if !h.Ready || h.VerifyOK != nil || h.VerifyDetail == "" {
 		t.Fatalf("ready=%v verify=%v detail=%q", h.Ready, h.VerifyOK, h.VerifyDetail)
 	}
 	spec := fe.Containers[h.Container].Spec
-	if spec.Network == nil || spec.Network.Name != DefaultNetwork || spec.Network.Aliases[0] != c.ID() {
+	if spec.Network == nil || spec.Network.Name != DefaultNetwork || spec.Network.Aliases[0] != c.ID()+"-vulnerable" {
 		t.Fatalf("network: %+v", spec.Network)
 	}
 	if len(spec.SecurityOpt) != 1 || spec.SecurityOpt[0] != "no-new-privileges:true" {
@@ -197,8 +198,10 @@ func TestSidecarCommandReachesEngine(t *testing.T) {
 		Name:     "patched",
 		Sidecars: map[string]contract.SidecarOverride{"node2": {Image: "minio/minio:fixed"}},
 	}
-	exp := Exposure{Mode: ModeInternal, Network: DefaultNetwork}
-	names, err := r.startSidecars(context.Background(), c, st, exp)
+	if _, err := fe.NetworkEnsure(context.Background(), engine.NetworkSpec{Name: "scnet"}); err != nil {
+		t.Fatal(err)
+	}
+	names, err := r.startSidecars(context.Background(), c, st, "patched", "scnet")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +221,7 @@ func TestSidecarCommandReachesEngine(t *testing.T) {
 		t.Fatalf("sidecar override not applied: %s", sc.Spec.Image)
 	}
 	// and it joins the network under its bare name, so peers can resolve it
-	if sc.Spec.Network == nil || len(sc.Spec.Network.Aliases) != 1 || sc.Spec.Network.Aliases[0] != "node2" {
+	if sc.Spec.Network == nil || sc.Spec.Network.Name != "scnet" || len(sc.Spec.Network.Aliases) != 1 || sc.Spec.Network.Aliases[0] != "node2" {
 		t.Fatalf("sidecar alias: %+v", sc.Spec.Network)
 	}
 }
@@ -365,7 +368,7 @@ func TestRunningCarriesAllHostBindings(t *testing.T) {
 	name := contract.ContainerNamePrefix + "multi-vulnerable"
 	fe.Containers[name] = &enginetest.Container{
 		ID: "c1", Running: true, IP: "172.17.0.2",
-		Spec: engine.ContainerSpec{Name: name, Ports: []engine.PortBinding{
+		Spec: engine.ContainerSpec{Name: name, Labels: map[string]string{LabelManaged: "true"}, Ports: []engine.PortBinding{
 			{HostIP: "127.0.0.1", HostPort: 40001, ContainerPort: 8091, Protocol: "tcp"},
 			{HostIP: "127.0.0.1", HostPort: 40000, ContainerPort: 9999, Protocol: "tcp"},
 		}},

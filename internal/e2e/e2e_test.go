@@ -26,12 +26,32 @@ import (
 const serverSrc = `package main
 
 import (
+	"io"
 	"net/http"
 	"os"
 )
 
+// get fetches u and relays its body (the sidecar e2e uses it to look names up
+// from inside the container: FROM scratch has no nslookup).
+func get(w http.ResponseWriter, u string) {
+	resp, err := http.Get(u)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	io.Copy(w, resp.Body)
+}
+
 func main() {
 	mode := os.Getenv("MODE")
+	whoami := mode
+	if whoami == "" {
+		whoami = "vulnerable"
+	}
+	http.HandleFunc("/whoami", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("mode=" + whoami + "\n")) })
+	http.HandleFunc("/peer", func(w http.ResponseWriter, r *http.Request) { get(w, "http://db:8080/whoami") })
+	http.HandleFunc("/fetch", func(w http.ResponseWriter, r *http.Request) { get(w, r.URL.Query().Get("u")) })
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
 	http.HandleFunc("/.env", func(w http.ResponseWriter, r *http.Request) {
 		if mode == "patched" {
@@ -172,7 +192,9 @@ func endToEnd(t *testing.T, kind string) {
 	})
 
 	r := runner.New(eng)
-	t.Cleanup(func() { _, _ = r.StopAll(context.Background(), "") })
+	// Only ever remove what this test started: other vulnsuite containers on
+	// the daemon are not ours.
+	t.Cleanup(func() { _, _ = r.StopAll(context.Background(), c.ID()) })
 
 	// -- host exposure: verify from this process.
 	for _, state := range []string{"vulnerable", "patched"} {
@@ -199,7 +221,14 @@ func endToEnd(t *testing.T, kind string) {
 	}
 	t.Logf("internal: ip=%q ready=%v verify=%v detail=%s", h.IP, h.Ready, h.VerifyOK, strings.ReplaceAll(h.VerifyDetail, "\n", " | "))
 	rows, err := r.Running(ctx, runner.DefaultNetwork)
-	if err != nil || len(rows) != 1 || rows[0].ID != c.ID() {
+	// Other targets may be up on this daemon; ours must be listed exactly once.
+	var ours []runner.Target
+	for _, row := range rows {
+		if row.ID == c.ID() {
+			ours = append(ours, row)
+		}
+	}
+	if err != nil || len(ours) != 1 || ours[0].State != "vulnerable" {
 		t.Fatalf("ps: %v %+v", err, rows)
 	}
 	removed, err := r.StopAll(ctx, c.ID())
@@ -226,6 +255,7 @@ func endToEnd(t *testing.T, kind string) {
 			_ = eng.ImageRemove(context.Background(), oc.ImageTag(s), true)
 		}
 	})
+	t.Cleanup(func() { _, _ = r.StopAll(context.Background(), oc.ID()) })
 	for _, state := range []string{"vulnerable", "patched"} {
 		h, err := r.Run(ctx, oc, state, runner.Exposure{Mode: runner.ModeHost, Bind: "127.0.0.1"}, runner.Options{Verify: true, Build: builder.Options{Pull: false}})
 		if err != nil {
@@ -237,6 +267,9 @@ func endToEnd(t *testing.T, kind string) {
 		t.Logf("overlay %s ok: %s", state, h.VerifyDetail)
 		r.Stop(ctx, h)
 	}
+
+	// -- sidecars: name resolution in host mode, both states side by side.
+	sidecarPhase(ctx, t, eng, r, store, root, c)
 
 	// -- exec probe through the engine.
 	code, out, err := eng.ContainerExec(ctx, "no-such-container", "true", 5*time.Second)

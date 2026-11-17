@@ -192,7 +192,7 @@ vulnsuite build -t SEL... | -f FILE | <filter> | -all [-variants] [-j N] [-push 
 vulnsuite run [vulnerable|patched] -t SEL... | -f FILE | <filter> | -all [-variants] [-expose MODE] [-detach]
 vulnsuite ps                                        running targets (id, state, ip)
 vulnsuite targets [-file FILE] [-by auto|ip|alias|host]  scannable URLs, right port per template
-vulnsuite stop [-t SEL]... [-prune-net]             tear down
+vulnsuite stop [-t SEL]... [-prune-net]             tear down (targets, their sidecars and sidecar networks)
 vulnsuite images [-rm]                              locally built images
 vulnsuite update-templates [-ref REF] [-force]      fetch / update the community templates
 ```
@@ -301,6 +301,32 @@ many as fit and reports the rest.
 | `internal` (default) | the target joins the `vulnsuite-net` Docker network; nothing is published on the host | your scanner runs as a container (`docker run --network vulnsuite-net ...`) or your host routes to container IPs (Linux, OrbStack) |
 | `host` | the primary port is published on the host, by default on `127.0.0.1` (plus any `publish: true` ports); one host port per published port | the scanner is on the host or elsewhere on the network |
 | `macvlan` | the target gets its own IP on the LAN via `-parent eth0` | the target must look like a separate device |
+
+**Names on the network.** A target is reachable on `vulnsuite-net` under a
+per-state alias, `<id>-<state>` (e.g. `exposed-dotenv-file-vulnerable`), and
+its container is `vulnsuite-<id>-<state>`. Both states of a template can run at
+once and each name resolves to exactly one of them; `vulnsuite targets -by
+alias` prints these aliases.
+
+**Sidecars** (a database, a cache, a second cluster node) belong to one target
+state. Each runs as `vulnsuite-<id>-<state>-<sidecar>` on a private network,
+`vulnsuite-<id>-<state>-net`, shared only with its target, where it resolves
+under its template name (e.g. `db`) in every exposure mode. Sidecars are not
+on `vulnsuite-net` and are not scan targets. The private network follows
+`-no-egress` in `internal` mode, is a plain bridge in `host` mode (the
+target's ports are published from it), and has no egress in `macvlan` mode so
+the target's traffic keeps leaving through its LAN address. `vulnsuite stop`
+removes the sidecars and their network along with the target.
+
+`vulnsuite ps`, `targets` and `stop` find containers by their
+`dev.vulnsuite.*` labels: `stop -t foo` stops exactly template `foo` (never
+`foo-bar`), and containers vulnsuite did not start are left alone.
+
+**Ctrl-C.** Interrupting `run` while targets are starting stops the batch,
+removes what it had started and exits non-zero (`interrupted`). Interrupting a
+held batch tears it down; a removal that fails is reported and fails the
+command. A second Ctrl-C during teardown exits at once (finish with
+`vulnsuite stop`).
 
 In `host` mode, `-bind <address>` chooses the address the port is published on
 (default `127.0.0.1`). Pass the Docker daemon host's reachable address when the

@@ -152,7 +152,11 @@ type Engine interface {
 	// NetworkEnsure creates the network if it does not exist and returns its id.
 	NetworkEnsure(ctx context.Context, spec NetworkSpec) (string, error)
 	NetworkExists(ctx context.Context, name string) (bool, error)
+	// NetworkRemove deletes a network; a missing network is not an error.
 	NetworkRemove(ctx context.Context, name string) error
+	// NetworkConnect attaches an existing (created or running) container to a
+	// further network, resolvable there under aliases.
+	NetworkConnect(ctx context.Context, network, container string, aliases []string) error
 }
 
 // CappedBuffer is an io.Writer that keeps the first Max bytes written and
