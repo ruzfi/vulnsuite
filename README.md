@@ -129,9 +129,19 @@ needed only for templates with a `source` base or a `patch`.
 ## Templates
 
 Community templates live in [ruzfi/vulnsuite-templates](https://github.com/ruzfi/vulnsuite-templates).
-`vulnsuite update-templates` fetches them into `~/vulnsuite-templates`; the
-templates directory is otherwise `-templates DIR`, `$VULNSUITE_TEMPLATES`, or
-the repository you are standing in.
+The templates directory is `-templates DIR`, `$VULNSUITE_TEMPLATES`, the
+templates repository you are standing in, or `~/vulnsuite-templates`.
+`vulnsuite update-templates` fetches the templates into that same directory:
+
+- a git checkout is pulled (`--ff-only`); `-ref BRANCH|TAG|COMMIT` fetches the
+  ref from `origin` and checks it out detached (refused while tracked files have
+  uncommitted changes). A checkout is never replaced, so the update fails if
+  `git` is not on `PATH`;
+- anything else is replaced by the GitHub archive of `-ref` (default `main`),
+  but only when the directory is missing, empty, or was installed by
+  `update-templates` (it has a `.vulnsuite-templates-version` marker). Any other
+  non-empty directory is refused unless you pass `-force`. The old directory is
+  removed only once the new one is in place.
 
 A template:
 
@@ -184,7 +194,7 @@ vulnsuite ps                                        running targets (id, state, 
 vulnsuite targets [-file FILE] [-by auto|ip|alias|host]  scannable URLs, right port per template
 vulnsuite stop [-t SEL]... [-prune-net]             tear down
 vulnsuite images [-rm]                              locally built images
-vulnsuite update-templates                          fetch / update the community templates
+vulnsuite update-templates [-ref REF] [-force]      fetch / update the community templates
 ```
 
 `-json` on any command gives machine-readable output (progress goes to stderr).
