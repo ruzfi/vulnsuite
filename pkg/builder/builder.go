@@ -61,7 +61,9 @@ type Options struct {
 	NoCache bool
 	// Force rebuilds even when the content-addressed tag already exists.
 	Force bool
-	// Platform, e.g. linux/amd64 (empty = engine default).
+	// Platform, e.g. linux/amd64 (empty = engine default). It is used for
+	// pulls and builds, and an existing image is reused only when it is for
+	// this platform.
 	Platform string
 	// Output receives build/pull progress (nil = discard).
 	Output io.Writer
@@ -95,15 +97,15 @@ func (b *Builder) Resolve(ctx context.Context, c *contract.Contract, state strin
 			return nil, fmt.Errorf("%s/%s: cannot resolve an image", c.ID(), state)
 		}
 		res.Ref = ref
-		exists, err := b.Engine.ImageExists(ctx, ref)
+		exists, err := b.Engine.ImageExists(ctx, ref, opts.Platform)
 		if err != nil {
 			return nil, err
 		}
 		if !exists {
 			if !opts.Pull {
-				return nil, fmt.Errorf("%s/%s: image %s is not present and pulling is disabled", c.ID(), state, ref)
+				return nil, fmt.Errorf("%s/%s: image %s%s is not present and pulling is disabled", c.ID(), state, ref, forPlatform(opts.Platform))
 			}
-			if err := b.Engine.ImagePull(ctx, ref, opts.Output); err != nil {
+			if err := b.Engine.ImagePull(ctx, ref, opts.Platform, opts.Output); err != nil {
 				return nil, err
 			}
 			res.Pulled = true
@@ -114,7 +116,10 @@ func (b *Builder) Resolve(ctx context.Context, c *contract.Contract, state strin
 	tag := c.ImageTag(state)
 	res.Ref = tag
 	if !opts.Force {
-		exists, err := b.Engine.ImageExists(ctx, tag)
+		// The content hash does not cover the platform: reuse the tag only
+		// when it was built for the platform wanted now (the host's when none
+		// is set), so an emulated build is not reused natively or vice versa.
+		exists, err := b.Engine.ImageExists(ctx, tag, b.reusePlatform(ctx, opts.Platform))
 		if err != nil {
 			return nil, err
 		}
@@ -138,6 +143,31 @@ func (b *Builder) Resolve(ctx context.Context, c *contract.Contract, state strin
 	}
 	res.Built = true
 	return res, nil
+}
+
+// reusePlatform is the platform an existing built image must match: the
+// requested one, else the daemon's own (empty when it cannot be determined,
+// which accepts any).
+func (b *Builder) reusePlatform(ctx context.Context, platform string) string {
+	if platform != "" {
+		return platform
+	}
+	host, err := b.Engine.Info(ctx)
+	if err != nil || host.Arch == "" {
+		return ""
+	}
+	hostOS := host.OS
+	if hostOS == "" {
+		hostOS = "linux"
+	}
+	return hostOS + "/" + host.Arch
+}
+
+func forPlatform(platform string) string {
+	if platform == "" {
+		return ""
+	}
+	return " for " + platform
 }
 
 func (b *Builder) labels(c *contract.Contract, st *contract.State, kind string) map[string]string {
@@ -173,12 +203,12 @@ func (b *Builder) buildOverlay(ctx context.Context, c *contract.Contract, st *co
 		return errors.New("overlay needs an image base")
 	}
 	if opts.Pull {
-		exists, err := b.Engine.ImageExists(ctx, baseRef)
+		exists, err := b.Engine.ImageExists(ctx, baseRef, opts.Platform)
 		if err != nil {
 			return err
 		}
 		if !exists {
-			if err := b.Engine.ImagePull(ctx, baseRef, opts.Output); err != nil {
+			if err := b.Engine.ImagePull(ctx, baseRef, opts.Platform, opts.Output); err != nil {
 				return err
 			}
 		}
@@ -191,8 +221,8 @@ func (b *Builder) buildOverlay(ctx context.Context, c *contract.Contract, st *co
 			return fmt.Errorf("overlay %s: %w", o.Src, err)
 		}
 		local := fmt.Sprintf("overlay_%d_%s", i, filepath.Base(o.Dest))
-		mc.add(local, data, 0o644)
-		entries = append(entries, overlayEntry{local: local, dest: o.Dest, mode: o.Mode})
+		mc.add(local, data, modeOf(o.Mode))
+		entries = append(entries, overlayEntry{local: local, dest: o.Dest})
 	}
 	mc.add("Dockerfile", []byte(overlayDockerfile(baseRef, entries, st.Environment)), 0o644)
 	return b.build(ctx, c, st, contract.BuildKindOverlay, tag, "Dockerfile", mc.tar(), opts)
@@ -468,6 +498,9 @@ func copyTree(src, dst string) error {
 type Job struct {
 	Contract *contract.Contract
 	State    string
+	// Platform overrides Options.Platform for this job (e.g. the emulation
+	// platform its target's requires.arch calls for); empty = Options.Platform.
+	Platform string
 }
 
 // Outcome pairs a job with its result.
@@ -502,6 +535,9 @@ func (b *Builder) ResolveAll(ctx context.Context, jobs []Job, parallel int, opts
 			var log strings.Builder
 			o := opts
 			o.Output = &log
+			if j.Platform != "" {
+				o.Platform = j.Platform
+			}
 			res, err := b.Resolve(ctx, j.Contract, j.State, o)
 			out := Outcome{Job: j, Resolved: res, Err: err, Log: log.String()}
 			results[i] = out

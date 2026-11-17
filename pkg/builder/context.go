@@ -88,10 +88,9 @@ func overlayDockerfile(baseRef string, overlays []overlayEntry, env map[string]s
 	var b strings.Builder
 	fmt.Fprintf(&b, "FROM %s\n", baseRef)
 	for _, o := range overlays {
+		// The file's mode is set in the build-context tar header and COPY
+		// keeps it, so no RUN chmod (which fails on non-root or shell-less bases).
 		fmt.Fprintf(&b, "COPY %s %s\n", o.local, o.dest)
-		if o.mode != "" {
-			fmt.Fprintf(&b, "RUN chmod %s %s\n", o.mode, o.dest)
-		}
 	}
 	keys := make([]string, 0, len(env))
 	for k := range env {
@@ -107,7 +106,6 @@ func overlayDockerfile(baseRef string, overlays []overlayEntry, env map[string]s
 type overlayEntry struct {
 	local string // file name inside the build context
 	dest  string // absolute path inside the image
-	mode  string
 }
 
 func dockerfileQuote(v string) string {

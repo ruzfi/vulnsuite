@@ -76,19 +76,41 @@ func (e *Engine) Info(ctx context.Context) (engine.HostInfo, error) {
 
 // -- images -------------------------------------------------------------------
 
-func (e *Engine) ImageExists(ctx context.Context, ref string) (bool, error) {
-	_, err := e.cli.ImageInspect(ctx, ref)
-	if err == nil {
+func (e *Engine) ImageExists(ctx context.Context, ref, platform string) (bool, error) {
+	img, err := e.cli.ImageInspect(ctx, ref)
+	if err != nil {
+		if cerrdefs.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if engine.PlatformMatches(platform, img.Os, img.Architecture, img.Variant) {
 		return true, nil
 	}
-	if cerrdefs.IsNotFound(err) {
+	// A multi-platform store (containerd) reports the host's variant by
+	// default; ask for the wanted one (API 1.49+). An older daemon, or one
+	// without that platform's content, means it has to be pulled.
+	p, err := parsePlatform(platform)
+	if err != nil {
+		return false, err
+	}
+	img, err = e.cli.ImageInspect(ctx, ref, client.ImageInspectWithPlatform(&p))
+	if err != nil {
 		return false, nil
 	}
-	return false, err
+	return engine.PlatformMatches(platform, img.Os, img.Architecture, img.Variant), nil
 }
 
-func (e *Engine) ImagePull(ctx context.Context, ref string, out io.Writer) error {
-	resp, err := e.cli.ImagePull(ctx, ref, client.ImagePullOptions{RegistryAuth: registryauth.For(ref)})
+func (e *Engine) ImagePull(ctx context.Context, ref, platform string, out io.Writer) error {
+	po := client.ImagePullOptions{RegistryAuth: registryauth.For(ref)}
+	if platform != "" {
+		p, err := parsePlatform(platform)
+		if err != nil {
+			return err
+		}
+		po.Platforms = []ocispec.Platform{p}
+	}
+	resp, err := e.cli.ImagePull(ctx, ref, po)
 	if err != nil {
 		return fmt.Errorf("pull %s: %w", ref, err)
 	}
@@ -236,7 +258,15 @@ func (e *Engine) ContainerCreate(ctx context.Context, spec engine.ContainerSpec)
 		}
 		nc = &network.NetworkingConfig{EndpointsConfig: map[string]*network.EndpointSettings{spec.Network.Name: ep}}
 	}
-	res, err := e.cli.ContainerCreate(ctx, client.ContainerCreateOptions{Name: spec.Name, Config: cfg, HostConfig: hc, NetworkingConfig: nc})
+	co := client.ContainerCreateOptions{Name: spec.Name, Config: cfg, HostConfig: hc, NetworkingConfig: nc}
+	if spec.Platform != "" {
+		p, err := parsePlatform(spec.Platform)
+		if err != nil {
+			return "", err
+		}
+		co.Platform = &p
+	}
+	res, err := e.cli.ContainerCreate(ctx, co)
 	if err != nil {
 		return "", err
 	}

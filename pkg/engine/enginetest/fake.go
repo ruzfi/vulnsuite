@@ -21,8 +21,11 @@ type Build struct {
 	BuildArgs  map[string]string
 	Labels     map[string]string
 	NoCache    bool
+	Platform   string
 	// Files holds the tar context, path -> content.
 	Files map[string]string
+	// Modes holds the tar context's file modes, path -> mode.
+	Modes map[string]int64
 }
 
 // Container records a created container.
@@ -37,15 +40,18 @@ type Container struct {
 
 // Fake is an in-memory engine.
 type Fake struct {
-	mu         sync.Mutex
-	Images     map[string]bool
-	Builds     []Build
-	Pulls      []string
-	Pushes     []string
-	Tagged     [][2]string
-	Containers map[string]*Container
-	Networks   map[string]engine.NetworkSpec
-	Execs      []string
+	mu     sync.Mutex
+	Images map[string]bool
+	// ImagePlatforms records the platform an image was pulled or built for
+	// ("" or absent = engine default, which satisfies any platform).
+	ImagePlatforms map[string]string
+	Builds         []Build
+	Pulls          []string
+	Pushes         []string
+	Tagged         [][2]string
+	Containers     map[string]*Container
+	Networks       map[string]engine.NetworkSpec
+	Execs          []string
 	// ExecFn answers ContainerExec when set.
 	ExecFn func(container, command string) (int, string, error)
 	// LogsFn answers ContainerLogs when set (receives the container spec).
@@ -76,7 +82,7 @@ func (f *Fake) Host() string { return f.HostAddr }
 
 // New returns an empty fake.
 func New() *Fake {
-	return &Fake{Images: map[string]bool{}, Containers: map[string]*Container{}, Networks: map[string]engine.NetworkSpec{},
+	return &Fake{Images: map[string]bool{}, ImagePlatforms: map[string]string{}, Containers: map[string]*Container{}, Networks: map[string]engine.NetworkSpec{},
 		HostInfo: engine.HostInfo{OS: "linux", Arch: "amd64"}}
 }
 
@@ -84,13 +90,34 @@ func (f *Fake) Ping(context.Context) (string, error) { return "fake", nil }
 
 func (f *Fake) Info(context.Context) (engine.HostInfo, error) { return f.HostInfo, nil }
 
-func (f *Fake) ImageExists(_ context.Context, ref string) (bool, error) {
+func (f *Fake) ImageExists(_ context.Context, ref, platform string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.Images[ref], nil
+	return f.Images[ref] && f.platformOK(ref, platform), nil
 }
 
-func (f *Fake) ImagePull(_ context.Context, ref string, out io.Writer) error {
+// platformOK reports whether the image ref satisfies platform.
+func (f *Fake) platformOK(ref, platform string) bool {
+	have := f.ImagePlatforms[ref]
+	if platform == "" || have == "" {
+		return true
+	}
+	hOS, hArch, hVariant := engine.SplitPlatform(have)
+	return engine.PlatformMatches(platform, hOS, hArch, hVariant)
+}
+
+func (f *Fake) setPlatform(ref, platform string) {
+	if f.ImagePlatforms == nil {
+		f.ImagePlatforms = map[string]string{}
+	}
+	if platform == "" {
+		delete(f.ImagePlatforms, ref)
+	} else {
+		f.ImagePlatforms[ref] = platform
+	}
+}
+
+func (f *Fake) ImagePull(_ context.Context, ref, platform string, out io.Writer) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.FailPull {
@@ -98,6 +125,7 @@ func (f *Fake) ImagePull(_ context.Context, ref string, out io.Writer) error {
 	}
 	f.Pulls = append(f.Pulls, ref)
 	f.Images[ref] = true
+	f.setPlatform(ref, platform)
 	if out != nil {
 		fmt.Fprintf(out, "pulled %s\n", ref)
 	}
@@ -106,6 +134,7 @@ func (f *Fake) ImagePull(_ context.Context, ref string, out io.Writer) error {
 
 func (f *Fake) ImageBuild(_ context.Context, opts engine.BuildOptions, out io.Writer) error {
 	files := map[string]string{}
+	modes := map[string]int64{}
 	tr := tar.NewReader(opts.Context)
 	for {
 		h, err := tr.Next()
@@ -114,10 +143,11 @@ func (f *Fake) ImageBuild(_ context.Context, opts engine.BuildOptions, out io.Wr
 		}
 		b, _ := io.ReadAll(tr)
 		files[h.Name] = string(b)
+		modes[h.Name] = h.Mode
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.Builds = append(f.Builds, Build{Tags: opts.Tags, Dockerfile: opts.Dockerfile, BuildArgs: opts.BuildArgs, Labels: opts.Labels, NoCache: opts.NoCache, Files: files})
+	f.Builds = append(f.Builds, Build{Tags: opts.Tags, Dockerfile: opts.Dockerfile, BuildArgs: opts.BuildArgs, Labels: opts.Labels, NoCache: opts.NoCache, Platform: opts.Platform, Files: files, Modes: modes})
 	if f.FailBuild != "" {
 		if out != nil {
 			fmt.Fprintln(out, "Step 1/1 : FROM x")
@@ -126,6 +156,7 @@ func (f *Fake) ImageBuild(_ context.Context, opts engine.BuildOptions, out io.Wr
 	}
 	for _, t := range opts.Tags {
 		f.Images[t] = true
+		f.setPlatform(t, opts.Platform)
 	}
 	if out != nil {
 		fmt.Fprintf(out, "Successfully tagged %s\n", strings.Join(opts.Tags, ","))
@@ -140,6 +171,7 @@ func (f *Fake) ImageTag(_ context.Context, source, target string) error {
 		return fmt.Errorf("no such image %s", source)
 	}
 	f.Images[target] = true
+	f.setPlatform(target, f.ImagePlatforms[source])
 	f.Tagged = append(f.Tagged, [2]string{source, target})
 	return nil
 }
@@ -182,6 +214,9 @@ func (f *Fake) ContainerCreate(ctx context.Context, spec engine.ContainerSpec) (
 	defer f.mu.Unlock()
 	if !f.Images[spec.Image] {
 		return "", fmt.Errorf("no such image: %s", spec.Image)
+	}
+	if !f.platformOK(spec.Image, spec.Platform) {
+		return "", fmt.Errorf("image %s was found but does not match the specified platform %s", spec.Image, spec.Platform)
 	}
 	if _, dup := f.Containers[spec.Name]; dup {
 		return "", fmt.Errorf("conflict: name %s already in use", spec.Name)

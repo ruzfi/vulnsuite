@@ -201,7 +201,7 @@ func TestSidecarCommandReachesEngine(t *testing.T) {
 	if _, err := fe.NetworkEnsure(context.Background(), engine.NetworkSpec{Name: "scnet"}); err != nil {
 		t.Fatal(err)
 	}
-	names, err := r.startSidecars(context.Background(), c, st, "patched", "scnet")
+	names, err := r.startSidecars(context.Background(), c, st, "patched", "scnet", "")
 	if err != nil {
 		t.Fatal(err)
 	}

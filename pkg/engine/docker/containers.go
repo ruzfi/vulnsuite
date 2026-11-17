@@ -106,6 +106,9 @@ func (c *Client) ContainerCreate(ctx context.Context, spec engine.ContainerSpec)
 	if spec.Name != "" {
 		q.Set("name", spec.Name)
 	}
+	if spec.Platform != "" {
+		q.Set("platform", spec.Platform)
+	}
 	var out struct {
 		ID       string   `json:"Id"`
 		Warnings []string `json:"Warnings"`

@@ -398,6 +398,9 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 		SecurityOpt: []string{"no-new-privileges:true"},
 		CapAdd:      c.Service.CapAdd,
 		CapDrop:     c.Service.CapDrop,
+		// Run the platform the image was resolved for (emulation), not the
+		// daemon's default variant of a multi-platform image.
+		Platform: opts.Build.Platform,
 	}
 	if scNet != "" {
 		spec.Labels[LabelSidecarNetwork] = scNet
@@ -512,7 +515,7 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 		}
 	}
 
-	sidecars, err := r.startSidecars(ctx, c, st, state, scNet)
+	sidecars, err := r.startSidecars(ctx, c, st, state, scNet, opts.Build.Platform)
 	h.Sidecars = sidecars
 	if err != nil {
 		return fail(err)
@@ -652,16 +655,17 @@ func (r *Runner) cleanup(ctx context.Context, container string, sidecars []strin
 }
 
 // startSidecars starts the state's sidecars on the private network scNet,
-// each resolvable there under its template name. It returns the name of every
-// container it created, including one whose start then failed, so the caller
-// can remove them all.
-func (r *Runner) startSidecars(ctx context.Context, c *contract.Contract, st *contract.State, state, scNet string) ([]string, error) {
+// each resolvable there under its template name. They run on the target's
+// platform: a stack that needs emulation is emulated as a whole. It returns
+// the name of every container it created, including one whose start then
+// failed, so the caller can remove them all.
+func (r *Runner) startSidecars(ctx context.Context, c *contract.Contract, st *contract.State, state, scNet, platform string) ([]string, error) {
 	var names []string
 	for _, sc := range c.Service.Sidecars {
 		name := SidecarContainerName(c.ID(), state, sc.Name)
 		ref := st.SidecarRef(sc)
-		if exists, _ := r.Engine.ImageExists(ctx, ref); !exists {
-			if err := r.Engine.ImagePull(ctx, ref, nil); err != nil {
+		if exists, _ := r.Engine.ImageExists(ctx, ref, platform); !exists {
+			if err := r.Engine.ImagePull(ctx, ref, platform, nil); err != nil {
 				return names, fmt.Errorf("sidecar %s: %w", sc.Name, err)
 			}
 		}
@@ -673,7 +677,8 @@ func (r *Runner) startSidecars(ctx context.Context, c *contract.Contract, st *co
 				builder.LabelState:  state,
 				LabelSidecarNetwork: scNet,
 			},
-			Network: &engine.NetworkAttachment{Name: scNet, Aliases: []string{sc.Name}},
+			Network:  &engine.NetworkAttachment{Name: scNet, Aliases: []string{sc.Name}},
+			Platform: platform,
 		}
 		id, err := r.Engine.ContainerCreate(ctx, spec)
 		if err != nil {
