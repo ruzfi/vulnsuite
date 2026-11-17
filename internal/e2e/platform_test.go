@@ -40,6 +40,29 @@ func daemon(t *testing.T, ctx context.Context, kind string) engine.Engine {
 	return eng
 }
 
+// requireEmulation skips the test unless the daemon can execute image for
+// platform: a daemon without qemu/binfmt registered for that architecture
+// (e.g. a stock linux/amd64 CI runner) pulls it fine but the container exits
+// at once with "exec format error".
+func requireEmulation(t *testing.T, ctx context.Context, eng engine.Engine, image, platform string) {
+	t.Helper()
+	if err := eng.ImagePull(ctx, image, platform, io.Discard); err != nil {
+		t.Fatalf("pull %s (%s): %v", image, platform, err)
+	}
+	name := fmt.Sprintf("vulnsuite-e2e-emucheck-%d", time.Now().UnixNano())
+	if _, err := eng.ContainerCreate(ctx, engine.ContainerSpec{Name: name, Image: image, Cmd: []string{"true"}, Platform: platform}); err != nil {
+		t.Fatalf("create %s: %v", name, err)
+	}
+	defer func() { _ = eng.ContainerRemove(context.Background(), name) }()
+	if err := eng.ContainerStart(ctx, name); err != nil {
+		t.Skipf("daemon cannot run %s images (no emulation registered?): %v", platform, err)
+	}
+	if code, err := eng.ContainerWait(ctx, name); err != nil || code != 0 {
+		logs, _ := eng.ContainerLogs(ctx, name, 5)
+		t.Skipf("daemon cannot run %s images (no emulation registered?): exit %d %v %s", platform, code, err, strings.TrimSpace(logs))
+	}
+}
+
 func runHost(t *testing.T, ctx context.Context, r *runner.Runner, c *contract.Contract, opts runner.Options) *runner.Handle {
 	t.Helper()
 	h, err := r.Run(ctx, c, "vulnerable", runner.Exposure{Mode: runner.ModeHost, Bind: "127.0.0.1"}, opts)
@@ -74,6 +97,10 @@ func TestEmulatedImageBase(t *testing.T) {
 				t.Skipf("emulation needs a linux daemon, have %s", host.OS)
 			}
 			arch, foreignOnly, uname := foreignArch(host.Arch)
+			if present, _ := eng.ImageExists(ctx, foreignOnly, ""); !present {
+				t.Cleanup(func() { _ = eng.ImageRemove(context.Background(), foreignOnly, true) })
+			}
+			requireEmulation(t, ctx, eng, foreignOnly, "linux/"+arch)
 			// A foreign-only image (failed to pull before) and a multi-arch one
 			// (ran natively before, although emulation was announced).
 			for i, image := range []string{foreignOnly, "busybox:1.36.1"} {
