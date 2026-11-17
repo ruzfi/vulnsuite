@@ -339,16 +339,16 @@ func TestHostModeMultiPort(t *testing.T) {
 	}
 }
 
-func TestAllocateHostPorts(t *testing.T) {
+func TestPinnedHostPorts(t *testing.T) {
 	pubs := []contract.Port{{Container: 9999}, {Container: 8091}}
-	// both unmapped -> two distinct free host ports
-	alloc, err := allocateHostPorts(Exposure{Bind: "127.0.0.1"}, pubs)
-	if err != nil || alloc[9999] == 0 || alloc[8091] == 0 || alloc[9999] == alloc[8091] {
-		t.Fatalf("auto alloc: %v %+v", err, alloc)
+	// unpinned ports are left to the daemon (host port 0)
+	alloc, err := pinnedHostPorts(Exposure{Bind: "127.0.0.1"}, pubs, true)
+	if err != nil || len(alloc) != 0 {
+		t.Fatalf("unpinned: %v %+v", err, alloc)
 	}
 	// the same host port for two container ports is rejected before create
 	p := freeTestPort(t)
-	if _, err := allocateHostPorts(Exposure{Bind: "127.0.0.1", HostPort: p, HostPortMap: map[int]int{8091: p}}, pubs); err == nil {
+	if _, err := pinnedHostPorts(Exposure{Bind: "127.0.0.1", HostPort: p, HostPortMap: map[int]int{8091: p}}, pubs, true); err == nil {
 		t.Fatal("duplicate host port must fail")
 	}
 	// an occupied host port is rejected
@@ -358,8 +358,13 @@ func TestAllocateHostPorts(t *testing.T) {
 	}
 	defer l.Close()
 	used := l.Addr().(*net.TCPAddr).Port
-	if _, err := allocateHostPorts(Exposure{Bind: "127.0.0.1", HostPort: used}, pubs); err == nil {
+	if _, err := pinnedHostPorts(Exposure{Bind: "127.0.0.1", HostPort: used}, pubs, true); err == nil {
 		t.Fatal("occupied host port must fail")
+	}
+	// a remote daemon's ports are not on this machine: no local check
+	alloc, err = pinnedHostPorts(Exposure{Bind: "127.0.0.1", HostPort: used}, pubs, false)
+	if err != nil || alloc[9999] != used {
+		t.Fatalf("remote pin: %v %+v", err, alloc)
 	}
 }
 
@@ -384,5 +389,37 @@ func TestRunningCarriesAllHostBindings(t *testing.T) {
 	}
 	if rows[0].HostPort != 40001 {
 		t.Fatalf("legacy host port should mirror the first binding: %+v", rows[0])
+	}
+}
+
+// Unpinned host ports are assigned by the daemon and read back from inspect; a
+// daemon that reports none fails the run cleanly instead of handing out port 0.
+func TestHostModeDaemonAssignedPorts(t *testing.T) {
+	fe := enginetest.New()
+	r := New(fe)
+	r.Reach = func(string, int, time.Duration) probes.Reach { return probes.Unreachable }
+	c := load(t, "redis-unauthenticated-access")
+	exp := Exposure{Mode: ModeHost, Bind: "127.0.0.1"}
+	h, err := r.Run(context.Background(), c, "vulnerable", exp, Options{ReadyTimeout: time.Second, Build: builder.Options{Pull: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec := fe.Containers[h.Container].Spec; spec.Ports[0].HostPort != h.EndpointPort {
+		t.Fatalf("handle %d does not match the daemon's binding %+v", h.EndpointPort, spec.Ports)
+	}
+	if h.EndpointPort == 0 || h.PublishedPorts[0].HostPort != h.EndpointPort {
+		t.Fatalf("endpoint %d, published %+v", h.EndpointPort, h.PublishedPorts)
+	}
+	if _, err := r.StopAll(context.Background(), c.ID()); err != nil {
+		t.Fatal(err)
+	}
+
+	fe.NoAssignPorts = true
+	if _, err := r.Run(context.Background(), c, "vulnerable", exp, Options{ReadyTimeout: time.Second, Build: builder.Options{Pull: true}}); err == nil ||
+		!strings.Contains(err.Error(), "no host port") {
+		t.Fatalf("want a no-host-port error, got %v", err)
+	}
+	if len(fe.Containers) != 0 {
+		t.Fatalf("a failed run must clean up: %v", fe.Containers)
 	}
 }

@@ -467,6 +467,13 @@ func (e *Engine) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (st
 	}
 	res, err := e.cli.NetworkCreate(ctx, spec.Name, opts)
 	if err != nil {
+		// A concurrent run created it between our inspect and create: use
+		// that one.
+		if cerrdefs.IsConflict(err) {
+			if again, ierr := e.cli.NetworkInspect(ctx, spec.Name, client.NetworkInspectOptions{}); ierr == nil {
+				return again.Network.ID, nil
+			}
+		}
 		return "", err
 	}
 	return res.ID, nil

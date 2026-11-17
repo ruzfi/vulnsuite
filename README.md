@@ -392,7 +392,8 @@ A template may publish more than one port: the primary is always published, and
 any port marked `publish: true` in the contract is published alongside it and
 added to the scanner target lists. `-host-port` pins the primary's host port;
 `-host-port-map container=host` pins an additional one (repeatable). Unpinned
-published ports get free host ports, all reported by `ps`, `targets` and
+published ports get a free host port assigned by the Docker daemon (on its own
+machine, so this works with a remote daemon too), all reported by `ps`, `targets` and
 `-targets-file`:
 
 ```bash

@@ -461,12 +461,16 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 		}
 	case ModeHost:
 		pubs := c.Service.HostPublishPorts()
-		alloc, err := allocateHostPorts(exp, pubs)
+		// Pinned host ports are checked here; every other port is published
+		// on host port 0, so the daemon picks a free one atomically (on its
+		// own machine, which is the right one for a remote daemon too). They
+		// are read back from inspect once the container has started.
+		alloc, err := pinnedHostPorts(exp, pubs, !h.DaemonRemote)
 		if err != nil {
 			return nil, err
 		}
 		for i, pp := range pubs {
-			hp := alloc[pp.Container]
+			hp := alloc[pp.Container] // 0 = assigned by the daemon
 			spec.Ports = append(spec.Ports, engine.PortBinding{HostIP: exp.Bind, HostPort: hp, ContainerPort: pp.Container, Protocol: "tcp"})
 			h.PublishedPorts = append(h.PublishedPorts, PublishedPort{ContainerPort: pp.Container, HostIP: exp.Bind, HostPort: hp, Scheme: pp.Scheme()})
 			if i == 0 {
@@ -554,10 +558,19 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 
 	// Discover the address a probe from this host can use: the one on the
 	// exposure network, never the private sidecar network.
-	if det, err := r.Engine.ContainerInspect(ctx, name); err == nil {
+	det, err := r.Engine.ContainerInspect(ctx, name)
+	if err == nil {
 		h.IP = pickIP(det.IPs, primaryNet, scNet)
 		if exp.Mode == ModeMacvlan && exp.IP == "" && h.IP != "" {
 			h.EndpointHost = h.IP
+		}
+	}
+	if exp.Mode == ModeHost {
+		if err != nil {
+			return fail(fmt.Errorf("inspect %s for its host ports: %w", name, err))
+		}
+		if err := assignedHostPorts(h, det); err != nil {
+			return fail(err)
 		}
 	}
 
@@ -1193,28 +1206,15 @@ func containerPortOf(portProto string) int {
 	return n
 }
 
-func freePort(bind string) (int, error) {
-	host := bind
-	if host == "0.0.0.0" || host == "" {
-		host = "127.0.0.1"
-	}
-	l, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
-	if err != nil {
-		return 0, err
-	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port, nil
-}
-
-// allocateHostPorts resolves the host port for each published container port in
-// host mode. Explicit ports (-host-port for the primary, -host-port-map for the
-// rest) are checked for duplicates and availability; the remaining ports get
-// distinct free host ports. Returns container port -> host port. All checks run
-// before any container is created, so a clash fails cleanly.
-func allocateHostPorts(exp Exposure, pubs []contract.Port) (map[int]int, error) {
+// pinnedHostPorts resolves the explicitly pinned host ports in host mode
+// (-host-port for the primary, -host-port-map for the rest), checking them for
+// duplicates and, when the daemon is local (checkFree), that nothing listens on
+// them yet, so a clash fails before any container is created. Returns
+// container port -> host port; a port that is not pinned is absent, and is
+// published on host port 0 for the daemon to assign.
+func pinnedHostPorts(exp Exposure, pubs []contract.Port, checkFree bool) (map[int]int, error) {
 	out := make(map[int]int, len(pubs))
 	used := map[int]bool{}
-	var auto []int
 	for i, pp := range pubs {
 		want := 0
 		if i == 0 {
@@ -1224,41 +1224,41 @@ func allocateHostPorts(exp Exposure, pubs []contract.Port) (map[int]int, error) 
 			want = m
 		}
 		if want == 0 {
-			auto = append(auto, pp.Container)
 			continue
 		}
 		if used[want] {
 			return nil, fmt.Errorf("host port %d is requested for more than one container port", want)
 		}
-		if err := assertPortFree(exp.Bind, want); err != nil {
-			return nil, fmt.Errorf("cannot publish container port %d: %w", pp.Container, err)
+		if checkFree {
+			if err := assertPortFree(exp.Bind, want); err != nil {
+				return nil, fmt.Errorf("cannot publish container port %d: %w", pp.Container, err)
+			}
 		}
 		used[want] = true
 		out[pp.Container] = want
 	}
-	// Grab distinct free host ports for the rest, holding each listener open so
-	// the OS does not hand out the same port twice, then release them all.
-	host := exp.Bind
-	if host == "0.0.0.0" || host == "" {
-		host = "127.0.0.1"
-	}
-	var held []net.Listener
-	defer func() {
-		for _, l := range held {
-			l.Close()
-		}
-	}()
-	for _, cp := range auto {
-		l, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
-		if err != nil {
-			return nil, err
-		}
-		held = append(held, l)
-		p := l.Addr().(*net.TCPAddr).Port
-		used[p] = true
-		out[cp] = p
-	}
 	return out, nil
+}
+
+// assignedHostPorts fills in the host port of every published port from the
+// started container's inspect data (the daemon assigned the unpinned ones),
+// and the endpoint port from the primary.
+func assignedHostPorts(h *Handle, det *engine.ContainerDetail) error {
+	for i := range h.PublishedPorts {
+		p := &h.PublishedPorts[i]
+		b, ok := det.Ports[fmt.Sprintf("%d/tcp", p.ContainerPort)]
+		if !ok || b.Port == 0 {
+			if p.HostPort == 0 {
+				return fmt.Errorf("the daemon reported no host port for container port %d of %s", p.ContainerPort, h.Container)
+			}
+			continue // pinned: keep what was asked for
+		}
+		p.HostPort = b.Port
+		if i == 0 {
+			h.EndpointPort = b.Port
+		}
+	}
+	return nil
 }
 
 func assertPortFree(bind string, port int) error {
