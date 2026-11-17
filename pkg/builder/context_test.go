@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -183,9 +184,21 @@ func TestDockerignorePatterns(t *testing.T) {
 		{"*\n!keep", "keep", false},
 		{"*\n!keep", "other", true},
 		{"!keep\n*", "keep", true}, // the last matching pattern wins
-		{"x\\*y", "x*y", true},
-		{"x\\*y", "xay", false},
 		{".", "anything", true},
+	}
+	if runtime.GOOS != "windows" {
+		// "\\" escapes only off Windows; there it is a path separator, as in Docker.
+		cases = append(cases, []struct {
+			patterns string
+			path     string
+			excluded bool
+		}{{"x\\*y", "x*y", true}, {"x\\*y", "xay", false}}...)
+	} else {
+		cases = append(cases, struct {
+			patterns string
+			path     string
+			excluded bool
+		}{"dir\\*.log", "dir/a.log", true})
 	}
 	for _, tc := range cases {
 		d, err := parseDockerignore([]byte(tc.patterns))
