@@ -27,6 +27,8 @@ type Build struct {
 	Files map[string]string
 	// Modes holds the tar context's file modes, path -> mode.
 	Modes map[string]int64
+	// Links holds the tar context's symlinks, path -> link target.
+	Links map[string]string
 }
 
 // Container records a created container.
@@ -153,11 +155,15 @@ func (f *Fake) ImagePull(_ context.Context, ref, platform string, out io.Writer)
 func (f *Fake) ImageBuild(_ context.Context, opts engine.BuildOptions, out io.Writer) error {
 	files := map[string]string{}
 	modes := map[string]int64{}
+	links := map[string]string{}
 	tr := tar.NewReader(opts.Context)
 	for {
 		h, err := tr.Next()
 		if err != nil {
 			break
+		}
+		if h.Typeflag == tar.TypeSymlink {
+			links[h.Name] = h.Linkname
 		}
 		b, _ := io.ReadAll(tr)
 		files[h.Name] = string(b)
@@ -165,7 +171,7 @@ func (f *Fake) ImageBuild(_ context.Context, opts engine.BuildOptions, out io.Wr
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.Builds = append(f.Builds, Build{Tags: opts.Tags, Dockerfile: opts.Dockerfile, BuildArgs: opts.BuildArgs, Labels: opts.Labels, NoCache: opts.NoCache, Platform: opts.Platform, Files: files, Modes: modes})
+	f.Builds = append(f.Builds, Build{Tags: opts.Tags, Dockerfile: opts.Dockerfile, BuildArgs: opts.BuildArgs, Labels: opts.Labels, NoCache: opts.NoCache, Platform: opts.Platform, Files: files, Modes: modes, Links: links})
 	if f.FailBuild != "" {
 		if out != nil {
 			fmt.Fprintln(out, "Step 1/1 : FROM x")

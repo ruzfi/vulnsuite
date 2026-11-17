@@ -76,3 +76,33 @@ func TestContentHashUnchangedWithoutNewInputs(t *testing.T) {
 		t.Fatalf("hash of a template without the new inputs changed: got %s, want %s", got, want)
 	}
 }
+
+// #47 item 7: symlinks in a build context are sent as symlinks, so the hash
+// covers their link text (and never reads through them).
+func TestHashTreeCoversSymlinks(t *testing.T) {
+	root := t.TempDir()
+	os.WriteFile(filepath.Join(root, "a"), []byte("a"), 0o644)
+	plain := hashTree(root)
+	if err := os.Symlink("a", filepath.Join(root, "l")); err != nil {
+		t.Skipf("symlinks unavailable here: %v", err)
+	}
+	withLink := hashTree(root)
+	if withLink == plain {
+		t.Fatal("adding a symlink must change the hash")
+	}
+	os.Remove(filepath.Join(root, "l"))
+	os.Symlink("b", filepath.Join(root, "l"))
+	if hashTree(root) == withLink {
+		t.Fatal("retargeting a symlink must change the hash")
+	}
+	// The target's content is not read: changing it leaves the hash alone.
+	outside := filepath.Join(t.TempDir(), "secret")
+	os.WriteFile(outside, []byte("one"), 0o600)
+	os.Remove(filepath.Join(root, "l"))
+	os.Symlink(outside, filepath.Join(root, "l"))
+	before := hashTree(root)
+	os.WriteFile(outside, []byte("two"), 0o600)
+	if hashTree(root) != before {
+		t.Fatal("a symlink's target content must not feed the hash")
+	}
+}

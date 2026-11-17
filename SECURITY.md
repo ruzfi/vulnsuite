@@ -36,7 +36,9 @@ vulnsuite stands up **knowingly vulnerable** targets. Two trust boundaries matte
   must still be inside the (resolved) template folder, so a symlink such as
   `files/app.conf -> ~/.aws/credentials` is refused instead of being baked into
   an image (`vulnsuite validate` reports it as `path-escapes-template`). The
-  build-context walk never follows or includes symlinks.
+  build-context walk never follows symlinks: one inside the context is sent
+  as a symlink, which the daemon resolves inside the context, so the host
+  file it names is never read.
 - **generated Dockerfile lines cannot be injected into.** Overlay `dest` must be
   a plain path (letters, digits and `. _ @ % + = : , / -`; absolute for an
   image base; no `..` segments), state environment names must be plain
