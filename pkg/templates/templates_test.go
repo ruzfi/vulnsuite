@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -286,27 +287,46 @@ func TestUpdateGitTimeoutAndNoPrompt(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script fake git")
 	}
-	dir := t.TempDir()
-	_ = os.Mkdir(filepath.Join(dir, ".git"), 0o755)
-	bin := t.TempDir()
-	envOut := filepath.Join(t.TempDir(), "env")
-	script := "#!/bin/sh\necho \"$GIT_TERMINAL_PROMPT\" > '" + envOut + "'\nexec sleep 30\n"
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
-		t.Fatal(err)
+	// Two independent checks, neither racing a deadline against process start
+	// (which made the old combined version flaky under `go test -race` load):
+	// the prompt is checked by a fake git that exits at once, and the timeout
+	// by one that never exits, measured against a bound far from both.
+	fakeGit := func(t *testing.T, script string) string {
+		t.Helper()
+		dir := t.TempDir()
+		_ = os.Mkdir(filepath.Join(dir, ".git"), 0o755)
+		bin := t.TempDir()
+		if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\n"+script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+		return dir
 	}
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	start := time.Now()
-	_, _, err := Update(context.Background(), UpdateOptions{Dir: dir, GitTimeout: 2 * time.Second})
-	if err == nil || !strings.Contains(err.Error(), "timed out") {
-		t.Fatalf("err = %v", err)
-	}
-	if time.Since(start) > 10*time.Second {
-		t.Fatal("timeout not enforced")
-	}
-	b, _ := os.ReadFile(envOut)
-	if strings.TrimSpace(string(b)) != "0" {
-		t.Fatalf("GIT_TERMINAL_PROMPT = %q", b)
-	}
+
+	t.Run("no prompt", func(t *testing.T) {
+		envOut := filepath.Join(t.TempDir(), "env")
+		dir := fakeGit(t, "echo \"$GIT_TERMINAL_PROMPT $GCM_INTERACTIVE\" > '"+envOut+"'\necho fatal: no >&2\nexit 1\n")
+		_, _, err := Update(context.Background(), UpdateOptions{Dir: dir, Output: io.Discard, GitTimeout: time.Hour})
+		if err == nil || strings.Contains(err.Error(), "timed out") {
+			t.Fatalf("err = %v", err)
+		}
+		b, _ := os.ReadFile(envOut)
+		if strings.TrimSpace(string(b)) != "0 never" {
+			t.Fatalf("GIT_TERMINAL_PROMPT GCM_INTERACTIVE = %q", b)
+		}
+	})
+
+	t.Run("timeout", func(t *testing.T) {
+		dir := fakeGit(t, "exec sleep 300\n")
+		start := time.Now()
+		_, _, err := Update(context.Background(), UpdateOptions{Dir: dir, Output: io.Discard, GitTimeout: 100 * time.Millisecond})
+		if err == nil || !strings.Contains(err.Error(), "timed out") {
+			t.Fatalf("err = %v", err)
+		}
+		if el := time.Since(start); el > time.Minute {
+			t.Fatalf("timeout not enforced: returned after %v", el)
+		}
+	})
 }
 
 // gitRepo sets up an origin repository and a clone of it, isolated from the

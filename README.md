@@ -77,8 +77,9 @@ useful as ground truth if a machine can stand it up, prove it, scan it and
 tear it down without a human in the loop.
 
 - Every command takes `-json` and returns structured output (progress goes
-  to stderr), and exits non-zero when a target fails to build, start or
-  verify.
+  to stderr; empty results are `[]`), and exits non-zero when a target fails
+  to build, start or verify. Flag mistakes exit 2. `-q` silences progress,
+  never a command's output (`vulnsuite -q targets` still prints the URLs).
 - `vulnsuite run -detach -targets-file` plus `vulnsuite targets` give a
   scanner exactly the URLs to hit; `vulnsuite stop` cleans up.
 - The Go packages (`loader`, `builder`, `runner`, `probes`) are importable,
@@ -245,6 +246,10 @@ vulnsuite run -f targets.txt                            # a mixed file of select
 
 Filters *within one line* combine with AND (`-category web-apps -class exposure`
 is web-apps **and** exposure); separate selectors and filter lines union with OR.
+A filter selects every template that matches, variant-group members included —
+it does not collapse groups the way `-all` does — and `list <filter>` shows
+exactly the set that `run <filter>` / `build <filter>` will stand up. A
+template that fails to load fails the `run` or `build` rather than being skipped.
 
 A **`-f` file** lists one selector per line — an id, a group handle, a category, a
 `suite:<name>`, or a filter line (begins with `-`). Blank lines and `#` comments

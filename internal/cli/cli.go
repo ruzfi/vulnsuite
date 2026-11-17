@@ -167,11 +167,13 @@ func mainWithEngine(ctx context.Context, eng engine.Engine, args []string, stdou
 	}
 	rest := root.Args()
 	if len(rest) == 0 {
+		// No command is a usage error (exit 2): the help goes to stderr so a
+		// script's stdout never carries text it did not ask for.
 		if !g.JSON {
-			printBanner(stdout)
-			fmt.Fprintln(stdout)
+			printBanner(stderr)
+			fmt.Fprintln(stderr)
 		}
-		printRootHelp(stdout)
+		printRootHelp(stderr)
 		return ExitUsage
 	}
 	name := rest[0]
@@ -277,8 +279,10 @@ func printBanner(w io.Writer) {
 	fmt.Fprintln(w, center(versionTag()))
 }
 
-// versionTag is the short display version for the banner: "vX.Y.Z" (or "dev").
-func versionTag() string {
+// resolvedVersion is the version the binary reports: the -ldflags Version, or,
+// when built without them (e.g. `go install ...@latest`) and Version is the
+// "dev" default, the module version Go embeds in the binary.
+func resolvedVersion() string {
 	v := Version
 	if v == "dev" || v == "" {
 		if bi, ok := debug.ReadBuildInfo(); ok {
@@ -287,7 +291,16 @@ func versionTag() string {
 			}
 		}
 	}
-	if v == "" || v == "dev" {
+	if v == "" {
+		v = "dev"
+	}
+	return v
+}
+
+// versionTag is the short display version for the banner: "vX.Y.Z" (or "dev").
+func versionTag() string {
+	v := resolvedVersion()
+	if v == "dev" {
 		return "dev"
 	}
 	if !strings.HasPrefix(v, "v") {
@@ -297,17 +310,7 @@ func versionTag() string {
 }
 
 func versionString() string {
-	v := Version
-	// When built without -ldflags (e.g. `go install ...@latest`), Version is the
-	// "dev" default; fall back to the module version Go embeds in the binary.
-	if v == "dev" || v == "" {
-		if bi, ok := debug.ReadBuildInfo(); ok {
-			if mv := bi.Main.Version; mv != "" && mv != "(devel)" {
-				v = mv
-			}
-		}
-	}
-	s := "vulnsuite " + v
+	s := "vulnsuite " + resolvedVersion()
 	if Commit != "" {
 		s += " (" + Commit
 		if Date != "" {

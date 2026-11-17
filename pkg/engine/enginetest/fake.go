@@ -62,6 +62,9 @@ type Fake struct {
 	// RemoveFn runs before a container is removed (receives its name); an error
 	// fails the removal and leaves the container in place.
 	RemoveFn func(name string) error
+	// ImageRemoveFn runs before an image is removed (receives its ref); an
+	// error fails the removal and keeps the image.
+	ImageRemoveFn func(ref string) error
 	// ListErr makes ContainerList fail when set.
 	ListErr error
 	// FailBuild makes every build fail with this message when set.
@@ -187,6 +190,11 @@ func (f *Fake) ImagePush(_ context.Context, ref string, out io.Writer) error {
 }
 
 func (f *Fake) ImageRemove(_ context.Context, ref string, _ bool) error {
+	if f.ImageRemoveFn != nil {
+		if err := f.ImageRemoveFn(ref); err != nil {
+			return err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.Images, ref)

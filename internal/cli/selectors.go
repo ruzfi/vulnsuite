@@ -140,7 +140,10 @@ func parseFilterLine(path string, tokens []string) (filters, error) {
 // resolveTargets turns -t selectors, -f files, suite handles, -all and filter
 // predicates into one de-duplicated, order-stable set of contract paths. Every
 // selector, every filter set (the command's own filter flags and each filter
-// line in a file) selects targets; the result is their union.
+// line in a file) selects targets; the result is their union. Filters look at
+// every template, variant members included, regardless of group collapse
+// (#36); `list <filter>` selects the same set. A template that fails to load
+// while filtering is included, so its load error surfaces to the caller.
 func resolveTargets(ctx context.Context, store *loader.Store, sel, files []string, all, variants bool, cliFilters filters) ([]string, error) {
 	if !all && len(sel) == 0 && len(files) == 0 && !cliFilters.active() {
 		return nil, usageError{"pass -t <selector>, -f <file>, a filter (e.g. -class misconfig), or -all"}
@@ -208,6 +211,11 @@ func resolveTargets(ctx context.Context, store *loader.Store, sel, files []strin
 			}
 			c, err := store.Load(p)
 			if err != nil {
+				// A template that does not load cannot be matched, and must
+				// not vanish silently: keep it in the set so the caller's
+				// LoadMany reports it as a load error (run fails on it,
+				// build counts it as a failure).
+				add([]string{p})
 				continue
 			}
 			for _, f := range r.filterSets {
