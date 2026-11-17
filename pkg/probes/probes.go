@@ -38,6 +38,27 @@ type Target struct {
 	Scheme    string // http | https; anything else is treated as http for http probes
 	Container string
 	Exec      ExecFunc
+	// PortMap, when non-nil, translates a container port named by a probe
+	// (`port:`) to the port to dial from here: in host exposure mode a probe's
+	// port is a container port, published on a different host port. A port
+	// missing from a non-nil map is not reachable from here. Port (the default
+	// when a probe names none) is already the address to dial.
+	PortMap map[int]int
+}
+
+// dialPort resolves the port a probe dials: 0 means the target's own Port; a
+// named port goes through PortMap when one is set.
+func (t Target) dialPort(p int) (int, error) {
+	if p == 0 {
+		return t.Port, nil
+	}
+	if t.PortMap == nil {
+		return p, nil
+	}
+	if hp, ok := t.PortMap[p]; ok {
+		return hp, nil
+	}
+	return 0, fmt.Errorf("container port %d is not published to the host, so it cannot be probed from here", p)
 }
 
 // Result is the outcome of one probe.
@@ -64,7 +85,7 @@ func (e *connError) Unwrap() error { return e.err }
 // HTTPResponse is a parsed raw HTTP response.
 type HTTPResponse struct {
 	Status  int
-	Headers map[string]string // lower-cased names
+	Headers map[string]string // lower-cased names; repeated headers are joined with ", "
 	Body    string
 }
 
@@ -108,6 +129,9 @@ func RawHTTP(ctx context.Context, host string, port int, method, path string, he
 		return nil, err
 	}
 	defer conn.Close()
+	// The deadline covers the TLS handshake too: a peer that accepts and then
+	// stalls must not outlive the probe timeout.
+	_ = conn.SetDeadline(time.Now().Add(timeout))
 	if useTLS {
 		tc := tls.Client(conn, &tls.Config{InsecureSkipVerify: true, ServerName: host}) //nolint:gosec // knowingly-vulnerable targets have junk certs
 		if err := tc.HandshakeContext(ctx); err != nil {
@@ -115,15 +139,115 @@ func RawHTTP(ctx context.Context, host string, port int, method, path string, he
 		}
 		conn = tc
 	}
-	_ = conn.SetDeadline(time.Now().Add(timeout))
 	if _, err := io.WriteString(conn, head+body); err != nil {
 		return nil, err
 	}
-	blob, _ := io.ReadAll(io.LimitReader(conn, MaxBody+64*1024)) // a timeout mid-read still yields what arrived
+	blob := readResponse(conn, method) // a timeout mid-read still yields what arrived
 	if len(blob) == 0 {
 		return nil, fmt.Errorf("empty response")
 	}
 	return parseHTTP(blob)
+}
+
+// maxResponse caps how much of a response is read (the body cap plus room for
+// the head).
+const maxResponse = MaxBody + 64*1024
+
+// readResponse reads one HTTP response from conn. It stops as soon as the
+// response is complete by its own framing (Content-Length, the final chunk, or
+// a status that has no body) instead of waiting for the server to close the
+// connection: a keep-alive server that ignores Connection: close would
+// otherwise hold every probe for its full timeout. Without framing it reads
+// until EOF, the deadline, or maxResponse.
+func readResponse(conn io.Reader, method string) []byte {
+	var blob []byte
+	buf := make([]byte, 32*1024)
+	for len(blob) < maxResponse {
+		n, err := conn.Read(buf)
+		blob = append(blob, buf[:n]...)
+		if n > 0 && responseComplete(blob, method) {
+			break
+		}
+		if err != nil {
+			break
+		}
+	}
+	if len(blob) > maxResponse {
+		blob = blob[:maxResponse]
+	}
+	return blob
+}
+
+// responseComplete reports whether blob holds a whole response by its framing.
+// It is conservative: anything it cannot frame is read to EOF as before.
+func responseComplete(blob []byte, method string) bool {
+	text := string(blob)
+	headEnd, sep := strings.Index(text, "\r\n\r\n"), 4
+	if headEnd < 0 {
+		if headEnd, sep = strings.Index(text, "\n\n"), 2; headEnd < 0 {
+			return false // the head is not complete yet
+		}
+	}
+	head, body := text[:headEnd], text[headEnd+sep:]
+	m := statusRe.FindStringSubmatch(head)
+	if m == nil {
+		return false
+	}
+	status, _ := strconv.Atoi(m[1])
+	if status >= 100 && status < 200 {
+		// An interim response (100 Continue): the final one follows it.
+		return responseComplete([]byte(body), method)
+	}
+	if strings.EqualFold(method, "HEAD") || status == 204 || status == 304 {
+		return true
+	}
+	var te, cl string
+	haveCL := false
+	for _, line := range strings.Split(head, "\n")[1:] {
+		k, v, ok := strings.Cut(strings.TrimRight(line, "\r"), ":")
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(k)) {
+		case "transfer-encoding":
+			te = strings.TrimSpace(v)
+		case "content-length":
+			cl, haveCL = strings.TrimSpace(v), true
+		}
+	}
+	switch {
+	case te != "":
+		return strings.EqualFold(te, "chunked") && chunkedComplete(body)
+	case haveCL:
+		n, err := strconv.Atoi(cl)
+		return err == nil && n >= 0 && len(body) >= n
+	}
+	return false // delimited by close
+}
+
+// chunkedComplete reports whether a chunked body has reached its last chunk
+// and the (possibly empty) trailer section after it.
+func chunkedComplete(s string) bool {
+	for {
+		nl := strings.Index(s, "\r\n")
+		if nl < 0 {
+			return false
+		}
+		sizeStr, _, _ := strings.Cut(s[:nl], ";")
+		size, err := strconv.ParseInt(strings.TrimSpace(sizeStr), 16, 64)
+		if err != nil || size < 0 {
+			return false
+		}
+		s = s[nl+2:]
+		if size == 0 {
+			// Trailers, if any, end with an empty line.
+			return strings.HasPrefix(s, "\r\n") || strings.Contains(s, "\r\n\r\n")
+		}
+		if int64(len(s)) < size+2 {
+			return false
+		}
+		s = s[size+2:]
+	}
 }
 
 var statusRe = regexp.MustCompile(`^HTTP/\d(?:\.\d)?\s+(\d{3})`)
@@ -153,12 +277,23 @@ func parseHTTP(blob []byte) (*HTTPResponse, error) {
 		return nil, fmt.Errorf("bad status line %q", line)
 	}
 	status, _ := strconv.Atoi(m[1])
+	if status >= 100 && status < 200 && statusRe.MatchString(body) {
+		// Skip an interim response (100 Continue) to the final one.
+		return parseHTTP([]byte(body))
+	}
 	resp := &HTTPResponse{Status: status, Headers: map[string]string{}}
 	for sc.Scan() {
 		k, v, ok := strings.Cut(sc.Text(), ":")
-		if ok {
-			resp.Headers[strings.ToLower(strings.TrimSpace(k))] = strings.TrimSpace(v)
+		if !ok {
+			continue
 		}
+		name, val := strings.ToLower(strings.TrimSpace(k)), strings.TrimSpace(v)
+		if prev, dup := resp.Headers[name]; dup {
+			// RFC 9110 5.3: repeated fields combine as a comma-separated list,
+			// so every Set-Cookie (etc.) stays visible to header_matches/absent.
+			val = prev + ", " + val
+		}
+		resp.Headers[name] = val
 	}
 	if strings.EqualFold(resp.Headers["transfer-encoding"], "chunked") {
 		body = dechunk(body)
@@ -244,9 +379,9 @@ func runHTTP(ctx context.Context, s *contract.HTTPProbe, t Target) (bool, string
 	if path == "" {
 		path = "/"
 	}
-	port := t.Port
-	if s.Port != 0 {
-		port = s.Port
+	port, err := t.dialPort(s.Port)
+	if err != nil {
+		return false, "", fmt.Errorf("%s -> %v", path, err)
 	}
 	resp, err := RawHTTP(ctx, t.Host, port, s.Method, path, s.Headers, s.Body, secs(s.Timeout, 10*time.Second), t.Scheme == "https")
 	if err != nil {
@@ -315,9 +450,15 @@ func runTCP(ctx context.Context, s *contract.TCPProbe, t Target) (bool, string, 
 	if port == 0 {
 		port = t.Port
 	}
+	dport, err := t.dialPort(s.Port)
+	if err != nil {
+		// Not reachable from here at all: neither "open" nor "closed" can be
+		// asserted, so a closed: probe must not pass by default.
+		return false, "", fmt.Errorf("tcp %d -> %v", port, err)
+	}
 	timeout := secs(s.Timeout, 10*time.Second)
 	d := net.Dialer{Timeout: timeout}
-	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(t.Host, strconv.Itoa(port)))
+	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(t.Host, strconv.Itoa(dport)))
 	if s.Closed {
 		// Asserting the port is NOT open: a dial error (refused/unreachable) is
 		// the expected result; a successful connection is the failure.
@@ -351,13 +492,19 @@ func runNet(ctx context.Context, s *contract.NetProbe, t Target) (bool, string, 
 	if port == 0 {
 		port = t.Port
 	}
+	dport, err := t.dialPort(s.Port)
+	if err != nil {
+		return false, "", fmt.Errorf("net %d -> %v", port, err)
+	}
 	timeout := secs(s.Timeout, 15*time.Second)
 	d := net.Dialer{Timeout: timeout}
-	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(t.Host, strconv.Itoa(port)))
+	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(t.Host, strconv.Itoa(dport)))
 	if err != nil {
 		return false, "", &connError{fmt.Errorf("net %d -> %v", port, err)}
 	}
 	defer conn.Close()
+	// Set before the handshake so a stalled TLS peer is bounded by the timeout.
+	_ = conn.SetDeadline(time.Now().Add(timeout))
 	if s.TLS || t.Scheme == "https" {
 		tc := tls.Client(conn, &tls.Config{InsecureSkipVerify: true, ServerName: t.Host}) //nolint:gosec // knowingly-vulnerable targets
 		if err := tc.HandshakeContext(ctx); err != nil {
@@ -365,7 +512,6 @@ func runNet(ctx context.Context, s *contract.NetProbe, t Target) (bool, string, 
 		}
 		conn = tc
 	}
-	_ = conn.SetDeadline(time.Now().Add(timeout))
 	var log strings.Builder
 	for i, step := range s.Steps {
 		if step.Send != "" {
@@ -483,7 +629,9 @@ func WaitForPort(ctx context.Context, host string, port int, timeout time.Durati
 			conn.Close()
 			return true
 		}
-		time.Sleep(500 * time.Millisecond)
+		if !pause(ctx, 500*time.Millisecond) {
+			return false
+		}
 	}
 	return false
 }
@@ -499,9 +647,23 @@ func WaitForHTTP(ctx context.Context, host string, port int, scheme, path string
 		if err == nil && (want == 0 || resp.Status == want) {
 			return true
 		}
-		time.Sleep(time.Second)
+		if !pause(ctx, time.Second) {
+			return false
+		}
 	}
 	return false
+}
+
+// pause sleeps for d, returning false early when ctx ends.
+func pause(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 func matchDotAll(pat, text string) bool {

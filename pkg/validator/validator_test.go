@@ -339,3 +339,83 @@ func TestGroupMultiCategory(t *testing.T) {
 		t.Fatal("a group spanning two categories must warn")
 	}
 }
+
+func TestIdenticalStatesSeesSidecarsAndSeed(t *testing.T) {
+	v := &Validator{}
+	withSidecar := strings.Replace(base, "healthcheck:", "sidecars: [ { name: db, image: \"mysql:8.0.1\" } ], healthcheck:", 1)
+	// Same main image, but patched swaps the sidecar to the fixed release.
+	c := parse(t, strings.Replace(withSidecar, "  patched:\n", "  patched:\n    sidecars: { db: { image: \"mysql:8.0.2\" } }\n", 1))
+	if _, bad := rules(v.Check(c))["identical-states"]; bad {
+		t.Fatal("states that differ only in a sidecar override must not be identical")
+	}
+	// An override to the same image is still identical.
+	c = parse(t, strings.Replace(withSidecar, "  patched:\n", "  patched:\n    sidecars: { db: { image: \"mysql:8.0.1\" } }\n", 1))
+	if rules(v.Check(c))["identical-states"] != Warning {
+		t.Fatal("a no-op sidecar override must still warn")
+	}
+	// Different seed data.
+	c = parse(t, strings.Replace(base, "  patched:\n", "  patched:\n    seed: [ { run: \"echo fixed\" } ]\n", 1))
+	if _, bad := rules(v.Check(c))["identical-states"]; bad {
+		t.Fatal("states that differ only in seed must not be identical")
+	}
+}
+
+func TestPrimaryWithoutGroup(t *testing.T) {
+	v := &Validator{}
+	c := parse(t, strings.Replace(base, "summary: x,", "summary: x, primary: true,", 1))
+	if rules(v.Check(c))["primary-no-group"] != Warning {
+		t.Fatal("primary without group must warn")
+	}
+	if _, bad := rules(v.Check(parse(t, base)))["primary-no-group"]; bad {
+		t.Fatal("no primary, no warning")
+	}
+}
+
+func TestUndeclaredPortRefs(t *testing.T) {
+	v := &Validator{}
+	if l, ok := rules(v.Check(parse(t, base)))["undeclared-port"]; ok {
+		t.Fatalf("declared ports flagged: %v", l)
+	}
+	cases := map[string]string{
+		"healthcheck": strings.Replace(base, "tcp: { port: 80 }", "tcp: { port: 8080 }", 1),
+		"http":        strings.Replace(base, "{ http: { path: /, status: 200,", "{ http: { port: 8443, path: /, status: 200,", 1),
+		"tcp":         strings.Replace(base, `[ { http: { path: /, status_in: [404] } } ]`, `[ { tcp: { port: 22 } } ]`, 1),
+		"net":         strings.Replace(base, `[ { http: { path: /, status_in: [404] } } ]`, `[ { net: { port: 25, steps: [ { expect: "220" } ] } } ]`, 1),
+	}
+	for name, doc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if doc == base {
+				t.Fatal("replacement did not apply")
+			}
+			fs := v.Check(parse(t, doc))
+			if rules(fs)["undeclared-port"] != Warning {
+				t.Fatalf("want undeclared-port warning, got %v", fs)
+			}
+		})
+	}
+	// Proving a port is closed needs no declaration.
+	closed := strings.Replace(base, `[ { http: { path: /, status_in: [404] } } ]`, `[ { tcp: { port: 9229, closed: true } } ]`, 1)
+	if _, ok := rules(v.Check(parse(t, closed)))["undeclared-port"]; ok {
+		t.Fatal("tcp closed: true must not need a declared port")
+	}
+}
+
+func TestShadowedContract(t *testing.T) {
+	c := parse(t, base)
+	c.SourcePath = filepath.Join(c.Folder, "contract.yaml")
+	for _, n := range []string{"contract.yaml", "template.yaml"} {
+		if err := os.WriteFile(filepath.Join(c.Folder, n), []byte(base), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fs := (&Validator{}).Check(c)
+	if rules(fs)["shadowed-contract"] != Warning {
+		t.Fatalf("want shadowed-contract warning, got %v", fs)
+	}
+	if err := os.Remove(filepath.Join(c.Folder, "template.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := rules((&Validator{}).Check(c))["shadowed-contract"]; ok {
+		t.Fatal("a lone contract must not be reported as shadowed")
+	}
+}

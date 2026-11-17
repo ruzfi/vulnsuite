@@ -1,6 +1,19 @@
 // Package registryauth resolves registry credentials the way the docker CLI
 // does: VULNSUITE_REGISTRY_USER/TOKEN, then credential helpers, then the
 // plain auths in ~/.docker/config.json.
+//
+// The VULNSUITE_REGISTRY_USER/TOKEN pair names no registry, so it is scoped
+// explicitly: templates choose which images are pulled, and a credential meant
+// for the user's push registry must never be sent to a registry a template
+// names. The pair is used only
+//
+//   - for the registry named by VULNSUITE_REGISTRY, when that is set (pulls and
+//     pushes), or
+//   - when VULNSUITE_REGISTRY is unset, for pushes only (the destination the
+//     user chose with -registry), never for pulls.
+//
+// Credentials from ~/.docker/config.json and credential helpers are keyed by
+// registry already and are used as before.
 package registryauth
 
 import (
@@ -12,6 +25,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/distribution/reference"
 )
 
 // Config is one registry credential.
@@ -55,18 +70,62 @@ func loadConfig() *dockerConfig {
 	return cfg
 }
 
-// registryOf extracts the registry host of an image reference
-// ("ghcr.io/ruzfi/x" -> "ghcr.io", "nginx" -> "https://index.docker.io/v1/").
+// hubAddress is the key the docker CLI files Docker Hub credentials under.
+const hubAddress = "https://index.docker.io/v1/"
+
+// registryOf returns the credential key of an image reference's registry:
+// hubAddress for Docker Hub ("nginx", "nginx:1.25", "postgres@sha256:...",
+// "docker.io/library/nginx", ...) and host[:port] otherwise ("ghcr.io/x" ->
+// "ghcr.io", "localhost:5000/x" -> "localhost:5000"). Tags and digests are
+// ignored, so callers may pass the full reference.
 func registryOf(ref string) string {
-	first, _, _ := strings.Cut(ref, "/")
-	if strings.Contains(first, ".") || strings.Contains(first, ":") || first == "localhost" {
-		return first
+	var domain string
+	if named, err := reference.ParseNormalizedNamed(ref); err == nil {
+		domain = reference.Domain(named)
+	} else {
+		// Not a valid reference (e.g. upper case): apply the same rule by hand.
+		first, rest, ok := strings.Cut(ref, "/")
+		if ok && rest != "" && (strings.ContainsAny(first, ".:") || first == "localhost" || strings.HasPrefix(first, "[")) {
+			domain = first
+		}
 	}
-	return "https://index.docker.io/v1/"
+	switch domain {
+	case "", "docker.io", "index.docker.io", "registry-1.docker.io":
+		return hubAddress
+	}
+	return domain
 }
 
-// For returns the base64 X-Registry-Auth value for an image ref, or "" when
-// no credentials are known.
+// scopeRegistry is the credential key (as registryOf returns it) of the
+// registry VULNSUITE_REGISTRY names, or "" when it is unset. It accepts a bare
+// host ("ghcr.io", "localhost:5000", "docker.io"), a repository prefix as
+// given to -registry ("ghcr.io/you/vulnsuite", "docker.io/you") or a URL
+// ("https://index.docker.io/v1/"), so every Docker Hub spelling maps to the
+// same key as a bare Hub reference such as "nginx:1.25".
+func scopeRegistry() string {
+	v := strings.TrimSpace(os.Getenv("VULNSUITE_REGISTRY"))
+	v = strings.TrimPrefix(strings.TrimPrefix(v, "https://"), "http://")
+	v = strings.Trim(v, "/")
+	if v == "" {
+		return ""
+	}
+	host, _, _ := strings.Cut(v, "/")
+	// Give registryOf a repository under the host, so a bare host is read
+	// as a registry rather than as a Docker Hub image name.
+	return registryOf(strings.ToLower(host) + "/x")
+}
+
+// envAllowed reports whether VULNSUITE_REGISTRY_USER/TOKEN may be sent to reg,
+// a key returned by registryOf.
+func envAllowed(reg string, push bool) bool {
+	if scope := scopeRegistry(); scope != "" {
+		return strings.EqualFold(reg, scope)
+	}
+	return push
+}
+
+// For returns the base64 X-Registry-Auth value for pulling an image ref, or ""
+// when no credentials are known.
 func For(ref string) string {
 	a, ok := Lookup(ref)
 	if !ok {
@@ -75,10 +134,26 @@ func For(ref string) string {
 	return Encode(a)
 }
 
-// Lookup resolves the credential for an image ref.
-func Lookup(ref string) (Config, bool) {
+// ForPush is For for pushing ref to the registry the user chose to publish to.
+func ForPush(ref string) string {
+	a, ok := LookupPush(ref)
+	if !ok {
+		return ""
+	}
+	return Encode(a)
+}
+
+// Lookup resolves the credential for pulling an image ref. The
+// VULNSUITE_REGISTRY_USER/TOKEN pair is used only when VULNSUITE_REGISTRY
+// names ref's registry.
+func Lookup(ref string) (Config, bool) { return lookup(ref, false) }
+
+// LookupPush resolves the credential for pushing ref.
+func LookupPush(ref string) (Config, bool) { return lookup(ref, true) }
+
+func lookup(ref string, push bool) (Config, bool) {
 	reg := registryOf(ref)
-	if u, t := os.Getenv("VULNSUITE_REGISTRY_USER"), os.Getenv("VULNSUITE_REGISTRY_TOKEN"); u != "" && t != "" {
+	if u, t := os.Getenv("VULNSUITE_REGISTRY_USER"), os.Getenv("VULNSUITE_REGISTRY_TOKEN"); u != "" && t != "" && envAllowed(reg, push) {
 		return Config{Username: u, Password: t, ServerAddress: reg}, true
 	}
 	conf := loadConfig()
@@ -148,21 +223,44 @@ func Encode(a Config) string {
 // Empty is the header value for "no credentials".
 func Empty() string { return Encode(Config{}) }
 
-// Configs returns every plain credential in the docker config, keyed by
-// registry, for builds that pull from private registries.
+// Configs returns every credential the docker config knows about, keyed by
+// registry, for builds that pull from private registries. Each registry named
+// in auths or credHelpers is resolved through its credential helper (the
+// per-registry credHelpers entry, else credsStore) and falls back to the plain
+// base64 auth stored in auths.
 func Configs() map[string]Config {
 	conf := loadConfig()
 	m := map[string]Config{}
 	if conf == nil {
 		return m
 	}
-	for key, entry := range conf.Auths {
+	keys := map[string]bool{}
+	for key := range conf.Auths {
+		keys[key] = true
+	}
+	for key := range conf.CredHelpers {
+		keys[key] = true
+	}
+	for key := range keys {
+		helper := conf.CredsStore
+		if h, ok := conf.CredHelpers[key]; ok {
+			helper = h
+		}
+		if helper != "" {
+			if a, ok := fromHelper(helper, key); ok {
+				m[key] = a
+				continue
+			}
+		}
+		entry, ok := conf.Auths[key]
+		if !ok || entry.Auth == "" {
+			continue
+		}
 		raw, err := base64.StdEncoding.DecodeString(entry.Auth)
 		if err != nil {
 			continue
 		}
-		u, p, ok := strings.Cut(string(raw), ":")
-		if ok {
+		if u, p, ok := strings.Cut(string(raw), ":"); ok {
 			m[key] = Config{Username: u, Password: p, ServerAddress: key}
 		}
 	}

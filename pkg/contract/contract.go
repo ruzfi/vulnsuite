@@ -241,15 +241,23 @@ const (
 	BaseBuild  = "build"
 )
 
-// Pinned reports whether the base is reproducible on another device.
+// Pinned reports whether the base is reproducible on another device. For a
+// source base this only checks that a commit is set; the validator also checks
+// that it is a full commit id rather than a branch or tag.
 func (b Base) Pinned() bool {
 	switch b.Kind {
 	case BaseImage:
-		return b.Digest != ""
+		return RefPinned(b.Image, b.Digest)
 	case BaseSource:
 		return b.Commit != ""
 	}
 	return true // a local build context is self-contained
+}
+
+// RefPinned reports whether an image reference is pinned to a digest, either
+// by a separate digest field or inline (image@sha256:...).
+func RefPinned(image, digest string) bool {
+	return digest != "" || strings.Contains(image, "@sha256:")
 }
 
 // ImageRef is the fully pinned image reference of an image base.
@@ -674,15 +682,27 @@ func (c *Contract) ContentHash(stateName string) string {
 	// The state name is deliberately not part of the hash: the hash is the
 	// identity of the *inputs*, so two states built from identical inputs are
 	// recognised as identical (the validator warns about that).
+	//
+	// Parts that were added after the first release (a state's image override,
+	// an overlay's mode) are appended only when set, so the tag of a template
+	// that does not use them is unchanged and no image is rebuilt needlessly.
 	parts := []string{c.Base.ContentKey()}
+	if st.Image != "" {
+		// An overlay build runs FROM the state's image, not the base's.
+		parts = append(parts, "state-image:"+st.EffectiveImage(c.Base))
+	}
 	if c.Base.Kind == BaseBuild && c.Base.Context != "" {
-		parts = append(parts, "context:"+hashTree(filepath.Join(c.Folder, c.Base.Context)))
+		parts = append(parts, "context:"+hashTree(c.hashPath(c.Base.Context)))
 	}
 	if st.Patch != "" {
-		parts = append(parts, fmt.Sprintf("patch:%s:%s", st.Patch, hashFile(filepath.Join(c.Folder, st.Patch))))
+		parts = append(parts, fmt.Sprintf("patch:%s:%s", st.Patch, hashFile(c.hashPath(st.Patch))))
 	}
 	for _, o := range st.Overlay {
-		parts = append(parts, fmt.Sprintf("overlay:%s:%s", o.Dest, hashFile(filepath.Join(c.Folder, o.Src))))
+		part := fmt.Sprintf("overlay:%s:%s", o.Dest, hashFile(c.hashPath(o.Src)))
+		if o.Mode != "" {
+			part += ":mode=" + o.Mode
+		}
+		parts = append(parts, part)
 	}
 	if len(st.Environment) > 0 {
 		b, _ := json.Marshal(sortedMap(st.Environment))
@@ -747,7 +767,20 @@ func sortedMap(m map[string]string) map[string]string {
 	return m
 }
 
+// hashPath resolves a template path for hashing; a path that escapes the
+// template folder hashes as missing rather than reading a host file.
+func (c *Contract) hashPath(rel string) string {
+	p, err := c.TemplatePath(rel)
+	if err != nil && p == "" {
+		return ""
+	}
+	return p
+}
+
 func hashFile(path string) string {
+	if path == "" {
+		return "missing"
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return "missing"
@@ -758,13 +791,16 @@ func hashFile(path string) string {
 
 // hashTree hashes a directory tree's relative paths and contents.
 func hashTree(root string) string {
+	if root == "" {
+		return "missing"
+	}
 	info, err := os.Stat(root)
 	if err != nil || !info.IsDir() {
 		return "missing"
 	}
 	var files []string
 	filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err == nil && d.Type().IsRegular() {
+		if err == nil && (d.Type().IsRegular() || d.Type()&fs.ModeSymlink != 0) {
 			files = append(files, p)
 		}
 		return nil
@@ -774,6 +810,12 @@ func hashTree(root string) string {
 	for _, p := range files {
 		rel, _ := filepath.Rel(root, p)
 		h.Write([]byte(filepath.ToSlash(rel)))
+		// A symlink travels in the build context as a link (never followed:
+		// it may point outside the folder), so its target text is what counts.
+		if target, err := os.Readlink(p); err == nil {
+			h.Write([]byte("\x00symlink\x00" + filepath.ToSlash(target)))
+			continue
+		}
 		b, err := os.ReadFile(p)
 		if err == nil {
 			h.Write(b)

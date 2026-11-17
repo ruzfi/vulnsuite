@@ -121,20 +121,53 @@ func HasTemplates(dir string) bool {
 	return found
 }
 
+// DefaultArchiveBaseURL serves GitHub repository archives as
+// <base>/<owner>/<name>/zip/<ref>, where ref is a branch, tag or commit.
+const DefaultArchiveBaseURL = "https://codeload.github.com"
+
+// DefaultGitTimeout bounds each git network operation of an update.
+const DefaultGitTimeout = 5 * time.Minute
+
 // UpdateOptions tune an update.
 type UpdateOptions struct {
-	Dir    string // destination (default DefaultDir())
-	Repo   string // owner/name on GitHub (default DefaultRepo)
-	Ref    string // branch or tag (default DefaultBranch)
+	Dir  string // destination (default DefaultDir())
+	Repo string // owner/name on GitHub (default DefaultRepo)
+	// Ref is a branch, tag or commit. Empty means DefaultBranch for an
+	// archive install, and "pull the current branch" for a git checkout.
+	Ref string
+	// Force replaces a non-empty Dir that update-templates did not install
+	// (no .vulnsuite-templates-version marker).
+	Force  bool
 	Output io.Writer
+
+	// ArchiveBaseURL overrides DefaultArchiveBaseURL (tests, mirrors).
+	ArchiveBaseURL string
+	// HTTPClient overrides the default client (10 minute timeout).
+	HTTPClient *http.Client
+	// GitTimeout overrides DefaultGitTimeout.
+	GitTimeout time.Duration
 }
 
-// Update fetches the templates repository into Dir. A git checkout is pulled;
-// anything else is replaced by the GitHub archive of Ref. It returns the
-// directory and the version string recorded.
+// Update fetches the templates repository into Dir. A git checkout is pulled
+// (or, with Ref, fetched and checked out detached); otherwise Dir is replaced
+// by the GitHub archive of Ref, but only when Dir is missing, empty or was
+// installed by Update before, unless Force is set. It returns the directory
+// and the version string recorded.
 func Update(ctx context.Context, o UpdateOptions) (string, string, error) {
 	if o.Dir == "" {
 		o.Dir = DefaultDir()
+	}
+	if abs, err := filepath.Abs(o.Dir); err == nil {
+		o.Dir = abs
+	}
+	if o.Output == nil {
+		o.Output = io.Discard
+	}
+	if o.GitTimeout <= 0 {
+		o.GitTimeout = DefaultGitTimeout
+	}
+	if isRepoRoot(o.Dir) {
+		return updateGit(ctx, o)
 	}
 	if o.Repo == "" {
 		o.Repo = DefaultRepo
@@ -142,31 +175,117 @@ func Update(ctx context.Context, o UpdateOptions) (string, string, error) {
 	if o.Ref == "" {
 		o.Ref = DefaultBranch
 	}
-	if o.Output == nil {
-		o.Output = io.Discard
+	if err := checkReplaceable(o.Dir, o.Force); err != nil {
+		return o.Dir, "", err
 	}
-	if isRepoRoot(o.Dir) {
-		if _, err := exec.LookPath("git"); err == nil {
-			fmt.Fprintf(o.Output, "git pull in %s\n", o.Dir)
-			cmd := exec.CommandContext(ctx, "git", "-C", o.Dir, "pull", "--ff-only")
-			out, err := cmd.CombinedOutput()
-			if err != nil {
-				return o.Dir, "", fmt.Errorf("git pull: %s", strings.TrimSpace(string(out)))
+	return updateArchive(ctx, o)
+}
+
+// updateGit updates a git checkout in place. It never falls back to replacing
+// the directory: that would discard .git and any uncommitted work.
+func updateGit(ctx context.Context, o UpdateOptions) (string, string, error) {
+	if _, err := exec.LookPath("git"); err != nil {
+		return o.Dir, "", fmt.Errorf("%s is a git checkout but git is not on PATH; install git to update it (it is never replaced by an archive)", o.Dir)
+	}
+	git := func(timeout time.Duration, args ...string) (string, error) {
+		cctx := ctx
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			cctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+		cmd := exec.CommandContext(cctx, "git", append([]string{"-C", o.Dir}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never")
+		out, err := cmd.CombinedOutput()
+		if cctx.Err() == context.DeadlineExceeded {
+			return string(out), fmt.Errorf("git %s: timed out after %s", args[0], timeout)
+		}
+		if err != nil {
+			msg := strings.TrimSpace(string(out))
+			if msg == "" {
+				msg = err.Error()
 			}
-			rev, _ := exec.CommandContext(ctx, "git", "-C", o.Dir, "rev-parse", "--short", "HEAD").Output()
-			return o.Dir, strings.TrimSpace(string(rev)), nil
+			return string(out), fmt.Errorf("git %s: %s", args[0], msg)
+		}
+		return string(out), nil
+	}
+	if o.Repo != "" && o.Repo != DefaultRepo {
+		return o.Dir, "", fmt.Errorf("%s is a git checkout: -repo is not used for checkouts; change its remote with `git remote set-url origin`", o.Dir)
+	}
+	if o.Ref == "" {
+		fmt.Fprintf(o.Output, "git pull in %s\n", o.Dir)
+		if _, err := git(o.GitTimeout, "pull", "--ff-only"); err != nil {
+			return o.Dir, "", err
+		}
+	} else {
+		if strings.HasPrefix(o.Ref, "-") {
+			return o.Dir, "", fmt.Errorf("invalid ref %q", o.Ref)
+		}
+		status, err := git(o.GitTimeout, "status", "--porcelain", "--untracked-files=no")
+		if err != nil {
+			return o.Dir, "", err
+		}
+		if strings.TrimSpace(status) != "" {
+			return o.Dir, "", fmt.Errorf("%s has uncommitted changes; commit or stash them before checking out -ref %s", o.Dir, o.Ref)
+		}
+		fmt.Fprintf(o.Output, "git fetch origin %s in %s\n", o.Ref, o.Dir)
+		if _, err := git(o.GitTimeout, "fetch", "origin", "--", o.Ref); err != nil {
+			return o.Dir, "", err
+		}
+		if _, err := git(o.GitTimeout, "checkout", "--detach", "FETCH_HEAD"); err != nil {
+			return o.Dir, "", err
 		}
 	}
-	url := fmt.Sprintf("https://codeload.github.com/%s/zip/refs/heads/%s", o.Repo, o.Ref)
-	if looksLikeTag(o.Ref) {
-		url = fmt.Sprintf("https://codeload.github.com/%s/zip/refs/tags/%s", o.Repo, o.Ref)
+	rev, err := git(o.GitTimeout, "rev-parse", "--short", "HEAD")
+	if err != nil {
+		return o.Dir, "", err
 	}
+	return o.Dir, strings.TrimSpace(rev), nil
+}
+
+// checkReplaceable refuses to replace a directory update-templates did not
+// create: it must be missing, empty, or carry the version marker.
+func checkReplaceable(dir string, force bool) error {
+	fi, err := os.Lstat(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("%s exists and is not a directory", dir)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 || force {
+		return nil
+	}
+	if _, err := os.Stat(filepath.Join(dir, versionFile)); err == nil {
+		return nil
+	}
+	return fmt.Errorf("refusing to replace %s: it is not empty and was not installed by update-templates (no %s marker); point -templates at another directory, or pass -force to replace it", dir, versionFile)
+}
+
+func updateArchive(ctx context.Context, o UpdateOptions) (string, string, error) {
+	base := strings.TrimRight(o.ArchiveBaseURL, "/")
+	if base == "" {
+		base = DefaultArchiveBaseURL
+	}
+	// zip/<ref> resolves branches, tags and commits alike, so a branch that
+	// looks like a version (v2-dev) is not mistaken for a tag.
+	url := fmt.Sprintf("%s/%s/zip/%s", base, o.Repo, o.Ref)
 	fmt.Fprintf(o.Output, "downloading %s\n", url)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return o.Dir, "", err
 	}
-	client := &http.Client{Timeout: 10 * time.Minute}
+	client := o.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Minute}
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return o.Dir, "", err
@@ -179,29 +298,60 @@ func Update(ctx context.Context, o UpdateOptions) (string, string, error) {
 	if err != nil {
 		return o.Dir, "", err
 	}
-	tmp := o.Dir + ".new"
-	os.RemoveAll(tmp)
+
+	parent, name := filepath.Dir(o.Dir), filepath.Base(o.Dir)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return o.Dir, "", err
+	}
+	tmp, err := os.MkdirTemp(parent, "."+name+".new-")
+	if err != nil {
+		return o.Dir, "", err
+	}
 	if err := unzipStripTop(data, tmp); err != nil {
 		os.RemoveAll(tmp)
 		return o.Dir, "", err
 	}
-	old := o.Dir + ".old"
-	os.RemoveAll(old)
-	if _, err := os.Stat(o.Dir); err == nil {
-		if err := os.Rename(o.Dir, old); err != nil {
-			os.RemoveAll(tmp)
-			return o.Dir, "", err
-		}
-	}
-	if err := os.Rename(tmp, o.Dir); err != nil {
-		os.Rename(old, o.Dir)
+	version := o.Repo + "@" + o.Ref + " " + time.Now().UTC().Format(time.RFC3339)
+	if err := os.WriteFile(filepath.Join(tmp, versionFile), []byte(version+"\n"), 0o644); err != nil {
+		os.RemoveAll(tmp)
 		return o.Dir, "", err
 	}
-	os.RemoveAll(old)
-	version := o.Repo + "@" + o.Ref + " " + time.Now().UTC().Format(time.RFC3339)
-	_ = os.WriteFile(filepath.Join(o.Dir, versionFile), []byte(version+"\n"), 0o644)
+	if err := swapDir(tmp, o.Dir); err != nil {
+		os.RemoveAll(tmp)
+		return o.Dir, "", err
+	}
 	return o.Dir, version, nil
 }
+
+// swapDir moves newDir into place at dir. The previous dir is kept under a
+// unique sibling name until newDir is in place, restored if that fails, and
+// only then removed.
+func swapDir(newDir, dir string) error {
+	if _, err := os.Lstat(dir); errors.Is(err, os.ErrNotExist) {
+		return os.Rename(newDir, dir)
+	}
+	old, err := os.MkdirTemp(filepath.Dir(dir), "."+filepath.Base(dir)+".old-")
+	if err != nil {
+		return err
+	}
+	// os.Rename cannot replace a directory on every platform; free the name.
+	if err := os.Remove(old); err != nil {
+		return err
+	}
+	if err := os.Rename(dir, old); err != nil {
+		return err
+	}
+	if err := renameDir(newDir, dir); err != nil {
+		if rerr := os.Rename(old, dir); rerr != nil {
+			return fmt.Errorf("%w; the previous templates are kept at %s (restore failed: %v)", err, old, rerr)
+		}
+		return err
+	}
+	return os.RemoveAll(old)
+}
+
+// renameDir is os.Rename; a variable so tests can make the swap fail.
+var renameDir = os.Rename
 
 // Version returns the recorded version of a templates directory, if any.
 func Version(dir string) string {
@@ -217,11 +367,9 @@ func Version(dir string) string {
 	return strings.TrimSpace(string(b))
 }
 
-func looksLikeTag(ref string) bool {
-	return strings.HasPrefix(ref, "v") && len(ref) > 1 && ref[1] >= '0' && ref[1] <= '9'
-}
-
 // unzipStripTop extracts a GitHub archive (single top-level folder) into dst.
+// Only directories and regular files are extracted: symlinks (and any other
+// special entries) are skipped, and entries escaping dst are rejected.
 func unzipStripTop(data []byte, dst string) error {
 	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
@@ -230,6 +378,7 @@ func unzipStripTop(data []byte, dst string) error {
 	if err := os.MkdirAll(dst, 0o755); err != nil {
 		return err
 	}
+	root := filepath.Clean(dst) + string(os.PathSeparator)
 	for _, f := range zr.File {
 		name := f.Name
 		if i := strings.Index(name, "/"); i >= 0 {
@@ -241,33 +390,47 @@ func unzipStripTop(data []byte, dst string) error {
 			continue
 		}
 		target := filepath.Join(dst, filepath.FromSlash(name))
-		if !strings.HasPrefix(target, filepath.Clean(dst)+string(os.PathSeparator)) {
+		if !strings.HasPrefix(target, root) {
 			return errors.New("archive contains an unsafe path: " + f.Name)
 		}
-		if f.FileInfo().IsDir() {
+		mode := f.Mode()
+		if mode.IsDir() {
 			if err := os.MkdirAll(target, 0o755); err != nil {
 				return err
 			}
 			continue
 		}
+		if !mode.IsRegular() {
+			continue // symlink, device, ...: never materialise it
+		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
 		}
-		rc, err := f.Open()
-		if err != nil {
-			return err
-		}
-		out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, f.Mode().Perm()|0o600)
-		if err != nil {
-			rc.Close()
-			return err
-		}
-		_, err = io.Copy(out, rc)
-		rc.Close()
-		out.Close()
-		if err != nil {
+		if err := extractFile(f, target); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func extractFile(f *zip.File, target string) error {
+	perm := os.FileMode(0o644)
+	if f.Mode()&0o111 != 0 {
+		perm = 0o755
+	}
+	rc, err := f.Open()
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	// O_EXCL: never follow or overwrite something already at target.
+	out, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, perm)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(out, rc)
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }

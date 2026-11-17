@@ -106,6 +106,9 @@ func (c *Client) ContainerCreate(ctx context.Context, spec engine.ContainerSpec)
 	if spec.Name != "" {
 		q.Set("name", spec.Name)
 	}
+	if spec.Platform != "" {
+		q.Set("platform", spec.Platform)
+	}
 	var out struct {
 		ID       string   `json:"Id"`
 		Warnings []string `json:"Warnings"`
@@ -229,36 +232,52 @@ func (c *Client) ContainerExec(ctx context.Context, id, command string, timeout 
 	if err != nil {
 		return -1, "", err
 	}
-	out := demux(resp.Body)
+	// Drain the stream to EOF (it ends when the process exits), keeping only
+	// the first 1 MiB: stopping at the cap would inspect a still-running exec,
+	// whose ExitCode reads as 0.
+	out := demux(resp.Body, 1<<20, true)
 	resp.Body.Close()
-	var insp struct {
-		ExitCode int `json:"ExitCode"`
+	if err := ctx.Err(); err != nil {
+		return -1, out, fmt.Errorf("exec timed out: %w", err)
 	}
-	if err := c.doJSON(ctx, http.MethodGet, "/exec/"+created.ID+"/json", nil, nil, &insp); err != nil {
-		return -1, out, err
+	for {
+		var insp struct {
+			Running  bool `json:"Running"`
+			ExitCode int  `json:"ExitCode"`
+		}
+		if err := c.doJSON(ctx, http.MethodGet, "/exec/"+created.ID+"/json", nil, nil, &insp); err != nil {
+			return -1, out, err
+		}
+		if !insp.Running {
+			return insp.ExitCode, out, nil
+		}
+		// The stream can close a moment before the daemon records the exit.
+		select {
+		case <-ctx.Done():
+			return -1, out, fmt.Errorf("exec timed out: %w", ctx.Err())
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
-	return insp.ExitCode, out, nil
 }
 
-// demux decodes the Docker stream multiplexing format (8-byte frame headers).
-func demux(r io.Reader) string {
-	var b strings.Builder
+// demux decodes the Docker stream multiplexing format (8-byte frame headers),
+// keeping at most limit bytes. With drain it reads to EOF past the cap (so the
+// producer is known to be done); otherwise it stops once the cap is reached.
+func demux(r io.Reader, limit int, drain bool) string {
+	b := &engine.CappedBuffer{Max: limit}
 	hdr := make([]byte, 8)
 	for {
 		if _, err := io.ReadFull(r, hdr); err != nil {
 			break
 		}
-		n := binary.BigEndian.Uint32(hdr[4:])
+		n := int64(binary.BigEndian.Uint32(hdr[4:]))
 		if n == 0 {
 			continue
 		}
-		buf := make([]byte, n)
-		if _, err := io.ReadFull(r, buf); err != nil {
-			b.Write(buf)
+		if _, err := io.CopyN(b, r, n); err != nil {
 			break
 		}
-		b.Write(buf)
-		if b.Len() > 1<<20 {
+		if b.Truncated && !drain {
 			break
 		}
 	}
@@ -278,13 +297,13 @@ func (c *Client) ContainerLogs(ctx context.Context, id string, tail int) (string
 	defer resp.Body.Close()
 	if strings.HasPrefix(resp.Header.Get("Content-Type"), "application/vnd.docker.multiplexed-stream") ||
 		resp.Header.Get("Content-Type") == "application/vnd.docker.raw-stream" {
-		return demux(resp.Body), nil
+		return demux(resp.Body, 1<<20, false), nil
 	}
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	s := string(b)
 	// older daemons send the multiplexed stream without a telling content type
 	if len(s) >= 8 && (s[0] == 1 || s[0] == 2) && s[1] == 0 && s[2] == 0 && s[3] == 0 {
-		return demux(strings.NewReader(s)), nil
+		return demux(strings.NewReader(s), 1<<20, false), nil
 	}
 	return s, nil
 }

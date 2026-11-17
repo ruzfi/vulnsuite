@@ -22,8 +22,8 @@ contract.yaml ───────► Contract ─────────► i
 | `pkg/loader` | Finds contracts under a root and resolves selectors (folder, file, id, unique substring). Sets `Folder`/`SourcePath` on loaded contracts. |
 | `pkg/validator` | Semantic lint: is the template *wrong* rather than malformed (unpinned base, missing files, identical states, weak probes, ...). Pure functions over contracts. |
 | `pkg/engine` | The `Engine` interface the rest of the system builds and runs on. `engine/moby` implements it with the official Moby SDK (`github.com/moby/moby/client`, the default); `engine/docker` implements the same thing against the Engine HTTP API with `net/http` only; `engine/engines` picks one by name; `engine/registryauth` resolves registry credentials for both; `engine/enginetest` is an in-memory fake for tests. |
-| `pkg/builder` | Turns a (contract, state) into a local image: pull for `image` kinds, a generated overlay Dockerfile for `overlay`, a git checkout + patch for `source`, the template's own context for `build`. Builds are tar streams in memory; `ResolveAll` runs them in parallel with a bounded worker pool. `Publish` tags and pushes to a registry. |
-| `pkg/runner` | Starts a resolved image with the hardening baseline and the chosen exposure, waits for readiness, runs the state's probes, and manages the fleet (`Running`, `StopAll`). Stateless: the fleet is discovered by container name prefix and labels, so there is no bookkeeping file to drift. |
+| `pkg/builder` | Turns a (contract, state) into a local image: pull for `image` kinds, a generated overlay Dockerfile for `overlay`, a git checkout + patch for `source`, the template's own context for `build`. Build contexts are streamed to the daemon as tar (never held in memory whole), honouring `.dockerignore`; `ResolveAll` runs them in parallel with a bounded worker pool. `Publish` tags and pushes to a registry. |
+| `pkg/runner` | Starts a resolved image with the hardening baseline and the chosen exposure, waits for readiness, runs the state's probes, and manages the fleet (`Running`, `StopAll`). Stateless: the fleet is discovered by the `dev.vulnsuite.*` container labels (id, state, role, network), so there is no bookkeeping file to drift. Each target state gets its own sidecars on a private network. |
 | `pkg/probes` | Raw-socket HTTP, TCP and exec probes plus readiness helpers. Deliberately not `net/http` on the client side so encoded traversal payloads reach the wire unchanged. |
 | `pkg/templates` | Where the templates directory is, and `update-templates` (git pull, or a GitHub archive download). |
 | `internal/cli` | The commands. A tiny subcommand layer over `flag`; every command gets the global flags; `-json` output is on stdout with progress on stderr. |
@@ -39,9 +39,10 @@ The state name is not in the hash on purpose.
 **Two engine clients behind one interface.** The default is the official
 Moby SDK (`github.com/moby/moby/client`, the modern, modular successor of
 `github.com/docker/docker/client`): API-version negotiation, `DOCKER_HOST` /
-TLS / context handling and error typing come for free and track the daemon.
+TLS handling and error typing come for free and track the daemon.
 `engine/docker` is a few hundred lines over the unix socket with `net/http`
-only, kept as a fallback (`-engine api`) and as proof that the interface is
+only (it resolves `DOCKER_HOST`, `DOCKER_TLS_VERIFY` / `DOCKER_CERT_PATH` and
+docker contexts itself, the way the docker CLI does), kept as a fallback (`-engine api`) and as proof that the interface is
 small: everything the builder and runner need is build, pull, push, tag,
 create/start/remove/inspect/exec/logs/wait and networks. Both run the same
 end-to-end test. Podman's native API or a remote builder would be a third

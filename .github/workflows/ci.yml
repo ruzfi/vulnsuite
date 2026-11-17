@@ -25,6 +25,9 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+      # Register qemu binfmt handlers so the emulated-platform e2e test runs
+      # (without them it skips).
+      - uses: docker/setup-qemu-action@v3
       - run: VULNSUITE_E2E=1 go test -count=1 -v ./internal/e2e/
   templates:
     name: validate vulnsuite-templates with this build

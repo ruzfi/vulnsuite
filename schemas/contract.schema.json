@@ -33,7 +33,10 @@
       "properties": {
         "id": {
           "type": "string",
-          "pattern": "^[a-z0-9][a-z0-9.-]{2,79}$"
+          "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$",
+          "minLength": 3,
+          "maxLength": 80,
+          "description": "Unique target id; also a Docker repository path component, so no leading, trailing or doubled '.'/'-'."
         },
         "summary": {
           "type": "string"
@@ -177,10 +180,12 @@
             },
             "commit": {
               "type": "string",
-              "description": "Pinned commit -- an RC or unreleased vulnerable revision."
+              "description": "Pinned commit -- an RC or unreleased vulnerable revision. Must be a full 40-character (or 64-character SHA-256) commit id: `validate` reports a branch or tag as unpinned-base and an abbreviated id as short-commit."
             },
             "dockerfile": {
-              "type": "string"
+              "type": "string",
+              "pattern": "^(?![/\\\\]|[A-Za-z]:)(?!(.*[/\\\\])?\\.\\.([/\\\\]|$))[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]+$",
+              "description": "Dockerfile path inside the build context. Relative to the template folder: not absolute, no .. segments, no control characters; a symlink must resolve inside the folder."
             },
             "build_args": {
               "type": "object",
@@ -202,10 +207,13 @@
             },
             "context": {
               "type": "string",
-              "description": "Folder inside the template with a Dockerfile + source (e.g. a Python/Go socket sim)."
+              "description": "Folder inside the template with a Dockerfile + source (e.g. a Python/Go socket sim). Relative to the template folder: not absolute, no .. segments, no control characters; a symlink must resolve inside the folder.",
+              "pattern": "^(?![/\\\\]|[A-Za-z]:)(?!(.*[/\\\\])?\\.\\.([/\\\\]|$))[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]+$"
             },
             "dockerfile": {
-              "type": "string"
+              "type": "string",
+              "pattern": "^(?![/\\\\]|[A-Za-z]:)(?!(.*[/\\\\])?\\.\\.([/\\\\]|$))[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]+$",
+              "description": "Dockerfile path inside the build context. Relative to the template folder: not absolute, no .. segments, no control characters; a symlink must resolve inside the folder."
             },
             "build_args": {
               "type": "object",
@@ -311,6 +319,7 @@
         },
         "sidecars": {
           "type": "array",
+          "description": "Helper containers started next to the target. Pin each image with digest (`validate`: unpinned-sidecar); under emulation they run on the target's platform.",
           "items": {
             "type": "object",
             "required": [
@@ -438,15 +447,17 @@
       "properties": {
         "image": {
           "type": "string",
-          "description": "Per-state image override (reuse-if-matches): e.g. patched = a newer tag."
+          "description": "Per-state image override (reuse-if-matches): e.g. patched = a newer tag. Pin it with digest (`validate`: unpinned-state-image). Part of the content hash of an overlay build."
         },
         "digest": {
           "type": "string",
-          "pattern": "^sha256:[0-9a-f]{64}$"
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "description": "Digest pinning the state's image override."
         },
         "patch": {
           "type": "string",
-          "description": "Git patch applied to a source base to reach this state."
+          "description": "Git patch applied to a source base to reach this state. Relative to the template folder: not absolute, no .. segments, no control characters; a symlink must resolve inside the folder.",
+          "pattern": "^(?![/\\\\]|[A-Za-z]:)(?!(.*[/\\\\])?\\.\\.([/\\\\]|$))[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]+$"
         },
         "overlay": {
           "type": "array",
@@ -459,14 +470,19 @@
             "additionalProperties": false,
             "properties": {
               "src": {
-                "type": "string"
+                "type": "string",
+                "pattern": "^(?![/\\\\]|[A-Za-z]:)(?!(.*[/\\\\])?\\.\\.([/\\\\]|$))[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]+$",
+                "description": "Template file to bake in. Relative to the template folder: not absolute, no .. segments, no control characters; a symlink must resolve inside the folder."
               },
               "dest": {
-                "type": "string"
+                "type": "string",
+                "pattern": "^(?!(.*/)?\\.\\.(/|$))(?![/.]*$)[A-Za-z0-9._@%+=:,/-]+$",
+                "description": "Absolute path in the image (image base) or a path in the build context (source/build base). A plain path: letters, digits and . _ @ % + = : , / -; no whitespace, quotes, $ or control characters; no .. segments; not the root."
               },
               "mode": {
                 "type": "string",
-                "pattern": "^0[0-7]{3}$"
+                "pattern": "^0[0-7]{3}$",
+                "description": "File mode, set in the build context (no RUN chmod, so it works on non-root and shell-less bases). Part of the content hash."
               }
             }
           }
@@ -474,8 +490,13 @@
         "environment": {
           "type": "object",
           "additionalProperties": {
-            "type": "string"
-          }
+            "type": "string",
+            "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]*$"
+          },
+          "propertyNames": {
+            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+          },
+          "description": "Baked into built images as ENV lines and passed at run time. Names are plain variable names; values may not contain control characters."
         },
         "seed": {
           "type": "array",
@@ -511,7 +532,7 @@
         },
         "sidecars": {
           "type": "object",
-          "description": "Per-state sidecar image overrides, keyed by sidecar name (e.g. the patched version on every node of a multi-node target).",
+          "description": "Per-state sidecar image overrides, keyed by sidecar name (e.g. the patched version on every node of a multi-node target). Pin each image with digest (`validate`: unpinned-sidecar).",
           "additionalProperties": {
             "type": "object",
             "required": [
@@ -594,6 +615,8 @@
             },
             "port": {
               "type": "integer",
+              "minimum": 1,
+              "maximum": 65535,
               "description": "Target a non-primary container port (default: the primary port)."
             }
           }
@@ -628,7 +651,9 @@
           "additionalProperties": false,
           "properties": {
             "port": {
-              "type": "integer"
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
             },
             "send": {
               "type": "string"

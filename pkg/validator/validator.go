@@ -4,6 +4,7 @@
 package validator
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/ruzfi/vulnsuite/pkg/contract"
+	"github.com/ruzfi/vulnsuite/pkg/loader"
 	"github.com/ruzfi/vulnsuite/pkg/scanners"
 )
 
@@ -65,6 +67,8 @@ func (v *Validator) Check(c *contract.Contract) []Finding {
 	out = append(out, v.states(c)...)
 	out = append(out, v.verify(c)...)
 	out = append(out, v.ports(c)...)
+	out = append(out, v.portRefs(c)...)
+	out = append(out, v.shadowed(c)...)
 	out = append(out, v.provenance(c)...)
 	out = append(out, v.fidelity(c)...)
 	out = append(out, v.requires(c)...)
@@ -203,52 +207,132 @@ func refKey(c *contract.Contract) string {
 	return strings.Join(refs, "\x00")
 }
 
+// fullSHARe matches a full git commit id (SHA-1 or SHA-256); shortSHARe an
+// abbreviated one, which can become ambiguous as the repository grows.
+var (
+	fullSHARe  = regexp.MustCompile(`^(?i)[0-9a-f]{40}([0-9a-f]{24})?$`)
+	shortSHARe = regexp.MustCompile(`^(?i)[0-9a-f]{7,39}$`)
+)
+
+// pinning checks that every image a template runs or builds from is pinned:
+// the base (image digest / full source commit), per-state image overrides and
+// sidecar images. An unpinned ref is an error, or a warning with
+// AllowUnpinned; an abbreviated commit is always a warning.
 func (v *Validator) pinning(c *contract.Contract) []Finding {
-	if c.Base.Pinned() {
-		return nil
-	}
 	level := Error
 	if v.AllowUnpinned {
 		level = Warning
 	}
-	what := "image digest"
-	if c.Base.Kind == contract.BaseSource {
-		what = "source commit"
+	var out []Finding
+	switch {
+	case !c.Base.Pinned():
+		what := "image digest"
+		if c.Base.Kind == contract.BaseSource {
+			what = "source commit"
+		}
+		out = append(out, Finding{level, c.ID(), "unpinned-base",
+			"base has no " + what + "; a template must pin its base to be reproducible on another device"})
+	case c.Base.Kind == contract.BaseSource && fullSHARe.MatchString(c.Base.Commit):
+	case c.Base.Kind == contract.BaseSource && shortSHARe.MatchString(c.Base.Commit):
+		out = append(out, Finding{Warning, c.ID(), "short-commit",
+			fmt.Sprintf("base.commit %q is an abbreviated commit id; use the full 40-character SHA so it cannot become ambiguous", c.Base.Commit)})
+	case c.Base.Kind == contract.BaseSource:
+		out = append(out, Finding{level, c.ID(), "unpinned-base",
+			fmt.Sprintf("base.commit %q is not a commit id (a branch or tag moves); pin the full 40-character SHA", c.Base.Commit)})
 	}
-	return []Finding{{level, c.ID(), "unpinned-base",
-		"base has no " + what + "; a template must pin its base to be reproducible on another device"}}
+	for _, name := range c.DeclaredStates() {
+		st := c.States[name]
+		if st.Image != "" && !contract.RefPinned(st.Image, st.Digest) {
+			out = append(out, Finding{level, c.ID(), "unpinned-state-image",
+				fmt.Sprintf("states.%s.image %s has no digest; pin it to be reproducible on another device", name, st.Image)})
+		}
+		overrides := make([]string, 0, len(st.Sidecars))
+		for sc := range st.Sidecars {
+			overrides = append(overrides, sc)
+		}
+		sort.Strings(overrides)
+		for _, sc := range overrides {
+			ov := st.Sidecars[sc]
+			if ov.Image != "" && !contract.RefPinned(ov.Image, ov.Digest) {
+				out = append(out, Finding{level, c.ID(), "unpinned-sidecar",
+					fmt.Sprintf("states.%s.sidecars.%s image %s has no digest; pin it to be reproducible on another device", name, sc, ov.Image)})
+			}
+		}
+	}
+	for _, sc := range c.Service.Sidecars {
+		if !contract.RefPinned(sc.Image, sc.Digest) {
+			out = append(out, Finding{level, c.ID(), "unpinned-sidecar",
+				fmt.Sprintf("sidecar %s image %s has no digest; pin it to be reproducible on another device", sc.Name, sc.Image)})
+		}
+	}
+	return out
 }
 
 func (v *Validator) filesExist(c *contract.Contract) []Finding {
 	var out []Finding
-	isFile := func(rel string) bool {
-		info, err := os.Stat(filepath.Join(c.Folder, filepath.FromSlash(rel)))
-		return err == nil && info.Mode().IsRegular()
+	// resolve confines a template path to the folder (following symlinks);
+	// a path that escapes it is reported once as path-escapes-template.
+	escapes := func(what, rel string) {
+		out = append(out, Finding{Error, c.ID(), "path-escapes-template",
+			fmt.Sprintf("%s %s resolves outside the template folder (a symlink or .. path); templates may only reference their own files", what, rel)})
+	}
+	// isFile reports a regular file inside the folder; ok is false when the
+	// path escapes (already reported).
+	isFile := func(what, rel string) (found, ok bool) {
+		p, err := c.TemplatePath(rel)
+		if errors.Is(err, contract.ErrPathEscapes) {
+			escapes(what, rel)
+			return false, false
+		}
+		if err != nil {
+			return false, true
+		}
+		info, err := os.Stat(p)
+		return err == nil && info.Mode().IsRegular(), true
 	}
 	if c.Base.Kind == contract.BaseBuild {
-		ctx := filepath.Join(c.Folder, filepath.FromSlash(c.Base.Context))
-		if info, err := os.Stat(ctx); err != nil || !info.IsDir() {
+		ctx, err := c.TemplatePath(c.Base.Context)
+		switch {
+		case errors.Is(err, contract.ErrPathEscapes):
+			escapes("build context", c.Base.Context)
+		case err != nil:
 			out = append(out, Finding{Error, c.ID(), "missing-context",
 				"build context " + c.Base.Context + " not found in the template folder"})
-		} else {
+		default:
+			if info, err := os.Stat(ctx); err != nil || !info.IsDir() {
+				out = append(out, Finding{Error, c.ID(), "missing-context",
+					"build context " + c.Base.Context + " not found in the template folder"})
+				break
+			}
 			df := c.Base.Dockerfile
 			if df == "" {
 				df = "Dockerfile"
 			}
-			if _, err := os.Stat(filepath.Join(ctx, filepath.FromSlash(df))); err != nil {
+			p, err := contract.ConfinedPath(ctx, df)
+			switch {
+			case errors.Is(err, contract.ErrPathEscapes):
+				escapes("dockerfile", df)
+			case err != nil:
 				out = append(out, Finding{Error, c.ID(), "missing-dockerfile",
 					"build context has no " + df})
+			default:
+				if info, err := os.Stat(p); err != nil || !info.Mode().IsRegular() {
+					out = append(out, Finding{Error, c.ID(), "missing-dockerfile",
+						"build context has no " + df})
+				}
 			}
 		}
 	}
 	for _, name := range c.DeclaredStates() {
 		st := c.States[name]
-		if st.Patch != "" && !isFile(st.Patch) {
-			out = append(out, Finding{Error, c.ID(), "missing-patch",
-				fmt.Sprintf("%s: patch %s not found in the template folder", name, st.Patch)})
+		if st.Patch != "" {
+			if found, ok := isFile(name+": patch", st.Patch); ok && !found {
+				out = append(out, Finding{Error, c.ID(), "missing-patch",
+					fmt.Sprintf("%s: patch %s not found in the template folder", name, st.Patch)})
+			}
 		}
 		for _, o := range st.Overlay {
-			if !isFile(o.Src) {
+			if found, ok := isFile(name+": overlay source", o.Src); ok && !found {
 				out = append(out, Finding{Error, c.ID(), "missing-overlay",
 					fmt.Sprintf("%s: overlay source %s not found", name, o.Src)})
 			}
@@ -308,7 +392,17 @@ func (v *Validator) states(c *contract.Contract) []Finding {
 		sameImg := vs.EffectiveImage(c.Base) == ps.EffectiveImage(c.Base)
 		sameHash := c.ContentHash(contract.StateVulnerable) == c.ContentHash(contract.StatePatched)
 		sameCmd := fmt.Sprint(vs.Command) == fmt.Sprint(ps.Command)
-		if sameImg && sameHash && sameCmd {
+		// The states also differ when a sidecar resolves to another image (the
+		// multi-node pattern: patched swaps each node to the fixed release) or
+		// when they seed different data.
+		sameSidecars := true
+		for _, sc := range c.Service.Sidecars {
+			if vs.SidecarRef(sc) != ps.SidecarRef(sc) {
+				sameSidecars = false
+			}
+		}
+		sameSeed := fmt.Sprint(vs.Seed) == fmt.Sprint(ps.Seed)
+		if sameImg && sameHash && sameCmd && sameSidecars && sameSeed {
 			out = append(out, Finding{Warning, c.ID(), "identical-states",
 				"vulnerable and patched resolve to the same build"})
 		}
@@ -394,6 +488,61 @@ func (v *Validator) ports(c *contract.Contract) []Finding {
 	return out
 }
 
+// portRefs checks that every container port a template refers to elsewhere
+// (healthcheck.tcp.port, verify http/tcp/net port) is declared in
+// service.ports. An undeclared port is never published in host mode and is
+// usually a typo, which otherwise surfaces only as a hang or a failed verify
+// at run time. It is a warning, not an error: a template may deliberately
+// probe a port only one state opens (a debug listener the vulnerable command
+// line enables). A tcp probe asserting closed: true is exempt, since proving a
+// port is shut needs no declaration.
+func (v *Validator) portRefs(c *contract.Contract) []Finding {
+	declared := map[int]bool{}
+	for _, p := range c.Service.Ports {
+		declared[p.Container] = true
+	}
+	var out []Finding
+	check := func(where string, port int) {
+		if port == 0 || declared[port] {
+			return // 0 is the default: the primary port
+		}
+		out = append(out, Finding{Warning, c.ID(), "undeclared-port",
+			fmt.Sprintf("%s refers to port %d, which is not declared in service.ports", where, port)})
+	}
+	if hc := c.Service.Healthcheck.TCP; hc != nil {
+		check("healthcheck.tcp.port", hc.Port)
+	}
+	for _, name := range c.DeclaredStates() {
+		for i, p := range c.States[name].Verify {
+			where := fmt.Sprintf("%s: verify probe #%d (%s)", name, i+1, p.Kind())
+			switch {
+			case p.HTTP != nil:
+				check(where, p.HTTP.Port)
+			case p.TCP != nil && !p.TCP.Closed:
+				check(where, p.TCP.Port)
+			case p.Net != nil:
+				check(where, p.Net.Port)
+			}
+		}
+	}
+	return out
+}
+
+// shadowed reports other contract files in the template's folder: discovery
+// loads one contract per folder, so the others are silently ignored.
+func (v *Validator) shadowed(c *contract.Contract) []Finding {
+	if c.SourcePath == "" {
+		return nil
+	}
+	var out []Finding
+	for _, other := range loader.Shadowed(c.SourcePath) {
+		out = append(out, Finding{Warning, c.ID(), "shadowed-contract",
+			fmt.Sprintf("folder also holds %s; a folder holds one template and only the first of %s is loaded, so the other is ignored",
+				filepath.Base(other), strings.Join(loader.ContractNames, ", "))})
+	}
+	return out
+}
+
 func (v *Validator) fidelity(c *contract.Contract) []Finding {
 	var out []Finding
 	if c.Metadata.Fidelity == "" {
@@ -415,6 +564,10 @@ func (v *Validator) provenance(c *contract.Contract) []Finding {
 	if len(c.Metadata.VulnRefs) == 0 {
 		out = append(out, Finding{Warning, c.ID(), "no-vuln-ref",
 			"no vuln_refs; a scanner cross-reference has nothing to match"})
+	}
+	if c.Metadata.Primary && c.Metadata.Group == "" {
+		out = append(out, Finding{Warning, c.ID(), "primary-no-group",
+			"primary: true has no effect without a group; set metadata.group or drop primary"})
 	}
 	if len(c.Metadata.References) == 0 {
 		out = append(out, Finding{Warning, c.ID(), "no-references",

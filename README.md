@@ -77,8 +77,9 @@ useful as ground truth if a machine can stand it up, prove it, scan it and
 tear it down without a human in the loop.
 
 - Every command takes `-json` and returns structured output (progress goes
-  to stderr), and exits non-zero when a target fails to build, start or
-  verify.
+  to stderr; empty results are `[]`), and exits non-zero when a target fails
+  to build, start or verify. Flag mistakes exit 2. `-q` silences progress,
+  never a command's output (`vulnsuite -q targets` still prints the URLs).
 - `vulnsuite run -detach -targets-file` plus `vulnsuite targets` give a
   scanner exactly the URLs to hit; `vulnsuite stop` cleans up.
 - The Go packages (`loader`, `builder`, `runner`, `probes`) are importable,
@@ -129,9 +130,19 @@ needed only for templates with a `source` base or a `patch`.
 ## Templates
 
 Community templates live in [ruzfi/vulnsuite-templates](https://github.com/ruzfi/vulnsuite-templates).
-`vulnsuite update-templates` fetches them into `~/vulnsuite-templates`; the
-templates directory is otherwise `-templates DIR`, `$VULNSUITE_TEMPLATES`, or
-the repository you are standing in.
+The templates directory is `-templates DIR`, `$VULNSUITE_TEMPLATES`, the
+templates repository you are standing in, or `~/vulnsuite-templates`.
+`vulnsuite update-templates` fetches the templates into that same directory:
+
+- a git checkout is pulled (`--ff-only`); `-ref BRANCH|TAG|COMMIT` fetches the
+  ref from `origin` and checks it out detached (refused while tracked files have
+  uncommitted changes). A checkout is never replaced, so the update fails if
+  `git` is not on `PATH`;
+- anything else is replaced by the GitHub archive of `-ref` (default `main`),
+  but only when the directory is missing, empty, or was installed by
+  `update-templates` (it has a `.vulnsuite-templates-version` marker). Any other
+  non-empty directory is refused unless you pass `-force`. The old directory is
+  removed only once the new one is in place.
 
 A template:
 
@@ -178,20 +189,31 @@ schema for editors and CI is [schemas/contract.schema.json](schemas/contract.sch
 vulnsuite list [selector] [-group H] [-variants] [-ref ID]... [-class C]... [-category P] [-cve] [-kev] [-year Y]  filter templates
 vulnsuite search ...                                alias for list
 vulnsuite validate [-t SEL]... [-strict]            structure + semantic lint
-vulnsuite build -t SEL... | -f FILE | <filter> | -all [-variants] [-j N] [-push -registry REG]
+vulnsuite build [vulnerable|patched] -t SEL... | -f FILE | <filter> | -all [-variants] [-j N] [-push -registry REG]
 vulnsuite run [vulnerable|patched] -t SEL... | -f FILE | <filter> | -all [-variants] [-expose MODE] [-detach]
 vulnsuite ps                                        running targets (id, state, ip)
 vulnsuite targets [-file FILE] [-by auto|ip|alias|host]  scannable URLs, right port per template
-vulnsuite stop [-t SEL]... [-prune-net]             tear down
+vulnsuite stop [-t SEL]... [-prune-net]             tear down (targets, their sidecars and sidecar networks)
 vulnsuite images [-rm]                              locally built images
-vulnsuite update-templates                          fetch / update the community templates
+vulnsuite update-templates [-ref REF] [-force]      fetch / update the community templates
 ```
 
 `-json` on any command gives machine-readable output (progress goes to stderr).
 `-engine sdk|api` (or `$VULNSUITE_ENGINE`) picks the daemon client: the Moby
-SDK by default, or the built-in API client.
+SDK by default, or the built-in API client. The API client also follows the
+docker CLI's context (`DOCKER_CONTEXT`, else `currentContext` in
+`~/.docker/config.json`) when `DOCKER_HOST` is unset, and speaks TLS to a
+`tcp://` daemon with `DOCKER_TLS_VERIFY` / `DOCKER_CERT_PATH` (`ca.pem`,
+`cert.pem`, `key.pem`).
 A selector is a folder (`web-servers`), a contract file, or a template id (a
 unique substring works: `-t grafana`).
+
+`run` and `build` take a state, `vulnerable` or `patched`, anywhere among their
+arguments, and flags may follow selectors: `vulnsuite run grafana patched
+-detach` and `vulnsuite build patched -t grafana` both work (for `build` it is
+shorthand for `-state`). A bare argument spelled like a state is always the
+state; a template literally named `vulnerable` or `patched` is still reachable
+with `-t`. After `--`, nothing is parsed as a flag.
 
 ### Variant groups and `-variants`
 
@@ -235,6 +257,14 @@ vulnsuite run -f targets.txt                            # a mixed file of select
 
 Filters *within one line* combine with AND (`-category web-apps -class exposure`
 is web-apps **and** exposure); separate selectors and filter lines union with OR.
+A filter selects every template that matches, variant-group members included —
+it does not collapse groups the way `-all` does — and `list <filter>` shows
+exactly the set that `run <filter>` / `build <filter>` will stand up. A
+template that fails to load fails the `run` or `build` rather than being skipped.
+Filter values are checked up front, on `list`, `run` and `build` alike: `-fidelity`
+must be `real` or `simulated`, `-year` a four-digit year and `-since` a
+`YYYY-MM-DD` date, so a typo is a usage error (exit 2) rather than a filter
+that silently matches nothing.
 
 A **`-f` file** lists one selector per line — an id, a group handle, a category, a
 `suite:<name>`, or a filter line (begins with `-`). Blank lines and `#` comments
@@ -251,6 +281,8 @@ suite:web-basics     # pull in a named suite
 A **suite** is a named selectors file (`<templates>/suites/<name>.txt`, same
 format) reached explicitly with `-t suite:<name>` or a `suite:` line in a file —
 never by a bare handle, so standing up a whole curated set is always deliberate.
+A mistake in a `-f` or suite file — a selector that matches nothing, a bad
+filter line — is reported as `file:line: ...`.
 A group handle inside a suite resolves to its primary, or to all members when you
 pass `-variants`. Overlapping selectors never start the same target twice.
 
@@ -271,6 +303,17 @@ Built images carry labels (`dev.vulnsuite.id`, `.state`, `.hash`,
 self-contained: `docker run ghcr.io/you/vulnsuite/<id>:vulnerable` is the
 vulnerable target, no vulnsuite needed.
 
+Push credentials come from `~/.docker/config.json` (or its credential
+helpers), or from `VULNSUITE_REGISTRY_USER` / `VULNSUITE_REGISTRY_TOKEN`. The
+env pair names no registry, so it is scoped: by default it is sent **only when
+pushing** to `-registry`, never when pulling the base or sidecar images a
+template names. Set `VULNSUITE_REGISTRY` (a host such as `ghcr.io`, or the
+`-registry` prefix) to also use it for pulls from that registry; it is then
+used for that registry only, pulls and pushes alike. `docker.io` (or a Hub
+prefix such as `docker.io/you`) matches every Docker Hub reference, bare ones
+like `nginx:1.25` included. The pair is never put in a build's registry
+config.
+
 ### Running and verifying
 
 ```bash
@@ -284,6 +327,41 @@ probes and prints `verify: ok` (or exactly which assertion failed). Up to 10
 targets run at once by default (`-max-concurrent`); a bigger batch starts as
 many as fit and reports the rest.
 
+### Results for pipelines: `-json -summary`
+
+`run -json` prints the array of started targets and `build -json` the array
+of build results, as before. Add `-summary` to either one to get a single
+document that also says what did not happen and why, so a pipeline can tell
+skipped from failed from not selected:
+
+```bash
+vulnsuite -json run -all -detach -summary
+# {"targets": [...handles...], "failed": [...], "skipped": [...]}
+vulnsuite -json build -all -summary
+# {"built": [...results...], "failed": [...results with "error"...], "skipped": [...]}
+```
+
+Each `skipped` / `failed` entry of `run` is `{id, state, reason, detail}`, and
+each `skipped` entry of `build` has the same shape. `reason` is a stable code:
+
+| reason | list | meaning |
+| --- | --- | --- |
+| `no-state` | skipped | the template has no such state |
+| `requires` | skipped | the host does not meet `requires` (override: `-ignore-requires`) |
+| `host-access` | skipped | needs host devices/capabilities (`-allow-host-access`) |
+| `over-cap` | skipped | over the `-max-concurrent` cap |
+| `cancelled` | skipped | interrupted before it started, or torn down by the interrupt |
+| `aborted` | skipped | not attempted: the command stopped on another error (e.g. a load error) |
+| `load` | failed | the template failed to load |
+| `start` | failed | could not be built, pulled or started |
+| `unhealthy` | failed | started but not ready, a seed failed, or verify failed (also in `targets`: it is running) |
+
+The document is printed on failure and on Ctrl-C too, and the exit code is
+unchanged: non-zero whenever anything failed or was interrupted. In `build`,
+jobs an interrupt stopped before they started are counted (`N ok, M failed, K
+cancelled before starting`); in the bare `-json` array they appear with an
+`error`.
+
 ### Exposure modes — how your scanner reaches the target
 
 | Mode | What happens | Use when |
@@ -291,6 +369,32 @@ many as fit and reports the rest.
 | `internal` (default) | the target joins the `vulnsuite-net` Docker network; nothing is published on the host | your scanner runs as a container (`docker run --network vulnsuite-net ...`) or your host routes to container IPs (Linux, OrbStack) |
 | `host` | the primary port is published on the host, by default on `127.0.0.1` (plus any `publish: true` ports); one host port per published port | the scanner is on the host or elsewhere on the network |
 | `macvlan` | the target gets its own IP on the LAN via `-parent eth0` | the target must look like a separate device |
+
+**Names on the network.** A target is reachable on `vulnsuite-net` under a
+per-state alias, `<id>-<state>` (e.g. `exposed-dotenv-file-vulnerable`), and
+its container is `vulnsuite-<id>-<state>`. Both states of a template can run at
+once and each name resolves to exactly one of them; `vulnsuite targets -by
+alias` prints these aliases.
+
+**Sidecars** (a database, a cache, a second cluster node) belong to one target
+state. Each runs as `vulnsuite-<id>-<state>-<sidecar>` on a private network,
+`vulnsuite-<id>-<state>-net`, shared only with its target, where it resolves
+under its template name (e.g. `db`) in every exposure mode. Sidecars are not
+on `vulnsuite-net` and are not scan targets. The private network follows
+`-no-egress` in `internal` mode, is a plain bridge in `host` mode (the
+target's ports are published from it), and has no egress in `macvlan` mode so
+the target's traffic keeps leaving through its LAN address. `vulnsuite stop`
+removes the sidecars and their network along with the target.
+
+`vulnsuite ps`, `targets` and `stop` find containers by their
+`dev.vulnsuite.*` labels: `stop -t foo` stops exactly template `foo` (never
+`foo-bar`), and containers vulnsuite did not start are left alone.
+
+**Ctrl-C.** Interrupting `run` while targets are starting stops the batch,
+removes what it had started and exits non-zero (`interrupted`). Interrupting a
+held batch tears it down; a removal that fails is reported and fails the
+command. A second Ctrl-C during teardown exits at once (finish with
+`vulnsuite stop`).
 
 In `host` mode, `-bind <address>` chooses the address the port is published on
 (default `127.0.0.1`). Pass the Docker daemon host's reachable address when the
@@ -303,7 +407,8 @@ A template may publish more than one port: the primary is always published, and
 any port marked `publish: true` in the contract is published alongside it and
 added to the scanner target lists. `-host-port` pins the primary's host port;
 `-host-port-map container=host` pins an additional one (repeatable). Unpinned
-published ports get free host ports, all reported by `ps`, `targets` and
+published ports get a free host port assigned by the Docker daemon (on its own
+machine, so this works with a remote daemon too), all reported by `ps`, `targets` and
 `-targets-file`:
 
 ```bash
@@ -399,8 +504,11 @@ vulnsuite list --since 2023-01-01                # disclosed on or after a date
 - `--kev` / `--no-kev`: on (not on) the CISA **Known Exploited Vulnerabilities**
   catalog — derived by cross-referencing the target's CVEs. The catalog is read
   from the templates checkout's `data/cisa-kev.txt`; `--refresh-kev` fetches the
-  live CISA feed and caches it at `~/.cache/vulnsuite/cisa-kev.json`. Offline
-  with neither present, KEV shows as `?` and `--kev`/`--no-kev` are unavailable.
+  live CISA feed and caches it at `~/.cache/vulnsuite/cisa-kev.json`, which is
+  used instead whenever it holds a newer catalog than the checkout. `list`
+  prints the source and its age (`kev_source` in `-json`) and warns when the
+  data is more than 30 days old. Offline with neither present, KEV shows as `?`
+  and `--kev`/`--no-kev` are unavailable.
 - `--year` / `--since`: from `metadata.disclosed`, falling back to the CVE-id
   year.
 

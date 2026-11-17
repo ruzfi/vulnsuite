@@ -76,19 +76,41 @@ func (e *Engine) Info(ctx context.Context) (engine.HostInfo, error) {
 
 // -- images -------------------------------------------------------------------
 
-func (e *Engine) ImageExists(ctx context.Context, ref string) (bool, error) {
-	_, err := e.cli.ImageInspect(ctx, ref)
-	if err == nil {
+func (e *Engine) ImageExists(ctx context.Context, ref, platform string) (bool, error) {
+	img, err := e.cli.ImageInspect(ctx, ref)
+	if err != nil {
+		if cerrdefs.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if engine.PlatformMatches(platform, img.Os, img.Architecture, img.Variant) {
 		return true, nil
 	}
-	if cerrdefs.IsNotFound(err) {
+	// A multi-platform store (containerd) reports the host's variant by
+	// default; ask for the wanted one (API 1.49+). An older daemon, or one
+	// without that platform's content, means it has to be pulled.
+	p, err := parsePlatform(platform)
+	if err != nil {
+		return false, err
+	}
+	img, err = e.cli.ImageInspect(ctx, ref, client.ImageInspectWithPlatform(&p))
+	if err != nil {
 		return false, nil
 	}
-	return false, err
+	return engine.PlatformMatches(platform, img.Os, img.Architecture, img.Variant), nil
 }
 
-func (e *Engine) ImagePull(ctx context.Context, ref string, out io.Writer) error {
-	resp, err := e.cli.ImagePull(ctx, ref, client.ImagePullOptions{RegistryAuth: registryauth.For(ref)})
+func (e *Engine) ImagePull(ctx context.Context, ref, platform string, out io.Writer) error {
+	po := client.ImagePullOptions{RegistryAuth: registryauth.For(ref)}
+	if platform != "" {
+		p, err := parsePlatform(platform)
+		if err != nil {
+			return err
+		}
+		po.Platforms = []ocispec.Platform{p}
+	}
+	resp, err := e.cli.ImagePull(ctx, ref, po)
 	if err != nil {
 		return fmt.Errorf("pull %s: %w", ref, err)
 	}
@@ -137,7 +159,7 @@ func (e *Engine) ImageTag(ctx context.Context, source, target string) error {
 }
 
 func (e *Engine) ImagePush(ctx context.Context, ref string, out io.Writer) error {
-	auth := registryauth.For(ref)
+	auth := registryauth.ForPush(ref)
 	if auth == "" {
 		auth, _ = authconfig.Encode(registry.AuthConfig{})
 	}
@@ -236,7 +258,15 @@ func (e *Engine) ContainerCreate(ctx context.Context, spec engine.ContainerSpec)
 		}
 		nc = &network.NetworkingConfig{EndpointsConfig: map[string]*network.EndpointSettings{spec.Network.Name: ep}}
 	}
-	res, err := e.cli.ContainerCreate(ctx, client.ContainerCreateOptions{Name: spec.Name, Config: cfg, HostConfig: hc, NetworkingConfig: nc})
+	co := client.ContainerCreateOptions{Name: spec.Name, Config: cfg, HostConfig: hc, NetworkingConfig: nc}
+	if spec.Platform != "" {
+		p, err := parsePlatform(spec.Platform)
+		if err != nil {
+			return "", err
+		}
+		co.Platform = &p
+	}
+	res, err := e.cli.ContainerCreate(ctx, co)
 	if err != nil {
 		return "", err
 	}
@@ -328,15 +358,38 @@ func (e *Engine) ContainerExec(ctx context.Context, id, command string, timeout 
 	if err != nil {
 		return -1, "", err
 	}
-	var out strings.Builder
-	_, _ = stdcopy.StdCopy(&out, &out, io.LimitReader(att.Reader, 1<<20))
+	// The hijacked connection does not watch ctx once attached; close it when
+	// the timeout (or the caller) cancels so a hung command cannot block here.
+	stopClose := context.AfterFunc(ctx, att.Close)
+	defer stopClose()
+	out := &engine.CappedBuffer{Max: execOutputCap}
+	// Read to EOF (the stream ends when the process exits), keeping only the
+	// first execOutputCap bytes: stopping early would inspect a still-running
+	// exec and report its exit code as 0.
+	_, _ = stdcopy.StdCopy(out, out, att.Reader)
 	att.Close()
-	insp, err := e.cli.ExecInspect(ctx, created.ID, client.ExecInspectOptions{})
-	if err != nil {
-		return -1, out.String(), err
+	if err := ctx.Err(); err != nil {
+		return -1, out.String(), fmt.Errorf("exec timed out: %w", err)
 	}
-	return insp.ExitCode, out.String(), nil
+	for {
+		insp, err := e.cli.ExecInspect(ctx, created.ID, client.ExecInspectOptions{})
+		if err != nil {
+			return -1, out.String(), err
+		}
+		if !insp.Running {
+			return insp.ExitCode, out.String(), nil
+		}
+		// The stream can close a moment before the daemon records the exit.
+		select {
+		case <-ctx.Done():
+			return -1, out.String(), fmt.Errorf("exec timed out: %w", ctx.Err())
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
+
+// execOutputCap bounds how much exec output is kept.
+const execOutputCap = 1 << 20
 
 func (e *Engine) ContainerLogs(ctx context.Context, id string, tail int) (string, error) {
 	opts := client.ContainerLogsOptions{ShowStdout: true, ShowStderr: true}
@@ -414,6 +467,13 @@ func (e *Engine) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (st
 	}
 	res, err := e.cli.NetworkCreate(ctx, spec.Name, opts)
 	if err != nil {
+		// A concurrent run created it between our inspect and create: use
+		// that one.
+		if cerrdefs.IsConflict(err) {
+			if again, ierr := e.cli.NetworkInspect(ctx, spec.Name, client.NetworkInspectOptions{}); ierr == nil {
+				return again.Network.ID, nil
+			}
+		}
 		return "", err
 	}
 	return res.ID, nil
@@ -424,6 +484,14 @@ func (e *Engine) NetworkRemove(ctx context.Context, name string) error {
 	if cerrdefs.IsNotFound(err) {
 		return nil
 	}
+	return err
+}
+
+func (e *Engine) NetworkConnect(ctx context.Context, networkName, container string, aliases []string) error {
+	_, err := e.cli.NetworkConnect(ctx, networkName, client.NetworkConnectOptions{
+		Container:      container,
+		EndpointConfig: &network.EndpointSettings{Aliases: aliases},
+	})
 	return err
 }
 
@@ -474,6 +542,11 @@ func drain(ctx context.Context, msgs func(func(jsonstream.Message, error) bool),
 		}
 		return ctx.Err() == nil
 	})
+	if failed == nil {
+		// The stream stopped because ctx was cancelled (or the iterator itself
+		// gave up on it): the pull/push did not finish, so it is not a success.
+		failed = ctx.Err()
+	}
 	return failed
 }
 

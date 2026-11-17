@@ -6,9 +6,10 @@
 // and removes entries). The set is sourced, in order:
 //
 //   - the templates checkout's data/cisa-kev.txt (the source of truth, a
-//     CVE-id snapshot kept fresh by the templates repo's cisa-kev-sync Action);
+//     CVE-id snapshot kept fresh by the templates repo's cisa-kev-sync Action),
+//     unless the local cache holds a newer catalog;
 //   - a local cache (~/.cache/vulnsuite/cisa-kev.json), when the templates file
-//     is absent;
+//     is absent or older than the cache;
 //   - empty, offline, when neither exists — the caller warns and --kev matches
 //     nothing.
 //
@@ -33,9 +34,14 @@ import (
 // FeedURL is the public CISA KEV JSON feed.
 const FeedURL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 
-// cveRe matches a bare CVE id anywhere in a line (case-insensitive; ids are
-// upper-cased on insertion).
-var cveRe = regexp.MustCompile(`(?i)CVE-\d{4}-\d{4,7}`)
+// cveRe matches a bare CVE id within a line (case-insensitive; ids are
+// upper-cased on insertion). The word boundaries keep it from taking a prefix of
+// a longer token (CVE-2021-12345678 is not CVE-2021-1234567).
+var cveRe = regexp.MustCompile(`(?i)\bCVE-\d{4}-\d{4,7}\b`)
+
+// cveExactRe matches a value that is exactly one CVE id, for whole-value
+// checks of cache and feed entries.
+var cveExactRe = regexp.MustCompile(`(?i)^CVE-\d{4}-\d{4,7}$`)
 
 // Set is a set of KEV-listed CVE ids (upper-cased).
 type Set map[string]bool
@@ -72,24 +78,73 @@ type Source struct {
 	Origin  Origin
 	Path    string // file path or URL, when applicable
 	Fetched string // ISO timestamp for cache/network sources
+	// CatalogVersion is CISA's catalogVersion (e.g. 2026.11.13) of the data,
+	// when known: the templates snapshot's header, or the feed's field.
+	CatalogVersion string
+	// AsOf is when the data was current: the catalogVersion date, else the
+	// fetch time. Zero when unknown (a snapshot without a header).
+	AsOf time.Time
+}
+
+// StaleAfter is the age past which KEV data is reported as stale. CISA adds
+// entries every few days, so a month-old set is likely missing some.
+const StaleAfter = 30 * 24 * time.Hour
+
+// Age is how old the data is at now (0 when AsOf is unknown).
+func (s Source) Age(now time.Time) time.Duration {
+	if s.AsOf.IsZero() {
+		return 0
+	}
+	return now.Sub(s.AsOf)
+}
+
+// Stale reports whether the data is known to be older than StaleAfter.
+func (s Source) Stale(now time.Time) bool {
+	return !s.AsOf.IsZero() && s.Age(now) > StaleAfter
 }
 
 // String renders the source for a status line.
 func (s Source) String() string {
+	var notes []string
+	if s.CatalogVersion != "" {
+		notes = append(notes, "catalog "+s.CatalogVersion)
+	}
+	if s.Fetched != "" && s.Origin != OriginNetwork {
+		notes = append(notes, "fetched "+s.Fetched)
+	}
+	note := ""
+	if len(notes) > 0 {
+		note = " (" + strings.Join(notes, ", ") + ")"
+	}
 	switch s.Origin {
 	case OriginTemplates:
-		return "templates " + s.Path
+		return "templates " + s.Path + note
 	case OriginCache:
-		at := ""
-		if s.Fetched != "" {
-			at = " (fetched " + s.Fetched + ")"
-		}
-		return "cache " + s.Path + at
+		return "cache " + s.Path + note
 	case OriginNetwork:
-		return "CISA feed " + s.Path
+		return "CISA feed " + s.Path + note
 	default:
 		return "unavailable (offline)"
 	}
+}
+
+// catalogDate parses a CISA catalogVersion (2026.11.13) as a date.
+func catalogDate(v string) time.Time {
+	t, err := time.Parse("2006.01.02", strings.TrimSpace(v))
+	if err != nil {
+		return time.Time{}
+	}
+	return t.UTC()
+}
+
+// asOf is when data with this catalog version, fetched at fetched (RFC 3339),
+// was current: the catalog date when known, else the fetch time.
+func asOf(catalogVersion, fetched string) time.Time {
+	if t := catalogDate(catalogVersion); !t.IsZero() {
+		return t
+	}
+	t, _ := time.Parse(time.RFC3339, fetched)
+	return t
 }
 
 // Options configures Resolve.
@@ -107,6 +162,18 @@ type Options struct {
 	FeedURL string
 	// Now overrides the clock used for cache timestamps (tests).
 	Now func() time.Time
+	// Warn receives non-fatal problems (a corrupt cache, an empty snapshot).
+	// Nil writes them to stderr.
+	Warn func(msg string)
+}
+
+func (o Options) warn(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	if o.Warn != nil {
+		o.Warn(msg)
+		return
+	}
+	fmt.Fprintln(os.Stderr, "warning: "+msg)
 }
 
 func (o Options) feedURL() string {
@@ -138,7 +205,9 @@ func (o Options) now() time.Time {
 
 // Resolve loads the KEV CVE-id set per the sourcing rules. It never errors on a
 // missing source; it only errors when Refresh is set and the fetch fails, or on
-// an unreadable existing file.
+// an unreadable templates snapshot. A corrupt or unreadable cache is treated as
+// missing (with a warning), and an empty templates snapshot falls through to
+// the cache, so a bad file cannot break every listing.
 func Resolve(ctx context.Context, opts Options) (Set, Source, error) {
 	cachePath, cacheErr := opts.cachePath()
 
@@ -147,33 +216,56 @@ func Resolve(ctx context.Context, opts Options) (Set, Source, error) {
 			return nil, Source{}, cacheErr
 		}
 		url := opts.feedURL()
-		set, err := fetch(ctx, opts.Client, url)
+		set, version, err := fetch(ctx, opts.Client, url)
 		if err != nil {
 			return nil, Source{}, fmt.Errorf("refresh KEV from CISA feed: %w", err)
 		}
 		fetched := opts.now().UTC().Format(time.RFC3339)
 		// A fresh set is still usable even if the cache write fails.
-		_ = writeCache(cachePath, set, string(OriginNetwork), fetched)
-		return set, Source{Origin: OriginNetwork, Path: url, Fetched: fetched}, nil
+		_ = writeCache(cachePath, set, string(OriginNetwork), fetched, version)
+		return set, Source{Origin: OriginNetwork, Path: url, Fetched: fetched, CatalogVersion: version, AsOf: asOf(version, fetched)}, nil
 	}
 
-	// Source of truth: the templates checkout's snapshot.
+	// The local cache from an earlier --refresh-kev.
+	var cacheSet Set
+	var cacheSrc Source
+	var cacheLoadErr error = os.ErrNotExist
+	if cacheErr == nil {
+		var cf cacheFile
+		if cacheSet, cf, cacheLoadErr = loadCache(cachePath); cacheLoadErr == nil {
+			cacheSrc = Source{Origin: OriginCache, Path: cachePath, Fetched: cf.Fetched,
+				CatalogVersion: cf.CatalogVersion, AsOf: asOf(cf.CatalogVersion, cf.Fetched)}
+		}
+	}
+
+	// Source of truth: the templates checkout's snapshot, unless the cache is
+	// known to hold a newer catalog (a recent -refresh-kev against an old
+	// checkout).
 	if opts.TemplatesDir != "" {
 		txt := filepath.Join(opts.TemplatesDir, "data", "cisa-kev.txt")
 		if data, err := os.ReadFile(txt); err == nil {
-			return parseTxt(data), Source{Origin: OriginTemplates, Path: txt}, nil
+			if set := parseTxt(data); set.Len() > 0 {
+				version := txtCatalogVersion(data)
+				src := Source{Origin: OriginTemplates, Path: txt, CatalogVersion: version, AsOf: catalogDate(version)}
+				if cacheLoadErr == nil && cacheSet.Len() > 0 && !src.AsOf.IsZero() && cacheSrc.AsOf.After(src.AsOf) {
+					return cacheSet, cacheSrc, nil
+				}
+				return set, src, nil
+			}
+			// An empty snapshot (e.g. a failed sync committed an empty file) is
+			// not authoritative: fall through to the cache.
+			opts.warn("%s contains no CVE ids; ignoring it", txt)
 		} else if !os.IsNotExist(err) {
 			return nil, Source{}, fmt.Errorf("read %s: %w", txt, err)
 		}
 	}
 
-	// Fallback: the local cache from an earlier --refresh-kev.
-	if cacheErr == nil {
-		if set, fetched, err := loadCache(cachePath); err == nil {
-			return set, Source{Origin: OriginCache, Path: cachePath, Fetched: fetched}, nil
-		} else if !os.IsNotExist(err) {
-			return nil, Source{}, fmt.Errorf("read KEV cache %s: %w", cachePath, err)
-		}
+	// Fallback: the cache.
+	if cacheLoadErr == nil {
+		return cacheSet, cacheSrc, nil
+	} else if !os.IsNotExist(cacheLoadErr) {
+		// A truncated or unreadable cache is treated as missing.
+		opts.warn("ignoring KEV cache %s: %v (run with -refresh-kev to rebuild it)", cachePath, cacheLoadErr)
 	}
 
 	// Offline, no source: an empty set. The caller warns; --kev matches nothing.
@@ -195,85 +287,118 @@ func parseTxt(data []byte) Set {
 	return set
 }
 
-// cacheFile is vulnsuite's own compact cache of the KEV CVE-id set.
-type cacheFile struct {
-	Fetched string   `json:"fetched"`
-	Source  string   `json:"source"`
-	CVEs    []string `json:"cves"`
+// catalogVersionRe finds the snapshot header written by the templates repo's
+// sync: "# catalogVersion: 2026.11.13  count: 1781".
+var catalogVersionRe = regexp.MustCompile(`(?m)^#\s*catalogVersion:\s*(\S+)`)
+
+// txtCatalogVersion returns the snapshot's catalogVersion header ("" if none).
+func txtCatalogVersion(data []byte) string {
+	if m := catalogVersionRe.FindSubmatch(data); m != nil {
+		return string(m[1])
+	}
+	return ""
 }
 
-func loadCache(path string) (Set, string, error) {
+// cacheFile is vulnsuite's own compact cache of the KEV CVE-id set.
+type cacheFile struct {
+	Fetched        string   `json:"fetched"`
+	Source         string   `json:"source"`
+	CatalogVersion string   `json:"catalog_version,omitempty"`
+	CVEs           []string `json:"cves"`
+}
+
+func loadCache(path string) (Set, cacheFile, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, "", err
+		return nil, cacheFile{}, err
 	}
 	var cf cacheFile
 	if err := json.Unmarshal(data, &cf); err != nil {
-		return nil, "", fmt.Errorf("corrupt KEV cache: %w", err)
+		return nil, cacheFile{}, fmt.Errorf("corrupt KEV cache: %w", err)
 	}
 	set := Set{}
 	for _, id := range cf.CVEs {
-		if cveRe.MatchString(id) {
+		if cveExactRe.MatchString(id) {
 			set[strings.ToUpper(id)] = true
 		}
 	}
-	return set, cf.Fetched, nil
+	return set, cf, nil
 }
 
-func writeCache(path string, set Set, source, fetched string) error {
+func writeCache(path string, set Set, source, fetched, catalogVersion string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	cf := cacheFile{Fetched: fetched, Source: source, CVEs: sortedKeys(set)}
+	cf := cacheFile{Fetched: fetched, Source: source, CatalogVersion: catalogVersion, CVEs: sortedKeys(set)}
 	data, err := json.MarshalIndent(cf, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	// Write a temp file in the same directory and rename it into place, so a
+	// crash or a concurrent -refresh-kev never leaves a truncated cache.
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".cisa-kev-*.json.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after a successful rename
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // feedDoc is the subset of the CISA KEV JSON feed we read.
 type feedDoc struct {
+	CatalogVersion  string `json:"catalogVersion"`
 	Vulnerabilities []struct {
 		CveID string `json:"cveID"`
 	} `json:"vulnerabilities"`
 }
 
-func fetch(ctx context.Context, client *http.Client, url string) (Set, error) {
+func fetch(ctx context.Context, client *http.Client, url string) (Set, string, error) {
 	if client == nil {
 		client = &http.Client{Timeout: 30 * time.Second}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	req.Header.Set("User-Agent", "vulnsuite")
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status %s", resp.Status)
+		return nil, "", fmt.Errorf("unexpected status %s", resp.Status)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	var doc feedDoc
 	if err := json.Unmarshal(body, &doc); err != nil {
-		return nil, fmt.Errorf("parse CISA feed: %w", err)
+		return nil, "", fmt.Errorf("parse CISA feed: %w", err)
 	}
 	set := Set{}
 	for _, v := range doc.Vulnerabilities {
-		if cveRe.MatchString(v.CveID) {
+		if cveExactRe.MatchString(v.CveID) {
 			set[strings.ToUpper(v.CveID)] = true
 		}
 	}
 	if len(set) == 0 {
-		return nil, fmt.Errorf("CISA feed contained no CVE ids")
+		return nil, "", fmt.Errorf("CISA feed contained no CVE ids")
 	}
-	return set, nil
+	return set, doc.CatalogVersion, nil
 }
 
 func sortedKeys(set Set) []string {

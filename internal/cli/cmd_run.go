@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -70,10 +71,42 @@ func reportVerify(g *Global, h *runner.Handle, indent string) {
 	}
 }
 
+// Reasons a target lands in a -summary's skipped or failed list. They are
+// stable strings a pipeline can switch on; detail carries the human text.
+const (
+	reasonNoState    = "no-state"    // the template has no such state
+	reasonRequires   = "requires"    // the host does not meet requires
+	reasonHostAccess = "host-access" // needs -allow-host-access
+	reasonOverCap    = "over-cap"    // over the -max-concurrent cap
+	reasonCancelled  = "cancelled"   // interrupted before it started (or torn down by the interrupt)
+	reasonAborted    = "aborted"     // not attempted: the command stopped on another target's error
+	reasonLoad       = "load"        // the template failed to load
+	reasonStart      = "start"       // could not be built, pulled or started
+	reasonUnhealthy  = "unhealthy"   // started, but not ready / seed failed / verify failed
+)
+
+// outcomeEntry is one skipped or failed target in a -summary.
+type outcomeEntry struct {
+	ID     string `json:"id"`
+	State  string `json:"state,omitempty"`
+	Reason string `json:"reason"`
+	Detail string `json:"detail,omitempty"`
+}
+
+// runSummary is `run -json -summary`: what started, what failed and what was
+// skipped, so a pipeline can tell the three apart (a target in none of them
+// was not selected). A target that started but is not confirmed in its state
+// is in targets (it is running) and in failed (it fails the run).
+type runSummary struct {
+	Targets []*runner.Handle `json:"targets"`
+	Failed  []outcomeEntry   `json:"failed"`
+	Skipped []outcomeEntry   `json:"skipped"`
+}
+
 func cmdRun() *Command {
 	var sel, files multiFlag
 	var flt filters
-	var all, variants, detach, noVerify, noPull, noCache, force bool
+	var all, variants, detach, noVerify, noPull, noCache, force, summary bool
 	var maxConcurrent int
 	var targetsFile, platform, readyTimeout, nucleiDir string
 	var ignoreRequires, allowHostAccess bool
@@ -82,7 +115,8 @@ func cmdRun() *Command {
 		Name:  "run",
 		Short: "build if needed, then run target(s) in a state and verify them",
 		Usage: "[vulnerable|patched] -t SEL... | -f FILE | <filter> | -all [-variants] [-expose MODE] [-detach] [-targets-file FILE]",
-		Long: `Stands targets up (default state: vulnerable), waits until they are ready,
+		Long: `Stands targets up (default state: vulnerable; give vulnerable or patched
+anywhere among the arguments, e.g. ` + "`run grafana patched`" + `), waits until they are ready,
 and runs each state's verify probes so you know the target is genuinely in the
 declared state before you scan it. Many targets can run at once; each gets its
 own IP on the internal network. Without -detach the command holds the batch
@@ -113,12 +147,56 @@ Exposure modes:
 			fs.StringVar(&nucleiDir, "nuclei-templates", "", "nuclei-templates checkout used to resolve the scanner templates shown for each target")
 			fs.BoolVar(&ignoreRequires, "ignore-requires", false, "run even when the host does not meet a target's requires (arch/kvm/host_os)")
 			fs.BoolVar(&allowHostAccess, "allow-host-access", false, "honor a template's host device passthrough and elevated capabilities (host-access primitives; only for templates you trust)")
+			fs.BoolVar(&summary, "summary", false, "with -json, print {targets, failed, skipped} instead of the bare array of started targets")
 		},
-		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
-			state := contract.StateVulnerable
-			if len(args) > 0 && has(contract.StateNames, args[0]) {
-				state = args[0]
-				args = args[1:]
+		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) (retErr error) {
+			if summary && !g.JSON {
+				return usageError{"-summary shapes the -json output; add -json"}
+			}
+			// sum collects every selected target's fate for -summary. Once the
+			// selection is resolved it is emitted on every way out (success,
+			// failure, interrupt) except a usage error, so a pipeline always
+			// gets a document to parse.
+			sum := runSummary{Targets: []*runner.Handle{}, Failed: []outcomeEntry{}, Skipped: []outcomeEntry{}}
+			resolved, emitted := false, false
+			emitSummary := func() error {
+				emitted = true
+				return g.emitJSON(sum)
+			}
+			defer func() {
+				var ue usageError
+				if summary && resolved && !emitted && !errors.As(retErr, &ue) {
+					retErr = errors.Join(retErr, emitSummary())
+				}
+			}()
+			skip := func(cs []*contract.Contract, state, reason, detail string) {
+				for _, c := range cs {
+					sum.Skipped = append(sum.Skipped, outcomeEntry{ID: c.ID(), State: state, Reason: reason, Detail: detail})
+				}
+			}
+			// Flag mistakes are usage errors (exit 2), caught before any
+			// template is resolved or image pulled/built.
+			switch exp.Mode {
+			case runner.ModeInternal, runner.ModeHost, runner.ModeMacvlan:
+			default:
+				return usageError{fmt.Sprintf("unknown -expose mode %q (internal, host or macvlan)", exp.Mode)}
+			}
+			if maxConcurrent < 1 {
+				return usageError{fmt.Sprintf("-max-concurrent must be at least 1, got %d", maxConcurrent)}
+			}
+			pinned := exp.HostPort != 0 || len(exp.HostPortMap) > 0
+			if exp.HostPort < 0 || exp.HostPort > 65535 {
+				return usageError{fmt.Sprintf("-host-port must be 1..65535, got %d", exp.HostPort)}
+			}
+			if pinned && exp.Mode != runner.ModeHost {
+				return usageError{"-host-port / -host-port-map need -expose host"}
+			}
+			state, args, err := takeState(args)
+			if err != nil {
+				return err
+			}
+			if state == "" {
+				state = contract.StateVulnerable
 			}
 			sel = append(sel, args...)
 			store, err := g.Store()
@@ -129,10 +207,13 @@ Exposure modes:
 			if err != nil {
 				return err
 			}
+			resolved = true
 			if len(loadErrs) > 0 {
 				for _, e := range loadErrs {
 					g.errorf("ERROR %v\n", e)
+					sum.Failed = append(sum.Failed, outcomeEntry{ID: loadErrID(e), Reason: reasonLoad, Detail: e.Error()})
 				}
+				skip(cs, state, reasonAborted, "not attempted: other templates failed to load")
 				return fmt.Errorf("%d template(s) failed to load", len(loadErrs))
 			}
 			var runnable []*contract.Contract
@@ -141,31 +222,67 @@ Exposure modes:
 					runnable = append(runnable, c)
 				} else {
 					g.printf("skip %s: no %q state\n", c.ID(), state)
+					skip([]*contract.Contract{c}, state, reasonNoState, fmt.Sprintf("no %q state", state))
 				}
 			}
 			if len(runnable) == 0 {
 				return fmt.Errorf("no templates have a %q state", state)
 			}
-			multi := len(runnable) > 1
-			if multi && exp.Mode == runner.ModeMacvlan && exp.IP != "" {
-				return usageError{"-ip pins one address; run one template at a time in macvlan mode, or omit -ip"}
-			}
-			if multi {
-				exp.HostPort = 0
-				exp.HostPortMap = nil
-			}
 			eng, err := g.Engine(ctx)
 			if err != nil {
+				skip(runnable, state, reasonAborted, err.Error())
 				return err
 			}
 			r := runner.New(eng)
+			host, herr := eng.Info(ctx)
+			if herr != nil {
+				skip(runnable, state, reasonAborted, herr.Error())
+				return herr
+			}
+
+			// Drop what will not run here (requires, host access) before the
+			// concurrency cap, so a skipped target never takes a slot.
+			var skippedReq, skippedHost []string
+			platformFor := map[*contract.Contract]string{}
+			eligible := runnable[:0:0]
+			for _, c := range runnable {
+				if !c.Requires.Empty() {
+					d := runner.Preflight(c.Requires, host)
+					switch {
+					case d.Skip() && !ignoreRequires:
+						g.printf("skip %s: %s\n", c.ID(), d.Reason)
+						skippedReq = append(skippedReq, c.ID())
+						skip([]*contract.Contract{c}, state, reasonRequires, d.Reason)
+						continue
+					case d.Skip() && ignoreRequires:
+						g.printf("%s does not meet requires (%s) -- running anyway (-ignore-requires)\n", c.ID(), d.Reason)
+					case d.Action == runner.ActionEmulated:
+						g.printf("%s: %s\n", c.ID(), d.Reason)
+						platformFor[c] = d.Platform
+					}
+				}
+				if !allowHostAccess {
+					if reason := runner.HostAccessReason(c); reason != "" {
+						g.printf("skip %s: needs host access (%s) -- re-run with -allow-host-access to include it\n", c.ID(), reason)
+						skippedHost = append(skippedHost, c.ID())
+						skip([]*contract.Contract{c}, state, reasonHostAccess, reason)
+						continue
+					}
+				}
+				eligible = append(eligible, c)
+			}
+			runnable = eligible
 
 			// Concurrency cap: containers this batch replaces (same name) are not net new.
 			batch := map[string]bool{}
 			for _, c := range runnable {
 				batch[c.ContainerName(state)] = true
 			}
-			already, _ := r.Running(ctx, exp.Network)
+			already, err := r.Running(ctx, exp.Network)
+			if err != nil {
+				skip(runnable, state, reasonAborted, err.Error())
+				return fmt.Errorf("count running targets for -max-concurrent: %w", err)
+			}
 			netNew := 0
 			for _, t := range already {
 				if !batch[t.Container] {
@@ -178,13 +295,26 @@ Exposure modes:
 			}
 			var overCap []*contract.Contract
 			if len(runnable) > free {
+				capDetail := fmt.Sprintf("over the -max-concurrent %d cap (%d already running)", maxConcurrent, netNew)
 				if free == 0 {
+					skip(runnable, state, reasonOverCap, capDetail)
 					return fmt.Errorf("max concurrent (%d) already reached: %d target(s) running. bring some down first:  vulnsuite stop", maxConcurrent, netNew)
 				}
 				overCap, runnable = runnable[free:], runnable[:free]
+				skip(overCap, state, reasonOverCap, capDetail)
 				g.printf("max concurrent is %d (%d already running): starting %d, skipping %d.\n", maxConcurrent, netNew, len(runnable), len(overCap))
 				g.printf("  raise it with -max-concurrent, or run the rest after `vulnsuite stop`.\n\n")
-				multi = len(runnable) > 1
+			}
+			// Single-target pins are judged on what will actually start, after
+			// the requires/host-access skips and the cap: a batch that ends up
+			// with one target keeps its pin, and a pin that would have to serve
+			// several targets is refused rather than silently dropped.
+			multi := len(runnable) > 1
+			if multi && exp.Mode == runner.ModeMacvlan && exp.IP != "" {
+				return usageError{fmt.Sprintf("-ip pins one address but %d targets would start (%s); run one template at a time in macvlan mode, or omit -ip", len(runnable), contractIDs(runnable))}
+			}
+			if multi && pinned {
+				return usageError{fmt.Sprintf("-host-port / -host-port-map pin one target's ports but %d targets would start (%s); select one target, or omit them for free ports", len(runnable), contractIDs(runnable))}
 			}
 
 			opts := runner.Options{Verify: !noVerify, AllowHostAccess: allowHostAccess, Build: builder.Options{Pull: !noPull, NoCache: noCache, Force: force, Platform: platform}}
@@ -198,54 +328,52 @@ Exposure modes:
 			if !g.JSON && !g.Quiet {
 				opts.Build.Output = g.Stdout
 			}
-			host, herr := eng.Info(ctx)
-			if herr != nil {
-				return herr
-			}
 			var idx *scanners.Index
 			if dir := scanners.ResolveDir(nucleiDir); dir != "" {
 				idx, _ = scanners.Load(dir)
 			}
 			var handles []*runner.Handle
-			var failures, skippedReq, skippedHost []string
+			var failures []string
+			// unhealthy: targets that came up but must not be handed out as-is
+			// (not ready, a seed failed, or verify failed). They fail the run.
+			var unhealthy []string
+			cancelled := false
+			// attempted counts the targets the loop reached; on an interrupt
+			// the rest never started.
+			attempted := 0
 			for _, c := range runnable {
+				if ctx.Err() != nil {
+					cancelled = true
+					break
+				}
+				attempted++
 				if multi {
 					g.printf("\n=== [%s] %s ===\n", c.ID(), state)
 				} else {
 					g.printf("[%s] %s: %s\n", c.ID(), state, c.Metadata.Summary)
 				}
 				tgtOpts := opts
-				if !c.Requires.Empty() {
-					d := runner.Preflight(c.Requires, host)
-					switch {
-					case d.Skip() && !ignoreRequires:
-						g.printf("  skip %s: %s\n", c.ID(), d.Reason)
-						skippedReq = append(skippedReq, c.ID())
-						continue
-					case d.Skip() && ignoreRequires:
-						g.printf("  %s does not meet requires (%s) -- running anyway (-ignore-requires)\n", c.ID(), d.Reason)
-					case d.Action == runner.ActionEmulated:
-						g.printf("  %s: %s\n", c.ID(), d.Reason)
-						if tgtOpts.Build.Platform == "" {
-							tgtOpts.Build.Platform = d.Platform
-						}
-					}
-				}
-				if !allowHostAccess {
-					if reason := runner.HostAccessReason(c); reason != "" {
-						g.printf("  skip %s: needs host access (%s) -- re-run with -allow-host-access to include it\n", c.ID(), reason)
-						skippedHost = append(skippedHost, c.ID())
-						continue
-					}
+				if p := platformFor[c]; p != "" && tgtOpts.Build.Platform == "" {
+					tgtOpts.Build.Platform = p
 				}
 				g.printf("resolving image (%s)...\n", c.BuildKind(state))
 				h, err := r.Run(ctx, c, state, exp, tgtOpts)
 				if err != nil {
+					if ctx.Err() != nil {
+						attempted-- // cut short by the interrupt: it never started
+						cancelled = true
+						break
+					}
 					g.errorf("  could not run %s: %v\n", c.ID(), err)
 					failures = append(failures, c.ID())
+					sum.Failed = append(sum.Failed, outcomeEntry{ID: c.ID(), State: state, Reason: reasonStart, Detail: err.Error()})
 					continue
 				}
 				handles = append(handles, h)
+				if ctx.Err() != nil {
+					cancelled = true
+					break
+				}
 				verb := "reused"
 				switch {
 				case h.Image.Built:
@@ -255,13 +383,44 @@ Exposure modes:
 				}
 				g.printf("  image: %s (%s)\n", h.Image.Ref, verb)
 				if !h.Ready {
-					g.printf("  ready: NO -- the healthcheck did not pass in time\n")
+					why := h.ReadyDetail
+					if why == "" {
+						why = "the healthcheck did not pass in time"
+					}
+					g.printf("  ready: NO -- %s\n", strings.ReplaceAll(why, "\n", "\n      "))
+				}
+				if noVerify {
+					// verify folds seed failures into its detail; without it, say so here.
+					for _, sr := range h.Seeds {
+						if !sr.OK {
+							g.printf("  seed: FAILED -- %q: %s\n", sr.Run, sr.Error)
+						}
+					}
 				}
 				reportVerify(g, h, "  ")
+				if p := h.Problem(); p != "" {
+					unhealthy = append(unhealthy, fmt.Sprintf("%s [%s] (%s)", c.ID(), state, p))
+					sum.Failed = append(sum.Failed, outcomeEntry{ID: c.ID(), State: state, Reason: reasonUnhealthy, Detail: p})
+				}
 				g.printf("  scanner templates:\n")
 				for _, line := range scanners.Match(c, idx).Lines(c) {
 					g.printf("  %s\n", line)
 				}
+			}
+			if cancelled {
+				// Interrupted: this batch never got handed out, so tear down what
+				// it started rather than leave half a batch behind.
+				g.errorf("\ninterrupted: tearing down %d started target(s)...\n", len(handles))
+				// Everything this batch reached is torn down, and the rest never
+				// started: all of it is cancelled, none of it is running.
+				for _, h := range handles {
+					sum.Skipped = append(sum.Skipped, outcomeEntry{ID: h.ID, State: h.State, Reason: reasonCancelled, Detail: "started, then torn down by the interrupt"})
+				}
+				skip(runnable[attempted:], state, reasonCancelled, "interrupted before it started")
+				if err := teardown(ctx, g, r, handles); err != nil {
+					return err
+				}
+				return errInterrupted
 			}
 			if len(handles) == 0 {
 				if len(skippedHost) > 0 {
@@ -270,11 +429,17 @@ Exposure modes:
 				return fmt.Errorf("nothing came up")
 			}
 
-			if g.JSON {
+			sum.Targets = append(sum.Targets, handles...)
+			switch {
+			case summary:
+				if err := emitSummary(); err != nil {
+					return err
+				}
+			case g.JSON:
 				if err := g.emitJSON(handles); err != nil {
 					return err
 				}
-			} else {
+			default:
 				g.printf("\nScan these with your probe:\n")
 				for _, h := range handles {
 					extra := ""
@@ -321,6 +486,15 @@ Exposure modes:
 			if len(failures) > 0 {
 				g.errorf("\n%d failed to start: %s\n", len(failures), strings.Join(failures, ", "))
 			}
+			if len(unhealthy) > 0 {
+				g.errorf("\n%d not confirmed in the requested state: %s\n", len(unhealthy), strings.Join(unhealthy, ", "))
+			}
+			runErr := func() error {
+				if n := len(failures) + len(unhealthy); n > 0 {
+					return fmt.Errorf("%d target(s) failed", n)
+				}
+				return nil
+			}
 			if len(skippedReq) > 0 {
 				g.printf("\n%d skipped (host does not meet requires): %s\n", len(skippedReq), strings.Join(skippedReq, ", "))
 				g.printf("  override with -ignore-requires, or run on a matching host.\n")
@@ -330,35 +504,55 @@ Exposure modes:
 				g.printf("  these request host devices or elevated capabilities; if you trust them, re-run with -allow-host-access.\n")
 			}
 			if len(overCap) > 0 {
-				ids := make([]string, 0, len(overCap))
-				for _, c := range overCap {
-					ids = append(ids, c.ID())
-				}
-				g.printf("\n%d not started (over the -max-concurrent %d cap): %s\n", len(overCap), maxConcurrent, strings.Join(ids, ", "))
+				g.printf("\n%d not started (over the -max-concurrent %d cap): %s\n", len(overCap), maxConcurrent, contractIDs(overCap))
 			}
 			if !g.JSON {
 				g.printf("\nTear down:  vulnsuite stop   (brings down all %d target(s))\n", len(handles))
 			}
 			if detach {
-				if len(failures) > 0 {
-					return fmt.Errorf("%d target(s) failed", len(failures))
-				}
-				return nil
+				return runErr()
 			}
 			g.printf("\nHolding. Ctrl-C to tear down this batch.\n")
 			sigCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 			<-sigCtx.Done()
+			// Release the handler at once: a second Ctrl-C during teardown then
+			// terminates the process (main releases its own on the first).
 			stop()
 			g.printf("\ntearing down...\n")
-			for _, h := range handles {
-				r.Stop(context.Background(), h)
-			}
-			if len(failures) > 0 {
-				return fmt.Errorf("%d target(s) failed", len(failures))
-			}
-			return nil
+			return errors.Join(runErr(), teardown(ctx, g, r, handles))
 		},
 	}
+}
+
+// contractIDs joins the contracts' ids for messages.
+func contractIDs(cs []*contract.Contract) string {
+	ids := make([]string, 0, len(cs))
+	for _, c := range cs {
+		ids = append(ids, c.ID())
+	}
+	return strings.Join(ids, ", ")
+}
+
+// errInterrupted reports a run cut short by Ctrl-C / SIGTERM.
+var errInterrupted = errors.New("interrupted")
+
+// teardown removes the handles' containers on a fresh context bounded by
+// runner.CleanupTimeout (the run's own context is usually cancelled by now),
+// reporting every removal that failed.
+func teardown(ctx context.Context, g *Global, r *runner.Runner, handles []*runner.Handle) error {
+	cctx, cancel := runner.CleanupContext(ctx)
+	defer cancel()
+	var failed []string
+	for _, h := range handles {
+		if err := r.Stop(cctx, h); err != nil {
+			g.errorf("  could not tear down %s [%s]: %v\n", h.ID, h.State, err)
+			failed = append(failed, h.Container)
+		}
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("teardown: %d target(s) not fully removed (%s); remove them with:  vulnsuite stop", len(failed), strings.Join(failed, ", "))
+	}
+	return nil
 }
 
 // reportableHostIP turns a binding's host IP into one a scanner can dial.
@@ -436,18 +630,30 @@ func cmdStop() *Command {
 			} else {
 				ids = []string{""}
 			}
-			var removed []string
+			removed := []string{} // -json prints [] (not null) when nothing ran
+			var stopErrs []error
 			for _, id := range ids {
 				names, err := r.StopAll(ctx, id)
 				removed = append(removed, names...)
 				if err != nil {
-					return err
+					stopErrs = append(stopErrs, err)
+				}
+			}
+			// Prune before reporting, so -json carries the outcome too. A network
+			// that cannot be removed (still in use, already gone) is a warning,
+			// not a failed stop.
+			networkRemoved := false
+			var pruneErr error
+			if pruneNet && len(sel) == 0 {
+				if pruneErr = r.PruneNetwork(ctx, network); pruneErr == nil {
+					networkRemoved = true
 				}
 			}
 			if g.JSON {
-				return g.emitJSON(map[string]any{"removed": removed})
-			}
-			if len(removed) == 0 {
+				if err := g.emitJSON(map[string]any{"removed": removed, "network_removed": networkRemoved}); err != nil {
+					return err
+				}
+			} else if len(removed) == 0 {
 				g.printf("nothing to stop\n")
 			} else {
 				g.printf("stopped %d container(s):\n", len(removed))
@@ -455,14 +661,13 @@ func cmdStop() *Command {
 					g.printf("  %s\n", n)
 				}
 			}
-			if pruneNet && len(sel) == 0 {
-				if err := r.PruneNetwork(ctx, network); err == nil {
-					g.printf("removed network %s\n", network)
-				} else {
-					g.errorf("could not remove network %s: %v\n", network, err)
-				}
+			switch {
+			case networkRemoved:
+				g.printf("removed network %s\n", network)
+			case pruneErr != nil:
+				g.errorf("could not remove network %s: %v\n", network, pruneErr)
 			}
-			return nil
+			return errors.Join(stopErrs...)
 		},
 	}
 }
@@ -530,6 +735,11 @@ the subnet. Non-HTTP targets come out as host:port for network templates.`,
 			fs.StringVar(&network, "network", runner.DefaultNetwork, "internal network name")
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
+			switch by {
+			case "auto", "ip", "alias", "host":
+			default:
+				return usageError{fmt.Sprintf("unknown -by %q (auto, ip, alias or host)", by)}
+			}
 			store, err := g.Store()
 			if err != nil {
 				return err
@@ -584,7 +794,7 @@ the subnet. Non-HTTP targets come out as host:port for network templates.`,
 				for _, pp := range published {
 					host := r.IP
 					if by == "alias" {
-						host = r.ID
+						host = runner.TargetAlias(r.ID, r.State)
 					}
 					if host == "" {
 						continue
@@ -595,9 +805,8 @@ the subnet. Non-HTTP targets come out as host:port for network templates.`,
 			if len(pairs) == 0 {
 				return fmt.Errorf("running targets have no resolvable address yet (try again in a moment, or -by alias)")
 			}
-			if g.JSON {
-				return g.emitJSON(pairs)
-			}
+			// -file is written whatever the output format, so
+			// `vulnsuite -json targets -file F && nuclei -l F` works.
 			if file != "" {
 				var lines []string
 				for _, p := range pairs {
@@ -606,11 +815,18 @@ the subnet. Non-HTTP targets come out as host:port for network templates.`,
 				if err := os.WriteFile(file, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
 					return err
 				}
+			}
+			if g.JSON {
+				return g.emitJSON(pairs)
+			}
+			if file != "" {
 				g.printf("wrote %s (%d targets, by %s)\nscan exactly these (no subnet sweep):\n  nuclei -l %s\n", file, len(pairs), by, file)
 				return nil
 			}
+			// The URL list is this command's output, not progress: -q keeps it
+			// and silences only the hint below.
 			for _, p := range pairs {
-				g.printf("%-48s # %s %s\n", p.URL, p.ID, p.State)
+				fmt.Fprintf(g.Stdout, "%-48s # %s %s\n", p.URL, p.ID, p.State)
 			}
 			g.printf("\n%d targets. Scan just these instead of the subnet, e.g.:\n  vulnsuite targets -file targets.txt && nuclei -l targets.txt\n", len(pairs))
 			return nil

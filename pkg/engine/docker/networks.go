@@ -55,6 +55,13 @@ func (c *Client) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (st
 		ID string `json:"Id"`
 	}
 	if err := c.doJSON(ctx, http.MethodPost, "/networks/create", nil, body, &out); err != nil {
+		// A concurrent run created it between our inspect and create: use
+		// that one.
+		if IsConflict(err) {
+			if ierr := c.doJSON(ctx, http.MethodGet, "/networks/"+url.PathEscape(spec.Name), nil, nil, &existing); ierr == nil {
+				return existing.ID, nil
+			}
+		}
 		return "", err
 	}
 	return out.ID, nil
@@ -67,6 +74,15 @@ func (c *Client) NetworkRemove(ctx context.Context, name string) error {
 		return nil
 	}
 	return err
+}
+
+// NetworkConnect attaches a container to a further network under aliases.
+func (c *Client) NetworkConnect(ctx context.Context, network, container string, aliases []string) error {
+	body := map[string]any{"Container": container}
+	if len(aliases) > 0 {
+		body["EndpointConfig"] = map[string]any{"Aliases": aliases}
+	}
+	return c.doJSON(ctx, http.MethodPost, "/networks/"+url.PathEscape(network)+"/connect", nil, body, nil)
 }
 
 var _ engine.Engine = (*Client)(nil)

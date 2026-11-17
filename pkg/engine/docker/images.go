@@ -13,16 +13,24 @@ import (
 	"github.com/ruzfi/vulnsuite/pkg/engine/registryauth"
 )
 
-// ImageExists reports whether ref is present locally.
-func (c *Client) ImageExists(ctx context.Context, ref string) (bool, error) {
-	err := c.doJSON(ctx, http.MethodGet, "/images/"+url.PathEscape(ref)+"/json", nil, nil, nil)
-	if err == nil {
-		return true, nil
+// ImageExists reports whether ref is present locally (for platform, when set).
+// This client speaks API 1.41, which cannot inspect a non-default platform of
+// a multi-platform store, so an image whose default variant is another
+// platform counts as missing and is pulled (a no-op download when present).
+func (c *Client) ImageExists(ctx context.Context, ref, platform string) (bool, error) {
+	var img struct {
+		Os           string `json:"Os"`
+		Architecture string `json:"Architecture"`
+		Variant      string `json:"Variant"`
 	}
-	if IsNotFound(err) {
-		return false, nil
+	err := c.doJSON(ctx, http.MethodGet, "/images/"+url.PathEscape(ref)+"/json", nil, nil, &img)
+	if err != nil {
+		if IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
 	}
-	return false, err
+	return engine.PlatformMatches(platform, img.Os, img.Architecture, img.Variant), nil
 }
 
 // splitRef splits "repo:tag", "repo@sha256:..." or "repo" into (fromImage, tag)
@@ -40,15 +48,18 @@ func splitRef(ref string) (string, string) {
 	return ref, "latest"
 }
 
-// ImagePull pulls ref, streaming progress to out.
-func (c *Client) ImagePull(ctx context.Context, ref string, out io.Writer) error {
+// ImagePull pulls ref for platform (empty = daemon default), streaming progress to out.
+func (c *Client) ImagePull(ctx context.Context, ref, platform string, out io.Writer) error {
 	from, tag := splitRef(ref)
 	q := url.Values{"fromImage": {from}}
 	if tag != "" {
 		q.Set("tag", tag)
 	}
+	if platform != "" {
+		q.Set("platform", platform)
+	}
 	headers := map[string]string{}
-	if auth := registryauth.For(from); auth != "" {
+	if auth := registryauth.For(ref); auth != "" {
 		headers["X-Registry-Auth"] = auth
 	}
 	resp, err := c.do(ctx, http.MethodPost, "/images/create", q, nil, headers)
@@ -118,7 +129,7 @@ func (c *Client) ImagePush(ctx context.Context, ref string, out io.Writer) error
 	if tag != "" {
 		q.Set("tag", tag)
 	}
-	auth := registryauth.For(repo)
+	auth := registryauth.ForPush(ref)
 	if auth == "" {
 		auth = registryauth.Empty()
 	}

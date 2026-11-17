@@ -24,7 +24,9 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -61,7 +63,9 @@ type Options struct {
 	NoCache bool
 	// Force rebuilds even when the content-addressed tag already exists.
 	Force bool
-	// Platform, e.g. linux/amd64 (empty = engine default).
+	// Platform, e.g. linux/amd64 (empty = engine default). It is used for
+	// pulls and builds, and an existing image is reused only when it is for
+	// this platform.
 	Platform string
 	// Output receives build/pull progress (nil = discard).
 	Output io.Writer
@@ -95,15 +99,15 @@ func (b *Builder) Resolve(ctx context.Context, c *contract.Contract, state strin
 			return nil, fmt.Errorf("%s/%s: cannot resolve an image", c.ID(), state)
 		}
 		res.Ref = ref
-		exists, err := b.Engine.ImageExists(ctx, ref)
+		exists, err := b.Engine.ImageExists(ctx, ref, opts.Platform)
 		if err != nil {
 			return nil, err
 		}
 		if !exists {
 			if !opts.Pull {
-				return nil, fmt.Errorf("%s/%s: image %s is not present and pulling is disabled", c.ID(), state, ref)
+				return nil, fmt.Errorf("%s/%s: image %s%s is not present and pulling is disabled", c.ID(), state, ref, forPlatform(opts.Platform))
 			}
-			if err := b.Engine.ImagePull(ctx, ref, opts.Output); err != nil {
+			if err := b.Engine.ImagePull(ctx, ref, opts.Platform, opts.Output); err != nil {
 				return nil, err
 			}
 			res.Pulled = true
@@ -114,7 +118,10 @@ func (b *Builder) Resolve(ctx context.Context, c *contract.Contract, state strin
 	tag := c.ImageTag(state)
 	res.Ref = tag
 	if !opts.Force {
-		exists, err := b.Engine.ImageExists(ctx, tag)
+		// The content hash does not cover the platform: reuse the tag only
+		// when it was built for the platform wanted now (the host's when none
+		// is set), so an emulated build is not reused natively or vice versa.
+		exists, err := b.Engine.ImageExists(ctx, tag, b.reusePlatform(ctx, opts.Platform))
 		if err != nil {
 			return nil, err
 		}
@@ -140,6 +147,31 @@ func (b *Builder) Resolve(ctx context.Context, c *contract.Contract, state strin
 	return res, nil
 }
 
+// reusePlatform is the platform an existing built image must match: the
+// requested one, else the daemon's own (empty when it cannot be determined,
+// which accepts any).
+func (b *Builder) reusePlatform(ctx context.Context, platform string) string {
+	if platform != "" {
+		return platform
+	}
+	host, err := b.Engine.Info(ctx)
+	if err != nil || host.Arch == "" {
+		return ""
+	}
+	hostOS := host.OS
+	if hostOS == "" {
+		hostOS = "linux"
+	}
+	return hostOS + "/" + host.Arch
+}
+
+func forPlatform(platform string) string {
+	if platform == "" {
+		return ""
+	}
+	return " for " + platform
+}
+
 func (b *Builder) labels(c *contract.Contract, st *contract.State, kind string) map[string]string {
 	return map[string]string{
 		LabelID:                                c.ID(),
@@ -153,9 +185,10 @@ func (b *Builder) labels(c *contract.Contract, st *contract.State, kind string) 
 }
 
 func (b *Builder) build(ctx context.Context, c *contract.Contract, st *contract.State, kind, tag, dockerfile string,
-	tarStream io.Reader, opts Options) error {
-	return b.Engine.ImageBuild(ctx, engine.BuildOptions{
-		Context:    tarStream,
+	bc *buildContext, opts Options) error {
+	stream := bc.stream(dockerfile)
+	err := b.Engine.ImageBuild(ctx, engine.BuildOptions{
+		Context:    stream,
 		Tags:       []string{tag},
 		Dockerfile: dockerfile,
 		BuildArgs:  c.Base.BuildArgs,
@@ -163,6 +196,12 @@ func (b *Builder) build(ctx context.Context, c *contract.Contract, st *contract.
 		Labels:     b.labels(c, st, kind),
 		Platform:   opts.Platform,
 	}, opts.Output)
+	// An error writing the context (an unreadable file, a bad .dockerignore)
+	// is the real cause of a build that then failed on a truncated stream.
+	if cerr := stream.Close(); cerr != nil {
+		return fmt.Errorf("build context: %w", cerr)
+	}
+	return err
 }
 
 // -- overlay ------------------------------------------------------------------
@@ -173,36 +212,52 @@ func (b *Builder) buildOverlay(ctx context.Context, c *contract.Contract, st *co
 		return errors.New("overlay needs an image base")
 	}
 	if opts.Pull {
-		exists, err := b.Engine.ImageExists(ctx, baseRef)
+		exists, err := b.Engine.ImageExists(ctx, baseRef, opts.Platform)
 		if err != nil {
 			return err
 		}
 		if !exists {
-			if err := b.Engine.ImagePull(ctx, baseRef, opts.Output); err != nil {
+			if err := b.Engine.ImagePull(ctx, baseRef, opts.Platform, opts.Output); err != nil {
 				return err
 			}
 		}
 	}
-	mc := newMemContext()
+	mc := newBuildContext("")
 	var entries []overlayEntry
 	for i, o := range st.Overlay {
-		data, err := os.ReadFile(filepath.Join(c.Folder, filepath.FromSlash(o.Src)))
+		if err := contract.CheckOverlayDest(o.Dest, true); err != nil {
+			return fmt.Errorf("overlay dest %q: %w", o.Dest, err)
+		}
+		data, err := readTemplateFile(c, o.Src)
 		if err != nil {
 			return fmt.Errorf("overlay %s: %w", o.Src, err)
 		}
-		local := fmt.Sprintf("overlay_%d_%s", i, filepath.Base(o.Dest))
-		mc.add(local, data, 0o644)
-		entries = append(entries, overlayEntry{local: local, dest: o.Dest, mode: o.Mode})
+		mode, err := modeOf(o.Mode)
+		if err != nil {
+			return err
+		}
+		local := fmt.Sprintf("overlay_%d_%s", i, path.Base(o.Dest))
+		mc.add(local, data, mode)
+		entries = append(entries, overlayEntry{local: local, dest: o.Dest})
 	}
-	mc.add("Dockerfile", []byte(overlayDockerfile(baseRef, entries, st.Environment)), 0o644)
-	return b.build(ctx, c, st, contract.BuildKindOverlay, tag, "Dockerfile", mc.tar(), opts)
+	df, err := overlayDockerfile(baseRef, entries, st.Environment, '\\')
+	if err != nil {
+		return err
+	}
+	mc.add("Dockerfile", []byte(df), 0o644)
+	return b.build(ctx, c, st, contract.BuildKindOverlay, tag, "Dockerfile", mc, opts)
 }
 
 // -- local build (simulations, devices) ---------------------------------------
 
 func (b *Builder) buildLocal(ctx context.Context, c *contract.Contract, st *contract.State, tag string, opts Options) error {
-	ctxDir := filepath.Join(c.Folder, filepath.FromSlash(c.Base.Context))
-	if info, err := os.Stat(ctxDir); err != nil || !info.IsDir() {
+	// The context is resolved (symlinks followed) and must stay inside the
+	// template folder; the tree walk below then never follows a symlink.
+	ctxDir, err := c.TemplatePath(c.Base.Context)
+	if errors.Is(err, contract.ErrPathEscapes) {
+		return fmt.Errorf("build context: %w", err)
+	}
+	if info, serr := os.Stat(ctxDir); err != nil || serr != nil || !info.IsDir() {
 		return fmt.Errorf("build context %s not found", c.Base.Context)
 	}
 	src := ctxDir
@@ -217,20 +272,17 @@ func (b *Builder) buildLocal(ctx context.Context, c *contract.Contract, st *cont
 		if err := copyTree(ctxDir, src); err != nil {
 			return err
 		}
-		if err := b.applyPatch(ctx, src, filepath.Join(c.Folder, filepath.FromSlash(st.Patch))); err != nil {
+		patch, err := c.TemplatePath(st.Patch)
+		if err != nil {
+			return fmt.Errorf("patch: %w", err)
+		}
+		if err := b.applyPatch(ctx, src, patch); err != nil {
 			return err
 		}
 	}
-	mc := newMemContext()
-	if err := mc.addTree(src, ""); err != nil {
+	mc := newBuildContext(src)
+	if err := addOverlays(mc, c, st); err != nil {
 		return err
-	}
-	for _, o := range st.Overlay {
-		data, err := os.ReadFile(filepath.Join(c.Folder, filepath.FromSlash(o.Src)))
-		if err != nil {
-			return fmt.Errorf("overlay %s: %w", o.Src, err)
-		}
-		mc.add(strings.TrimPrefix(o.Dest, "/"), data, modeOf(o.Mode))
 	}
 	dockerfile := c.Base.Dockerfile
 	if dockerfile == "" {
@@ -239,7 +291,7 @@ func (b *Builder) buildLocal(ctx context.Context, c *contract.Contract, st *cont
 	if err := bakeEnv(mc, dockerfile, st.Environment); err != nil {
 		return err
 	}
-	return b.build(ctx, c, st, contract.BuildKindBuild, tag, dockerfile, mc.tar(), opts)
+	return b.build(ctx, c, st, contract.BuildKindBuild, tag, dockerfile, mc, opts)
 }
 
 // -- source + patch -----------------------------------------------------------
@@ -265,20 +317,17 @@ func (b *Builder) buildSource(ctx context.Context, c *contract.Contract, st *con
 		return fmt.Errorf("checkout %s: %s", c.Base.Commit, tail(out))
 	}
 	if st.Patch != "" {
-		if err := b.applyPatch(ctx, repo, filepath.Join(c.Folder, filepath.FromSlash(st.Patch))); err != nil {
+		patch, err := c.TemplatePath(st.Patch)
+		if err != nil {
+			return fmt.Errorf("patch: %w", err)
+		}
+		if err := b.applyPatch(ctx, repo, patch); err != nil {
 			return err
 		}
 	}
-	mc := newMemContext()
-	if err := mc.addTree(repo, ""); err != nil {
+	mc := newBuildContext(repo)
+	if err := addOverlays(mc, c, st); err != nil {
 		return err
-	}
-	for _, o := range st.Overlay {
-		data, err := os.ReadFile(filepath.Join(c.Folder, filepath.FromSlash(o.Src)))
-		if err != nil {
-			return fmt.Errorf("overlay %s: %w", o.Src, err)
-		}
-		mc.add(strings.TrimPrefix(o.Dest, "/"), data, modeOf(o.Mode))
 	}
 	dockerfile := c.Base.Dockerfile
 	if dockerfile == "" {
@@ -287,20 +336,63 @@ func (b *Builder) buildSource(ctx context.Context, c *contract.Contract, st *con
 	if err := bakeEnv(mc, dockerfile, st.Environment); err != nil {
 		return err
 	}
-	return b.build(ctx, c, st, contract.BuildKindSource, tag, dockerfile, mc.tar(), opts)
+	return b.build(ctx, c, st, contract.BuildKindSource, tag, dockerfile, mc, opts)
+}
+
+// readTemplateFile reads a file the contract references, refusing any path
+// (.., absolute, or a symlink) that resolves outside the template folder.
+func readTemplateFile(c *contract.Contract, rel string) ([]byte, error) {
+	p, err := c.TemplatePath(rel)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", rel)
+	}
+	return os.ReadFile(p)
+}
+
+// addOverlays writes a source/build state's overlay files into the build
+// context; dest is a path inside the context.
+func addOverlays(mc *buildContext, c *contract.Contract, st *contract.State) error {
+	for _, o := range st.Overlay {
+		if err := contract.CheckOverlayDest(o.Dest, false); err != nil {
+			return fmt.Errorf("overlay dest %q: %w", o.Dest, err)
+		}
+		data, err := readTemplateFile(c, o.Src)
+		if err != nil {
+			return fmt.Errorf("overlay %s: %w", o.Src, err)
+		}
+		mode, err := modeOf(o.Mode)
+		if err != nil {
+			return err
+		}
+		mc.add(strings.TrimPrefix(path.Clean("/"+o.Dest), "/"), data, mode)
+	}
+	return nil
 }
 
 // bakeEnv appends the state's environment to the Dockerfile so the published
 // image is self-contained (the runner passes it at run time as well).
-func bakeEnv(mc *memContext, dockerfile string, env map[string]string) error {
+func bakeEnv(mc *buildContext, dockerfile string, env map[string]string) error {
 	if len(env) == 0 {
 		return nil
 	}
-	f, ok := mc.files[filepath.ToSlash(dockerfile)]
+	f, ok, err := mc.readFile(dockerfile)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", dockerfile, err)
+	}
 	if !ok {
 		return fmt.Errorf("build context has no %s", dockerfile)
 	}
-	extra := overlayDockerfile("", nil, env)
+	extra, err := overlayDockerfile("", nil, env, escapeToken(f.data))
+	if err != nil {
+		return err
+	}
 	extra = strings.TrimPrefix(extra, "FROM \n")
 	data := append([]byte{}, f.data...)
 	if len(data) > 0 && data[len(data)-1] != '\n' {
@@ -429,18 +521,25 @@ func tail(s string) string {
 	return s
 }
 
-func modeOf(mode string) int64 {
+// modeOf is the tar-header mode of an overlay file. The mode is template
+// input that reaches the build context directly, so it is re-checked here:
+// only permission bits ("0755"), never setuid/setgid/sticky or file type.
+func modeOf(mode string) (int64, error) {
 	if mode == "" {
-		return 0o644
+		return 0o644, nil
 	}
-	var m int64
-	fmt.Sscanf(mode, "%o", &m)
+	if !modeRe.MatchString(mode) {
+		return 0, fmt.Errorf("overlay mode %q must be an octal mode like 0644", mode)
+	}
+	m, _ := strconv.ParseInt(mode, 8, 64)
 	if m == 0 {
-		return 0o644
+		return 0o644, nil
 	}
-	return m
+	return m, nil
 }
 
+// copyTree copies a build context so a patch can be applied to it. Symlinks
+// are copied as symlinks (never followed: they may point outside the folder).
 func copyTree(src, dst string) error {
 	return filepath.Walk(src, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -450,6 +549,13 @@ func copyTree(src, dst string) error {
 		target := filepath.Join(dst, rel)
 		if info.IsDir() {
 			return os.MkdirAll(target, 0o755)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			link, err := os.Readlink(p)
+			if err != nil {
+				return err
+			}
+			return os.Symlink(link, target)
 		}
 		if !info.Mode().IsRegular() {
 			return nil
@@ -468,6 +574,9 @@ func copyTree(src, dst string) error {
 type Job struct {
 	Contract *contract.Contract
 	State    string
+	// Platform overrides Options.Platform for this job (e.g. the emulation
+	// platform its target's requires.arch calls for); empty = Options.Platform.
+	Platform string
 }
 
 // Outcome pairs a job with its result.
@@ -502,6 +611,9 @@ func (b *Builder) ResolveAll(ctx context.Context, jobs []Job, parallel int, opts
 			var log strings.Builder
 			o := opts
 			o.Output = &log
+			if j.Platform != "" {
+				o.Platform = j.Platform
+			}
 			res, err := b.Resolve(ctx, j.Contract, j.State, o)
 			out := Outcome{Job: j, Resolved: res, Err: err, Log: log.String()}
 			results[i] = out

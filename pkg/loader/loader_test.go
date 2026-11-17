@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ruzfi/vulnsuite/pkg/contract"
@@ -221,5 +222,113 @@ states: { vulnerable: { verify: [ { http: { path: /, status: 200 } } ] } }
 	s := New(root)
 	if _, err := s.Find("g"); err == nil {
 		t.Fatal("a group with no primary should fail to resolve")
+	}
+}
+
+func writeContract(t *testing.T, path, id string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	doc := fmt.Sprintf("apiVersion: vulnsuite/v1\nkind: Target\nmetadata: { id: %s, summary: x }\nbase: { kind: image, image: nginx:1 }\nservice: { ports: [ { container: 80 } ] }\nstates:\n  vulnerable:\n    verify: [ { tcp: { port: 80 } } ]\n", id)
+	if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func relPaths(t *testing.T, root string, paths []string) []string {
+	t.Helper()
+	var out []string
+	for _, p := range paths {
+		r, err := filepath.Rel(root, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, filepath.ToSlash(r))
+	}
+	return out
+}
+
+func TestDiscoveryWalkRules(t *testing.T) {
+	root := t.TempDir()
+	// A category named like a content dir is still discovered.
+	writeContract(t, filepath.Join(root, "files", "a", "contract.yaml"), "cat-files")
+	// Inside a contract folder, content dirs are not walked.
+	writeContract(t, filepath.Join(root, "web", "b", "contract.yaml"), "web-b")
+	writeContract(t, filepath.Join(root, "web", "b", "src", "contract.yaml"), "vendored-src")
+	writeContract(t, filepath.Join(root, "web", "b", "files", "contract.yaml"), "vendored-files")
+	// Dot-directories are never walked.
+	writeContract(t, filepath.Join(root, ".github", "x", "contract.yaml"), "dot-github")
+	writeContract(t, filepath.Join(root, "web", ".trash", "contract.yaml"), "dot-trash")
+	// Two contract names in one folder load once (contract.yaml wins).
+	writeContract(t, filepath.Join(root, "web", "c", "contract.yaml"), "web-c")
+	writeContract(t, filepath.Join(root, "web", "c", "template.yaml"), "web-c")
+
+	got, err := New(root).All()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"files/a/contract.yaml", "web/b/contract.yaml", "web/c/contract.yaml"}
+	if fmt.Sprint(relPaths(t, root, got)) != fmt.Sprint(want) {
+		t.Fatalf("All = %v, want %v", relPaths(t, root, got), want)
+	}
+}
+
+func TestDiscoveryFollowsSymlinkedDirsWithoutLooping(t *testing.T) {
+	outside, root := t.TempDir(), t.TempDir()
+	writeContract(t, filepath.Join(outside, "t1", "contract.yaml"), "linked-one")
+	if err := os.Symlink(outside, filepath.Join(root, "linked")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	// A loop back to the root must not recurse forever.
+	if err := os.Symlink(root, filepath.Join(outside, "loop")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := New(root).All()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"linked/t1/contract.yaml"}; fmt.Sprint(relPaths(t, root, got)) != fmt.Sprint(want) {
+		t.Fatalf("All = %v, want %v", relPaths(t, root, got), want)
+	}
+}
+
+func TestFindSurfacesYAMLErrors(t *testing.T) {
+	root := t.TempDir()
+	writeContract(t, filepath.Join(root, "web", "ok", "contract.yaml"), "web-ok")
+	bad := filepath.Join(root, "web", "broken", "contract.yaml")
+	if err := os.MkdirAll(filepath.Dir(bad), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bad, []byte("metadata:\n  id: broken-one\n   summary: [unclosed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := New(root).Find("broken-one")
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if msg := err.Error(); !strings.Contains(msg, "could not be read") || !strings.Contains(msg, bad) {
+		t.Fatalf("error must name the unparseable template: %v", err)
+	}
+	// A good selector is unaffected by an unrelated broken file.
+	if p, err := New(root).Find("web-ok"); err != nil || len(p) != 1 {
+		t.Fatalf("web-ok: %v %v", p, err)
+	}
+}
+
+func TestShadowed(t *testing.T) {
+	dir := t.TempDir()
+	for _, n := range []string{"contract.yaml", "contract.yml", "notes.yaml"} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := Shadowed(filepath.Join(dir, "contract.yaml"))
+	if len(got) != 1 || filepath.Base(got[0]) != "contract.yml" {
+		t.Fatalf("Shadowed = %v, want [contract.yml]", got)
+	}
+	found, err := New(dir).All()
+	if err != nil || len(found) != 1 {
+		t.Fatalf("discovery must still load one contract per folder: %v %v", found, err)
 	}
 }

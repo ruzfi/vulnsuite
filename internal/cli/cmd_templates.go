@@ -4,8 +4,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/ruzfi/vulnsuite/pkg/contract"
 	"github.com/ruzfi/vulnsuite/pkg/kev"
@@ -35,29 +37,70 @@ func gather(store *loader.Store, selectors []string, all, variants bool) ([]*con
 // -- list ---------------------------------------------------------------------
 
 type listRow struct {
-	ID         string   `json:"id"`
-	Group      string   `json:"group,omitempty"`
-	Variant    string   `json:"variant,omitempty"`
-	Primary    bool     `json:"primary,omitempty"`
-	GroupSize  int      `json:"group_size,omitempty"`
-	Category   string   `json:"category,omitempty"`
-	Severity   string   `json:"severity"`
-	Class      []string `json:"class,omitempty"`
-	CVE        bool     `json:"cve"`
-	KEV        *bool    `json:"kev,omitempty"`
-	Year       string   `json:"year,omitempty"`
-	Disclosed  string   `json:"disclosed,omitempty"`
-	States     []string `json:"states"`
-	BuildKind  string   `json:"build_kind"`
-	Fidelity   string   `json:"fidelity"`
-	VulnRefs   []string `json:"vuln_refs"`
-	Detection  string   `json:"detection,omitempty"`
-	DetectedBy []string `json:"detected_by,omitempty"`
-	Tags       []string `json:"tags,omitempty"`
-	HostAccess bool     `json:"host_access,omitempty"`
-	Summary    string   `json:"summary"`
-	Path       string   `json:"path"`
-	Error      string   `json:"error,omitempty"`
+	ID        string   `json:"id"`
+	Group     string   `json:"group,omitempty"`
+	Variant   string   `json:"variant,omitempty"`
+	Primary   bool     `json:"primary,omitempty"`
+	GroupSize int      `json:"group_size,omitempty"`
+	Category  string   `json:"category,omitempty"`
+	Severity  string   `json:"severity"`
+	Class     []string `json:"class,omitempty"`
+	CVE       bool     `json:"cve"`
+	KEV       *bool    `json:"kev,omitempty"`
+	// KEVSource is where the KEV column came from and how old it is (the same
+	// for every row; per row so -json stays a plain array).
+	KEVSource  *kevSourceInfo `json:"kev_source,omitempty"`
+	Year       string         `json:"year,omitempty"`
+	Disclosed  string         `json:"disclosed,omitempty"`
+	States     []string       `json:"states"`
+	BuildKind  string         `json:"build_kind"`
+	Fidelity   string         `json:"fidelity"`
+	VulnRefs   []string       `json:"vuln_refs"`
+	Detection  string         `json:"detection,omitempty"`
+	DetectedBy []string       `json:"detected_by,omitempty"`
+	Tags       []string       `json:"tags,omitempty"`
+	HostAccess bool           `json:"host_access,omitempty"`
+	Summary    string         `json:"summary"`
+	Path       string         `json:"path"`
+	Error      string         `json:"error,omitempty"`
+}
+
+// kevSourceInfo is the KEV data's provenance and age, for list -json.
+type kevSourceInfo struct {
+	Origin         string `json:"origin"`
+	Path           string `json:"path,omitempty"`
+	CatalogVersion string `json:"catalog_version,omitempty"`
+	AsOf           string `json:"as_of,omitempty"` // YYYY-MM-DD the data was current
+	AgeDays        *int   `json:"age_days,omitempty"`
+	Stale          bool   `json:"stale"`
+}
+
+func newKEVSourceInfo(src kev.Source, now time.Time) *kevSourceInfo {
+	info := &kevSourceInfo{Origin: string(src.Origin), Path: src.Path, CatalogVersion: src.CatalogVersion, Stale: src.Stale(now)}
+	if !src.AsOf.IsZero() {
+		info.AsOf = src.AsOf.Format("2006-01-02")
+		days := int(src.Age(now).Hours() / 24)
+		info.AgeDays = &days
+	}
+	return info
+}
+
+// kevAgeNote renders the KEV data's age for the status line ("" if unknown).
+func kevAgeNote(src kev.Source, now time.Time) string {
+	if src.AsOf.IsZero() {
+		if src.Origin == kev.OriginNone {
+			return ""
+		}
+		return "; age unknown"
+	}
+	days := int(src.Age(now).Hours() / 24)
+	switch {
+	case days <= 0:
+		return "; current as of today"
+	case days == 1:
+		return "; 1 day old"
+	}
+	return fmt.Sprintf("; %d days old", days)
 }
 
 func cmdList() *Command {
@@ -73,7 +116,11 @@ when unique). A ref-shaped selector (CVE-..., GHSA-..., GO-..., VS-...) that
 matches no id/file/folder resolves against vuln_refs instead, so
 ` + "`search CVE-2026-109619`" + ` just works. With no selector every template is listed.
 
-Filters compose (all must match). Finding class, CVE and KEV status are derived
+Filters compose (all must match). With no selector, a filter looks at every
+template, variant-group members included -- the same set run and build select
+for that filter -- while a bare list shows one row per group (its primary)
+unless -variants is given. With a selector, filters narrow what it selected.
+Finding class, CVE and KEV status are derived
 from contract metadata (taxonomy v2) and shown as columns:
 
   -ref         a specific vuln_refs id -- CVE-, GHSA-, GO- or VS-... (repeatable;
@@ -90,8 +137,11 @@ from contract metadata (taxonomy v2) and shown as columns:
 KEV membership is derived by cross-referencing a target's CVEs against the CISA
 KEV catalog. The catalog is read from the templates checkout's data/cisa-kev.txt
 (kept fresh upstream); -refresh-kev fetches the live CISA feed and caches it at
-` + "`~/.cache/vulnsuite/cisa-kev.json`" + `. Offline with neither present, KEV is
-shown as "?" and -kev/-no-kev cannot be used.`,
+` + "`~/.cache/vulnsuite/cisa-kev.json`" + `, and that cache is used instead
+whenever it holds a newer catalog than the checkout. The status line (and
+kev_source in -json) gives the source and its age; data more than 30 days old
+gets a warning. Offline with neither present, KEV is shown as "?" and
+-kev/-no-kev cannot be used.`,
 		Flags: func(fs *flag.FlagSet) {
 			f.register(fs)
 			fs.StringVar(&groupFilter, "group", "", "only members of this variant group (shows the whole family)")
@@ -107,7 +157,11 @@ shown as "?" and -kev/-no-kev cannot be used.`,
 			}
 			// Resolve the KEV set always, to populate the column; -kev/-no-kev
 			// additionally require it to be known.
-			kevSet, kevSrc, err := kev.Resolve(ctx, kev.Options{TemplatesDir: store.Root, Refresh: f.refreshKEV})
+			kevSet, kevSrc, err := kev.Resolve(ctx, kev.Options{
+				TemplatesDir: store.Root,
+				Refresh:      f.refreshKEV,
+				Warn:         func(msg string) { g.errorf("warning: %s\n", msg) },
+			})
 			if err != nil {
 				return err
 			}
@@ -115,11 +169,27 @@ shown as "?" and -kev/-no-kev cannot be used.`,
 			if f.needsKEV() && !kevKnown {
 				return fmt.Errorf("cannot filter by KEV: catalog unavailable (offline and no cache). Run with -refresh-kev, or point -templates at a checkout with data/cisa-kev.txt")
 			}
+			now := time.Now()
+			var kevInfo *kevSourceInfo
+			if kevKnown {
+				kevInfo = newKEVSourceInfo(kevSrc, now)
+			}
+			if kevSrc.Stale(now) {
+				g.errorf("warning: the KEV data is %d days old (%s); refresh it with -refresh-kev or update-templates\n",
+					int(kevSrc.Age(now).Hours()/24), kevSrc)
+			}
 			groupSizes, err := store.Groups()
 			if err != nil {
 				return err
 			}
-			expanded := variants || groupFilter != ""
+			// A filter with no selector selects from every template, variant
+			// members included, exactly as it does on run and build (#36: "a
+			// filter that matches a variant member includes that member
+			// regardless of collapse"), so `list <filter>` previews what
+			// `run <filter>` / `build <filter>` will stand up. A bare `list`
+			// (like -all) still collapses each group to its primary.
+			filterAll := len(args) == 0 && groupFilter == "" && f.active()
+			expanded := variants || groupFilter != "" || filterAll
 			var paths []string
 			switch {
 			case groupFilter != "":
@@ -134,14 +204,14 @@ shown as "?" and -kev/-no-kev cannot be used.`,
 					paths = append(paths, m.Path)
 				}
 			case len(args) == 0:
-				paths, err = store.FindMany(nil, true, variants)
+				paths, err = store.FindMany(nil, true, variants || filterAll)
 			default:
 				paths, err = store.FindMany(args, false, variants)
 			}
 			if err != nil {
 				return err
 			}
-			var rows []listRow
+			rows := []listRow{} // -json prints [] (not null) when nothing matches
 			for _, p := range paths {
 				c, err := store.Load(p)
 				if err != nil {
@@ -166,6 +236,7 @@ shown as "?" and -kev/-no-kev cannot be used.`,
 				if kevKnown {
 					v := onKEV
 					row.KEV = &v
+					row.KEVSource = kevInfo
 				}
 				rows = append(rows, row)
 			}
@@ -202,7 +273,7 @@ shown as "?" and -kev/-no-kev cannot be used.`,
 			}
 			tw.Flush()
 			g.printf("\n%d templates in %s\n", len(rows), store.Root)
-			g.printf("KEV source: %s\n", kevSrc)
+			g.printf("KEV source: %s%s\n", kevSrc, kevAgeNote(kevSrc, now))
 			if anyHostAccess(rows) {
 				g.printf("* needs host access (device/elevated capability); run with -allow-host-access, and only for templates you trust.\n")
 			}
@@ -356,6 +427,9 @@ func cmdValidate() *Command {
 					LoadErrs  []string            `json:"load_errors,omitempty"`
 					Findings  []validator.Finding `json:"findings"`
 				}
+				if findings == nil {
+					findings = []validator.Finding{}
+				}
 				o := out{Templates: len(cs), Errors: nerr, Warnings: nwarn, Findings: findings}
 				for _, e := range loadErrs {
 					o.LoadErrs = append(o.LoadErrs, e.Error())
@@ -384,23 +458,41 @@ func cmdValidate() *Command {
 
 func cmdUpdateTemplates() *Command {
 	var repo, ref string
+	var force bool
 	return &Command{
 		Name: "update-templates", Aliases: []string{"ut"},
 		Short: "download or update the community templates (~/vulnsuite-templates)",
-		Usage: "[-repo OWNER/NAME] [-ref BRANCH|TAG]",
-		Long: `Fetches ` + templates.DefaultRepo + ` into the templates directory. A git
-checkout is pulled (fast-forward only); anything else is replaced by the GitHub
-archive of the branch or tag.`,
+		Usage: "[-repo OWNER/NAME] [-ref BRANCH|TAG|COMMIT] [-force]",
+		Long: `Fetches ` + templates.DefaultRepo + ` into the templates directory
+(-templates, $VULNSUITE_TEMPLATES, the templates repo you are in, or
+~/vulnsuite-templates).
+
+A git checkout is pulled (fast-forward only); with -ref, the ref is fetched
+from origin and checked out detached (refused while tracked files have
+uncommitted changes). A checkout is never replaced: if git is not on PATH the
+update fails.
+
+Anything else is replaced by the GitHub archive of -ref (default ` + templates.DefaultBranch + `), but
+only when the directory is missing, empty, or was installed by
+update-templates before; pass -force to replace any other directory.`,
 		Flags: func(fs *flag.FlagSet) {
-			fs.StringVar(&repo, "repo", templates.DefaultRepo, "GitHub repository")
-			fs.StringVar(&ref, "ref", templates.DefaultBranch, "branch or tag")
+			fs.StringVar(&repo, "repo", "", "GitHub repository for archive installs (default "+templates.DefaultRepo+")")
+			fs.StringVar(&ref, "ref", "", "branch, tag or commit (default: pull a checkout's branch, or "+templates.DefaultBranch+")")
+			fs.BoolVar(&force, "force", false, "replace a non-empty directory update-templates did not install")
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
-			dir := g.TemplatesDir
-			if dir == "" {
-				dir = templates.DefaultDir()
+			dir, err := templates.Resolve(g.TemplatesDir)
+			if err != nil {
+				return err
 			}
-			dir, version, err := templates.Update(ctx, templates.UpdateOptions{Dir: dir, Repo: repo, Ref: ref, Output: g.Stdout})
+			progress := g.Stdout
+			if g.JSON {
+				progress = g.Stderr // keep stdout valid JSON
+			}
+			if g.Quiet {
+				progress = io.Discard
+			}
+			dir, version, err := templates.Update(ctx, templates.UpdateOptions{Dir: dir, Repo: repo, Ref: ref, Force: force, Output: progress})
 			if err != nil {
 				return err
 			}
@@ -421,7 +513,7 @@ func cmdVersion() *Command {
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
 			dir, _ := templates.Resolve(g.TemplatesDir)
 			if g.JSON {
-				return g.emitJSON(map[string]string{"version": Version, "commit": Commit, "date": Date,
+				return g.emitJSON(map[string]string{"version": resolvedVersion(), "commit": Commit, "date": Date,
 					"templates_dir": dir, "templates_version": templates.Version(dir)})
 			}
 			fmt.Fprintln(g.Stdout, versionString())

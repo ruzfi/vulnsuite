@@ -12,8 +12,20 @@ relative to that folder, so a template is self-contained.
   src/                 Dockerfile + source for a `build` base
 ```
 
-Unknown fields are rejected. The machine-readable form of this document is
-[`schemas/contract.schema.json`](../schemas/contract.schema.json).
+Unknown fields are rejected, and so is a value of the wrong type: a quoted
+number where an integer is expected (`container: "80"`), a number or `null`
+where a string is expected (`summary: 123`, an `environment` value of `1`,
+`true` or `null` -- quote it: `FOO: "1"`). A file must hold a single YAML
+document. The machine-readable form of this document is
+[`schemas/contract.schema.json`](../schemas/contract.schema.json); the loader
+enforces the same rules.
+
+Discovery walks the templates tree and takes at most one contract per folder
+(the first of `contract.yaml`, `contract.yml`, `template.yaml`). It never
+enters dot-directories (`.git`, `.github`, ...) or `node_modules`, skips a
+template's own `files/`, `patches/` and `src/` (only inside a folder that holds
+a contract, so a category may be called `files`), and follows symlinked
+directories once.
 
 ## Top level
 
@@ -30,15 +42,15 @@ Unknown fields are rejected. The machine-readable form of this document is
 
 | Field | Required | Notes |
 | --- | --- | --- |
-| `id` | yes | `^[a-z0-9][a-z0-9.-]{2,79}$`; unique; `<product>-<version>-<cve>` by convention. Also the container's network alias. |
+| `id` | yes | `^[a-z0-9]+([.-][a-z0-9]+)*$`, 3-80 characters (a valid Docker repository name: no leading, trailing or doubled `.`/`-`); unique; `<product>-<version>-<cve>` by convention. The running container's network alias is `<id>-<state>` (one per state). |
 | `summary` | yes | one line: what and how |
 | `vuln_refs` | | `CVE-YYYY-NNNN`, `GHSA-...`, or `PREFIX-ID` for flaws without a CVE (community templates use `VS-...`) |
 | `cwe` | | `CWE-NN` |
 | `severity` | | `info`, `low`, `medium`, `high`, `critical` |
-| `class` | | finding class(es) (taxonomy v2), orthogonal to the product surface (the top directory level): `vuln` (a tracked software vulnerability, usually a CVE), `misconfig` (an insecure configuration), `exposure` (data/interface reachable that should not be), `default-login` (default/weak credentials), `weak-crypto`. One or more, unique. `vulnsuite list --class` filters on it. |
+| `class` | | non-empty list of finding class(es) (taxonomy v2), orthogonal to the product surface (the top directory level): `vuln` (a tracked software vulnerability, usually a CVE), `misconfig` (an insecure configuration), `exposure` (data/interface reachable that should not be), `default-login` (default/weak credentials), `weak-crypto`. One or more, unique. `vulnsuite list --class` filters on it. |
 | `disclosed` | | optional public-disclosure date (`YYYY-MM-DD`); drives `list --year`/`--since` and a timeline view, falling back to the CVE-id year when unset. |
 | `group` | | variant-family handle (`^[a-z0-9]+(-[a-z0-9]+)*$`). Targets that share a `group` are variants of one vulnerability: `-t <group>` resolves to the group's **primary**, and `-variants` expands to every member. A lone target that sets a `group` is simply a nickname for its id (no `primary`/`variant` needed). A handle must not equal any target `id`. |
-| `primary` | | `true` marks the canonical member of a group. Exactly one member of a multi-member group must set it; a single-member group's lone member is the primary implicitly. |
+| `primary` | | `true` marks the canonical member of a group. Exactly one member of a multi-member group must set it; a single-member group's lone member is the primary implicitly. Without a `group` it has no effect (`primary-no-group` warning). |
 | `variant` | | discriminator within a group (`^[a-z0-9]+(-[a-z0-9]+)*$`), e.g. `waf-evasion`; unique within the group. Every non-primary member of a multi-member group needs one. Requires `group`. |
 | `tags` | | free-form; `vulnsuite list -tag` filters on them |
 | `references` | | the advisory and the fix |
@@ -62,7 +74,13 @@ base: { kind: build, context: src, dockerfile: Dockerfile, build_args: {} }
 - `image` must pin `digest` to be reproducible (`validate` errors otherwise;
   `-allow-unpinned` downgrades it while authoring). Get it with
   `docker manifest inspect <image> -v | grep -m1 digest` or `docker buildx imagetools inspect <image>`.
-- `source` pins `commit`; the state's `patch` is applied on top.
+- `source` pins `commit` to a full 40-character (or 64-character SHA-256)
+  commit id; a branch or tag is unpinned, an abbreviated id a `short-commit`
+  warning. The state's `patch` is applied on top.
+- Per-state `image` overrides and every sidecar image (`service.sidecars`
+  and per-state `sidecars` overrides) must pin `digest` too
+  (`unpinned-state-image`, `unpinned-sidecar`; `-allow-unpinned` downgrades
+  them like the base).
 - `build` points at a folder inside the template with a Dockerfile; it is
   self-contained and therefore always considered pinned.
 
@@ -74,7 +92,7 @@ base: { kind: build, context: src, dockerfile: Dockerfile, build_args: {} }
 | `command` | string or list; overrides the image command |
 | `environment` | map; merged with the state's environment (state wins) |
 | `healthcheck` | `{ http: { path, status }, timeout: 60s }` or `{ tcp: { port }, timeout }`; `timeout` is `<n>s|m|h` |
-| `sidecars` | helper containers `{ name, image, digest, command, environment }` started on the same network, reachable by `name` (`command` sets the container command, e.g. a `server ...` arg list for a clustered node) |
+| `sidecars` | helper containers `{ name, image, digest, command, environment }` (names unique) started with each target state on a private network shared only with that state's target, reachable there by `name` in every exposure mode; each state gets its own sidecars (`command` sets the container command, e.g. a `server ...` arg list for a clustered node) |
 | `user` | run-as `uid` or `uid:gid` |
 | `cap_add` / `cap_drop` | Linux capabilities, e.g. `cap_drop: [ALL]` then `cap_add: [CAP_NET_BIND_SERVICE]` |
 | `devices` | host devices to pass through, e.g. `/dev/kvm` |
@@ -98,14 +116,16 @@ Preflight decisions (`vulnsuite run` / `build`):
 | Situation | Result |
 | --- | --- |
 | `arch` empty or includes the host arch | native |
-| host arch not in `arch`, `emulation` true, linux host | emulated (`--platform linux/<arch>`, with a warning) |
+| host arch not in `arch`, `emulation` true, linux host | emulated (`--platform linux/<arch>`, with a warning): images are pulled, built and run for that platform, sidecars included |
 | host arch not in `arch`, `emulation` false | skip (reason) |
 | `kvm: true` on a non-`linux/amd64` host | skip (reason) |
 | `host_os` set and the daemon OS is not in it | skip (reason) |
 
 A skipped target is reported and the rest of the batch continues;
 `-ignore-requires` runs it anyway. `list -arch <a>` hides targets that cannot
-run on that arch.
+run on that arch. The platform is decided per target, so a `build` of several
+targets emulates only those that need it; an explicit `-platform` applies to
+every target.
 
 ## `states`
 
@@ -116,12 +136,12 @@ scanner's discrimination cannot be checked). Each state:
 | --- | --- |
 | `image` / `digest` | per-state image override — the cheapest "patched": a newer tag |
 | `patch` | a git patch applied to a `source` or `build` base |
-| `overlay` | `[{ src, dest, mode }]` files from the template baked into the image (`image` base) or written into the build context (`source`/`build` base) |
-| `environment` | baked into built images and passed at run time |
+| `overlay` | `[{ src, dest, mode }]` files from the template baked into the image (`image` base) or written into the build context (`source`/`build` base). `src` is relative to the template folder; `dest` is an absolute path in the image for an `image` base, or a path in the build context for a `source`/`build` base. `mode` (e.g. `"0755"`) is set on the file in the build context and kept by `COPY`, so it also works on a non-root or shell-less base. See **Paths** below. |
+| `environment` | baked into built images and passed at run time. Names must match `^[A-Za-z_][A-Za-z0-9_.-]*$`; values may not contain newlines or other control characters (they become Dockerfile `ENV` lines; `$` is kept literally). |
 | `command` | per-state command override |
 | `sidecars` | per-state sidecar image overrides, `{ <name>: { image, digest } }` -- swap a sidecar to another version for this state (e.g. the fixed release on every node of a multi-node cluster, which will not form across mixed versions) |
-| `seed` | `[{ run: "..." }]` shell steps executed inside the container once it is up |
-| `verify` | probes that prove the state |
+| `seed` | `[{ run: "..." }]` shell steps executed inside the container once it is ready (skipped if it never becomes ready). A step that exits non-zero stops the rest, fails verify and fails `run` |
+| `verify` | probes that prove the state; when present, at least one |
 
 How a state's image is produced (`vulnsuite list` shows it as KIND):
 
@@ -132,13 +152,21 @@ How a state's image is produced (`vulnsuite list` shows it as KIND):
 | `source` | anything | `source` | `vulnsuite/<id>:<state>-<hash>` |
 | `build` | anything | `build` | `vulnsuite/<id>:<state>-<hash>` |
 
-`<hash>` covers the base identity, the build context tree, the patch, every
-overlay's content and destination, the environment and build args. Identical
-inputs produce an identical tag and are never rebuilt.
+`<hash>` covers the base identity, the state's `image`/`digest` override
+(what an overlay build starts `FROM`), the build context tree (a symlink by
+its link text), the patch,
+every overlay's content, destination and `mode`, the environment and build
+args. Identical inputs produce an identical tag and are never rebuilt. The
+state image and `mode` enter the hash only when set, so templates that use
+neither keep their tags. The platform is not part of the hash: an existing
+image is reused only when it was built for the platform wanted now (the
+emulation platform, else the daemon's own), otherwise it is rebuilt.
 
 ## `verify` probes
 
-Exactly one kind per probe. Probes are independent of any scanner: they
+Exactly one kind per probe (`http`, `tcp`, `net` or `exec`). A probe `port` is
+1-65535 and a `timeout` (seconds) is greater than 0; leave either out for the
+default (an explicit `port: 0` or `timeout: 0` is rejected). Probes are independent of any scanner: they
 demonstrate the *impact* from the advisory, not a matcher.
 
 ```yaml
@@ -182,6 +210,29 @@ template says. Chunked responses are decoded. `https` ports skip certificate
 verification. A `status`-only assertion on the vulnerable state is a
 `weak-verify` warning: assert the body or a header.
 
+### Paths
+
+Templates are untrusted input, so every file a template references must be its
+own:
+
+- `overlay[].src`, `patch`, `base.context` and `base.dockerfile` are relative
+  paths inside the template folder (`base.dockerfile` inside the context).
+  Absolute paths (`/etc/x`, `C:/x`), `..` segments and control characters are
+  schema errors. A symlink is allowed only when its target is inside the template
+  folder too; one pointing elsewhere is refused at build time and reported by
+  `validate` as `path-escapes-template`.
+- The build context (`base.context`, or the `source` checkout) is sent as it
+  is on disk: symlinks inside it travel as symlinks and are never followed
+  (the daemon resolves them inside the context), `.git` is left out, and a
+  `.dockerignore` at the context root is honoured with Docker's pattern rules.
+  The Dockerfile and `.dockerignore` are always sent, as with `docker build`.
+- `overlay[].dest` is a plain path: letters, digits and `. _ @ % + = : , / -`,
+  no whitespace, quotes, `$` or control characters, no `..` segments, and not
+  `/` itself. For an `image` base it must be absolute.
+- `overlay[].mode` is four octal digits starting with `0` (`"0755"`): plain
+  permission bits only, no setuid, setgid or sticky bit. It is set on the file
+  in the build context's tar header, never through a generated `RUN` line.
+
 Probes run from the vulnsuite host against the container's IP (internal /
 macvlan) or the published port (host). Where the host cannot route to
 container IPs (Docker Desktop), verification is skipped with an explanation
@@ -193,8 +244,12 @@ rather than failed; use `-expose host` or scan from a container.
 
 | Rule | Level | Meaning |
 | --- | --- | --- |
-| `unpinned-base` | error (warning with `-allow-unpinned`) | image has no digest / source has no commit |
+| `unpinned-base` | error (warning with `-allow-unpinned`) | image has no digest / source has no commit, or a commit that is not a commit id (a branch or tag) |
+| `unpinned-state-image` | error (warning with `-allow-unpinned`) | a state's `image` override has no digest |
+| `unpinned-sidecar` | error (warning with `-allow-unpinned`) | a sidecar image, or a state's sidecar override, has no digest |
+| `short-commit` | warning | `base.commit` is an abbreviated commit id; use the full SHA |
 | `missing-context`, `missing-dockerfile`, `missing-patch`, `missing-overlay` | error | a referenced file is not in the template |
+| `path-escapes-template` | error | a referenced path resolves (through a symlink) outside the template folder |
 | `patch-needs-source` | error | a patch on an `image` base |
 | `empty-verify` | error | an http probe asserts nothing |
 | `bad-regex`, `bad-timeout` | error | malformed values |
@@ -204,13 +259,20 @@ rather than failed; use `-expose host` or scan from a container.
 | `group-id-collision` | error | a group handle equals a template `id` |
 | `group-multi-category` | warning | a group spans more than one product surface |
 | `group-divergent-refs` | warning | members of a group cite differing `vuln_refs` |
-| `no-patched`, `no-verify`, `weak-verify`, `identical-states` | warning | the template proves less than it could |
+| `no-ports` | error | `service` declares no ports |
+| `undeclared-port` | warning | `healthcheck.tcp.port` or a verify probe's `port` is not declared in `service.ports` (usually a typo; a `tcp` probe with `closed: true` is exempt) |
+| `shadowed-contract` | warning | the template folder holds a second contract file (`contract.yaml`, `contract.yml`, `template.yaml`); only the first is loaded |
+| `no-patched`, `no-verify`, `weak-verify`, `identical-states` | warning | the template proves less than it could (`identical-states`: vulnerable and patched have the same image, build inputs, command, sidecar images and seed) |
 | `source-no-diff` | warning | a source base where states have no patch/image difference |
 | `no-healthcheck`, `no-vuln-ref`, `no-references`, `scanner-unnamed` | warning | missing provenance |
 | `no-detected-by` | warning | no scanner template linked and `detection` unset |
 | `fidelity-unset` | warning | metadata.fidelity is not set (real or simulated) |
 | `simulated-on-image-base` | warning | fidelity: simulated but the base is a prebuilt image |
 | `kvm-without-requires` | warning | service.devices has /dev/kvm but requires.kvm is not set |
+| `host-device-access` | warning | `service.devices` passes a host device through; `run` needs `-allow-host-access` |
+| `elevated-capability` | warning | `cap_add` adds a capability that can escape the container; `run` needs `-allow-host-access` |
+| `primary-no-group` | warning | `primary: true` is set without a `group` |
+| `unknown-scanner` | warning | a `detected_by` entry names a scanner other than `nuclei` or `nmap` |
 | `unknown-scanner-template`, `undeclared-scanner-template` | warning | with a nuclei-templates checkout: a declared id does not exist / a template for the target's CVE is not declared |
 
 `-strict` turns warnings into failures (use it in CI).

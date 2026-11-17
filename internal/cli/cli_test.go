@@ -21,8 +21,9 @@ func seedHostTarget(fe *enginetest.Fake, hostIP string, hostPort int) {
 	fe.Containers[name] = &enginetest.Container{
 		ID: "c1", Running: true, IP: "172.17.0.2",
 		Spec: engine.ContainerSpec{
-			Name:  name,
-			Ports: []engine.PortBinding{{HostIP: hostIP, HostPort: hostPort, ContainerPort: 3000, Protocol: "tcp"}},
+			Name:   name,
+			Labels: map[string]string{"dev.vulnsuite.managed": "true"},
+			Ports:  []engine.PortBinding{{HostIP: hostIP, HostPort: hostPort, ContainerPort: 3000, Protocol: "tcp"}},
 		},
 	}
 }
@@ -332,7 +333,7 @@ func TestRunStopPs(t *testing.T) {
 		t.Fatalf("ps: %d %s", code, out)
 	}
 	code, out, _ = run(t, fe, "-T", root, "targets", "-by", "alias")
-	if code != ExitOK || !strings.Contains(out, "http://grafana-8.3.0-cve-2021-43798:3000") {
+	if code != ExitOK || !strings.Contains(out, "http://grafana-8.3.0-cve-2021-43798-patched:3000") {
 		t.Fatalf("targets: %d %s", code, out)
 	}
 	// concurrency cap counts what is already running
@@ -385,7 +386,7 @@ func TestMultiPortReporting(t *testing.T) {
 	name := contract.ContainerNamePrefix + "multiport-console-demo-vulnerable"
 	fe.Containers[name] = &enginetest.Container{
 		ID: "c1", Running: true, IP: "172.17.0.2",
-		Spec: engine.ContainerSpec{Name: name, Ports: []engine.PortBinding{
+		Spec: engine.ContainerSpec{Name: name, Labels: map[string]string{"dev.vulnsuite.managed": "true"}, Ports: []engine.PortBinding{
 			{HostIP: "127.0.0.1", HostPort: 40000, ContainerPort: 9999, Protocol: "tcp"},
 			{HostIP: "127.0.0.1", HostPort: 40001, ContainerPort: 8091, Protocol: "tcp"},
 		}},
@@ -400,9 +401,9 @@ func TestMultiPortReporting(t *testing.T) {
 	if code != ExitOK || !strings.Contains(out, "http://127.0.0.1:40000") || !strings.Contains(out, "http://127.0.0.1:40001") {
 		t.Fatalf("targets -by host: %d\n%s", code, out)
 	}
-	// -by alias addresses each published container port at the network alias.
+	// -by alias addresses each published container port at the per-state network alias.
 	code, out, _ = run(t, fe, "-T", root, "targets", "-by", "alias")
-	if code != ExitOK || !strings.Contains(out, "http://multiport-console-demo:9999") || !strings.Contains(out, "http://multiport-console-demo:8091") {
+	if code != ExitOK || !strings.Contains(out, "http://multiport-console-demo-vulnerable:9999") || !strings.Contains(out, "http://multiport-console-demo-vulnerable:8091") {
 		t.Fatalf("targets -by alias: %d\n%s", code, out)
 	}
 }
@@ -414,6 +415,7 @@ func TestMultiPortReporting(t *testing.T) {
 func TestRunTargetsFileEmitsCleanURLs(t *testing.T) {
 	root := fixtures(t)
 	fe := enginetest.New()
+	serveOnPublishedPorts(t, fe, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n") // so it becomes ready
 	targetsFile := filepath.Join(t.TempDir(), "targets.txt")
 	code, out, errOut := run(t, fe, "-T", root, "run", "vulnerable",
 		"-t", "multiport-console-demo", "-expose", "host", "-bind", "127.0.0.1",
