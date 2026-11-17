@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"sort"
 	"strings"
 	"sync"
@@ -68,6 +69,9 @@ type Fake struct {
 	// ImageRemoveFn runs before an image is removed (receives its ref); an
 	// error fails the removal and keeps the image.
 	ImageRemoveFn func(ref string) error
+	// NoAssignPorts leaves host port 0 bindings unassigned on start (a daemon
+	// that does not report its assignment).
+	NoAssignPorts bool
 	// ListErr makes ContainerList fail when set.
 	ListErr error
 	// FailBuild makes every build fail with this message when set.
@@ -247,6 +251,20 @@ func (f *Fake) ContainerCreate(ctx context.Context, spec engine.ContainerSpec) (
 	return c.ID, nil
 }
 
+// freeHostPort returns a currently free TCP port on host (127.0.0.1 for "" or
+// 0.0.0.0).
+func freeHostPort(host string) (int, error) {
+	if host == "" || host == "0.0.0.0" {
+		host = "127.0.0.1"
+	}
+	l, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
+	if err != nil {
+		return 0, err
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port, nil
+}
+
 func (f *Fake) byIDOrName(id string) *Container {
 	if c, ok := f.Containers[id]; ok {
 		return c
@@ -270,6 +288,22 @@ func (f *Fake) ContainerStart(ctx context.Context, id string) error {
 		return fmt.Errorf("no such container %s", id)
 	}
 	c.Running = true
+	// Like the daemon, assign a free host port to every binding that asks
+	// for host port 0 (a real free port, so a StartFn can listen on it).
+	if !f.NoAssignPorts {
+		ports := append([]engine.PortBinding(nil), c.Spec.Ports...)
+		for i := range ports {
+			if ports[i].HostPort == 0 {
+				p, err := freeHostPort(ports[i].HostIP)
+				if err != nil {
+					f.mu.Unlock()
+					return err
+				}
+				ports[i].HostPort = p
+			}
+		}
+		c.Spec.Ports = ports
+	}
 	spec, fn := c.Spec, f.StartFn
 	f.mu.Unlock()
 	if fn != nil {

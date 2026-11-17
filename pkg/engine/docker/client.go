@@ -60,6 +60,13 @@ func IsNotFound(err error) bool {
 	return errors.As(err, &e) && e.Status == http.StatusNotFound
 }
 
+// IsConflict reports whether err is the daemon's 409 Conflict (e.g. a network
+// or container name already in use).
+func IsConflict(err error) bool {
+	var e *Error
+	return errors.As(err, &e) && e.Status == http.StatusConflict
+}
+
 // DefaultHost is the socket used when DOCKER_HOST is unset.
 func DefaultHost() string {
 	if h := os.Getenv("DOCKER_HOST"); h != "" {

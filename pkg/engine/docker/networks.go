@@ -55,6 +55,13 @@ func (c *Client) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (st
 		ID string `json:"Id"`
 	}
 	if err := c.doJSON(ctx, http.MethodPost, "/networks/create", nil, body, &out); err != nil {
+		// A concurrent run created it between our inspect and create: use
+		// that one.
+		if IsConflict(err) {
+			if ierr := c.doJSON(ctx, http.MethodGet, "/networks/"+url.PathEscape(spec.Name), nil, nil, &existing); ierr == nil {
+				return existing.ID, nil
+			}
+		}
 		return "", err
 	}
 	return out.ID, nil
