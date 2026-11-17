@@ -67,6 +67,8 @@ states:
   vulnerable:
     verify:
       - http: { path: /.env, status: 200, body_matches: "DB_PASSWORD=" }
+      # a container port: in host mode it must be dialled on its published host port
+      - tcp: { port: 8080 }
   patched:
     environment: { MODE: patched }
     verify:

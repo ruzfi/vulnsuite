@@ -90,6 +90,39 @@ type Handle struct {
 	VerifyOK     *bool           `json:"verify_ok"`
 	VerifyDetail string          `json:"verify_detail,omitempty"`
 	Probes       []probes.Result `json:"probes,omitempty"`
+	// Seeds is the outcome of each of the state's seed steps, in order. Seeds
+	// run only once the target is ready; otherwise each is recorded as skipped.
+	Seeds []SeedResult `json:"seeds,omitempty"`
+}
+
+// SeedResult is the outcome of one seed step.
+type SeedResult struct {
+	Run      string `json:"run"`
+	OK       bool   `json:"ok"`
+	Skipped  bool   `json:"skipped,omitempty"`
+	ExitCode int    `json:"exit_code"`
+	Error    string `json:"error,omitempty"`
+	Output   string `json:"output,omitempty"` // tail of the output, on failure
+}
+
+// Problem returns why this target must not be handed out (not ready, a seed
+// step failed, or verify failed), or "" when nothing is wrong. Verify that was
+// skipped (VerifyOK nil) is not a problem in itself.
+func (h *Handle) Problem() string {
+	var why []string
+	if !h.Ready {
+		why = append(why, "not ready")
+	}
+	for _, s := range h.Seeds {
+		if !s.OK && !s.Skipped { // a skip follows a failure or "not ready", already reported
+			why = append(why, "seed failed")
+			break
+		}
+	}
+	if h.VerifyOK != nil && !*h.VerifyOK {
+		why = append(why, "verify failed")
+	}
+	return strings.Join(why, ", ")
 }
 
 // PublishedPort is one container port exposed to a scanner. In host mode HostIP
@@ -395,13 +428,67 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 	}
 
 	r.awaitReady(ctx, c, h, opts.ReadyTimeout)
-	for _, step := range st.Seed {
-		_, _, _ = r.Engine.ContainerExec(ctx, name, step.Run, 2*time.Minute)
-	}
+	r.seed(ctx, st, h)
 	if opts.Verify {
 		r.verify(ctx, c, st, h)
 	}
 	return h, nil
+}
+
+// seed runs the state's seed steps once the target is ready, recording each
+// outcome. A step that fails stops the rest: later steps usually build on it.
+// When the target is not ready nothing runs; every step is recorded as skipped.
+func (r *Runner) seed(ctx context.Context, st *contract.State, h *Handle) {
+	stopped := ""
+	if !h.Ready {
+		stopped = "target not ready"
+	}
+	for _, step := range st.Seed {
+		res := SeedResult{Run: step.Run}
+		if stopped != "" {
+			res.Skipped, res.ExitCode, res.Error = true, -1, "skipped: "+stopped
+			h.Seeds = append(h.Seeds, res)
+			continue
+		}
+		code, out, err := r.Engine.ContainerExec(ctx, h.Container, step.Run, 2*time.Minute)
+		res.ExitCode = code
+		switch {
+		case err != nil:
+			res.Error = err.Error()
+		case code != 0:
+			res.Error = fmt.Sprintf("exit %d", code)
+		default:
+			res.OK = true
+		}
+		if !res.OK {
+			res.Output = tail(out, 512)
+			stopped = "an earlier seed step failed"
+		}
+		h.Seeds = append(h.Seeds, res)
+	}
+}
+
+// seedDetail summarises failed or skipped seed steps for the verify detail.
+func seedDetail(h *Handle) string {
+	var lines []string
+	for _, s := range h.Seeds {
+		if s.OK {
+			continue
+		}
+		line := fmt.Sprintf("FAIL seed %q -> %s", s.Run, s.Error)
+		if o := strings.TrimSpace(s.Output); o != "" {
+			line += ": " + strings.ReplaceAll(o, "\n", " | ")
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func tail(s string, n int) string {
+	if len(s) > n {
+		return s[len(s)-n:]
+	}
+	return s
 }
 
 // Stop tears a handle down.
@@ -594,13 +681,42 @@ func (r *Runner) awaitReady(ctx context.Context, c *contract.Contract, h *Handle
 		}
 		h.Ready = probes.WaitForHTTP(ctx, host, port, h.Scheme, path, hc.HTTP.Status, time.Until(deadline))
 	case hc.TCP != nil && hc.TCP.Port != 0:
-		h.Ready = probes.WaitForPort(ctx, host, hc.TCP.Port, time.Until(deadline))
+		// The healthcheck names a container port; in host mode it is reached on
+		// its published host port. An unpublished port cannot be checked from
+		// here, so fall back to the primary port.
+		hcPort := hc.TCP.Port
+		if pm := hostPortMap(h); pm != nil {
+			if hp, ok := pm[hcPort]; ok {
+				hcPort = hp
+			} else {
+				hcPort = port
+			}
+		}
+		h.Ready = probes.WaitForPort(ctx, host, hcPort, time.Until(deadline))
 	default:
 		h.Ready = probes.WaitForPort(ctx, host, port, time.Until(deadline))
 	}
 }
 
+// verify runs the state's probes and folds failed or skipped seed steps into
+// the result: the probes may pass on the image alone, but the state the seeds
+// were meant to set up is not guaranteed, so that is a failed verify.
 func (r *Runner) verify(ctx context.Context, c *contract.Contract, st *contract.State, h *Handle) {
+	r.runProbes(ctx, c, st, h)
+	sd := seedDetail(h)
+	if sd == "" {
+		return
+	}
+	if h.VerifyDetail != "" {
+		sd += "\n" + h.VerifyDetail
+	}
+	h.VerifyDetail = sd
+	if h.VerifyOK != nil {
+		*h.VerifyOK = false
+	}
+}
+
+func (r *Runner) runProbes(ctx context.Context, c *contract.Contract, st *contract.State, h *Handle) {
 	if len(st.Verify) == 0 {
 		h.VerifyDetail = "no verify probes declared"
 		return
@@ -624,7 +740,7 @@ func (r *Runner) verify(ctx context.Context, c *contract.Contract, st *contract.
 		scheme = "http"
 	}
 	ok, results := probes.RunAll(ctx, st.Verify, probes.Target{
-		Host: host, Port: port, Scheme: scheme, Container: h.Container,
+		Host: host, Port: port, Scheme: scheme, Container: h.Container, PortMap: hostPortMap(h),
 		Exec: func(ctx context.Context, container, command string, timeout time.Duration) (int, string, error) {
 			return r.Engine.ContainerExec(ctx, container, command, timeout)
 		},
@@ -640,6 +756,19 @@ func (r *Runner) verify(ctx context.Context, c *contract.Contract, st *contract.
 	h.VerifyOK = &ok
 	h.Probes = results
 	h.VerifyDetail = probes.FormatResults(results)
+}
+
+// hostPortMap is container port -> host port for every published port in host
+// mode, or nil in other modes (where probes dial container ports directly).
+func hostPortMap(h *Handle) map[int]int {
+	if h.Exposure.Mode != ModeHost {
+		return nil
+	}
+	m := make(map[int]int, len(h.PublishedPorts))
+	for _, p := range h.PublishedPorts {
+		m[p.ContainerPort] = p.HostPort
+	}
+	return m
 }
 
 // -- fleet ---------------------------------------------------------------------

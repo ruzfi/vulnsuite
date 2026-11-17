@@ -328,15 +328,38 @@ func (e *Engine) ContainerExec(ctx context.Context, id, command string, timeout 
 	if err != nil {
 		return -1, "", err
 	}
-	var out strings.Builder
-	_, _ = stdcopy.StdCopy(&out, &out, io.LimitReader(att.Reader, 1<<20))
+	// The hijacked connection does not watch ctx once attached; close it when
+	// the timeout (or the caller) cancels so a hung command cannot block here.
+	stopClose := context.AfterFunc(ctx, att.Close)
+	defer stopClose()
+	out := &engine.CappedBuffer{Max: execOutputCap}
+	// Read to EOF (the stream ends when the process exits), keeping only the
+	// first execOutputCap bytes: stopping early would inspect a still-running
+	// exec and report its exit code as 0.
+	_, _ = stdcopy.StdCopy(out, out, att.Reader)
 	att.Close()
-	insp, err := e.cli.ExecInspect(ctx, created.ID, client.ExecInspectOptions{})
-	if err != nil {
-		return -1, out.String(), err
+	if err := ctx.Err(); err != nil {
+		return -1, out.String(), fmt.Errorf("exec timed out: %w", err)
 	}
-	return insp.ExitCode, out.String(), nil
+	for {
+		insp, err := e.cli.ExecInspect(ctx, created.ID, client.ExecInspectOptions{})
+		if err != nil {
+			return -1, out.String(), err
+		}
+		if !insp.Running {
+			return insp.ExitCode, out.String(), nil
+		}
+		// The stream can close a moment before the daemon records the exit.
+		select {
+		case <-ctx.Done():
+			return -1, out.String(), fmt.Errorf("exec timed out: %w", ctx.Err())
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
+
+// execOutputCap bounds how much exec output is kept.
+const execOutputCap = 1 << 20
 
 func (e *Engine) ContainerLogs(ctx context.Context, id string, tail int) (string, error) {
 	opts := client.ContainerLogsOptions{ShowStdout: true, ShowStderr: true}
