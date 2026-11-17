@@ -250,6 +250,10 @@ A filter selects every template that matches, variant-group members included —
 it does not collapse groups the way `-all` does — and `list <filter>` shows
 exactly the set that `run <filter>` / `build <filter>` will stand up. A
 template that fails to load fails the `run` or `build` rather than being skipped.
+Filter values are checked up front, on `list`, `run` and `build` alike: `-fidelity`
+must be `real` or `simulated`, `-year` a four-digit year and `-since` a
+`YYYY-MM-DD` date, so a typo is a usage error (exit 2) rather than a filter
+that silently matches nothing.
 
 A **`-f` file** lists one selector per line — an id, a group handle, a category, a
 `suite:<name>`, or a filter line (begins with `-`). Blank lines and `#` comments
@@ -266,6 +270,8 @@ suite:web-basics     # pull in a named suite
 A **suite** is a named selectors file (`<templates>/suites/<name>.txt`, same
 format) reached explicitly with `-t suite:<name>` or a `suite:` line in a file —
 never by a bare handle, so standing up a whole curated set is always deliberate.
+A mistake in a `-f` or suite file — a selector that matches nothing, a bad
+filter line — is reported as `file:line: ...`.
 A group handle inside a suite resolves to its primary, or to all members when you
 pass `-variants`. Overlapping selectors never start the same target twice.
 
