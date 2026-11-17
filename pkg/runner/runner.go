@@ -42,6 +42,58 @@ const DefaultNetwork = "vulnsuite-net"
 // LabelManaged marks containers vulnsuite started.
 const LabelManaged = "dev.vulnsuite.managed"
 
+// Labels stamped on the containers vulnsuite runs, next to builder.LabelID and
+// builder.LabelState (both set on targets and sidecars). The fleet commands
+// (ps, targets, stop) select containers by these, never by name prefix.
+const (
+	// LabelRole is RoleTarget or RoleSidecar.
+	LabelRole = "dev.vulnsuite.role"
+	// LabelNetwork names the network a target's scanner-facing address is on.
+	LabelNetwork = "dev.vulnsuite.network"
+	// LabelSidecarNetwork names the private network a target state shares with
+	// its sidecars (only set when the template has sidecars).
+	LabelSidecarNetwork = "dev.vulnsuite.sidecar_network"
+)
+
+// Container roles.
+const (
+	RoleTarget  = "target"
+	RoleSidecar = "sidecar"
+)
+
+// CleanupTimeout bounds the removal of containers and networks after a failed
+// or cancelled run. Cleanup runs on a fresh context, so an interrupt that
+// cancelled the run does not also leak what it had already started.
+var CleanupTimeout = 60 * time.Second
+
+// CleanupContext returns a context for tearing things down: not cancelled
+// with parent (it keeps parent's values only), bounded by CleanupTimeout.
+func CleanupContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(context.WithoutCancel(parent), CleanupTimeout)
+}
+
+// TargetAlias is the network alias of a target in one state, e.g.
+// "exposed-dotenv-file-vulnerable". It is unique per state, so with both
+// states of a template running each alias resolves to exactly one container.
+func TargetAlias(id, state string) string {
+	return strings.ReplaceAll(id, "/", "-") + "-" + state
+}
+
+// SidecarContainerName is the container name of a sidecar of one target state:
+// vulnsuite-<id>-<state>-<sidecar>. Each state has its own sidecars.
+func SidecarContainerName(id, state, sidecar string) string {
+	return contract.ContainerName(id, state) + "-" + sidecar
+}
+
+// SidecarNetworkName is the private network a target state shares with its
+// sidecars, where each sidecar resolves under its template name (e.g. "db").
+func SidecarNetworkName(id, state string) string {
+	return contract.ContainerName(id, state) + "-net"
+}
+
 // Exposure is how the target is reachable.
 type Exposure struct {
 	Mode     string `json:"mode"`
@@ -67,17 +119,20 @@ func DefaultExposure() Exposure {
 
 // Handle describes a running target.
 type Handle struct {
-	ID           string            `json:"id"`
-	State        string            `json:"state"`
-	Container    string            `json:"container"`
-	Image        *builder.Resolved `json:"image"`
-	Exposure     Exposure          `json:"exposure"`
-	Sidecars     []string          `json:"sidecars,omitempty"`
-	EndpointHost string            `json:"endpoint_host"` // alias, 127.0.0.1, or macvlan ip
-	EndpointPort int               `json:"endpoint_port"`
-	IP           string            `json:"ip,omitempty"` // container ip (internal/macvlan)
-	Scheme       string            `json:"scheme"`       // http | https | "" (raw tcp)
-	Ready        bool              `json:"ready"`
+	ID        string            `json:"id"`
+	State     string            `json:"state"`
+	Container string            `json:"container"`
+	Image     *builder.Resolved `json:"image"`
+	Exposure  Exposure          `json:"exposure"`
+	Sidecars  []string          `json:"sidecars,omitempty"`
+	// SidecarNetwork is the private network the target shares with its
+	// sidecars ("" when the template has none).
+	SidecarNetwork string `json:"sidecar_network,omitempty"`
+	EndpointHost   string `json:"endpoint_host"` // per-state alias, 127.0.0.1, or macvlan ip
+	EndpointPort   int    `json:"endpoint_port"`
+	IP             string `json:"ip,omitempty"` // container ip (internal/macvlan)
+	Scheme         string `json:"scheme"`       // http | https | "" (raw tcp)
+	Ready          bool   `json:"ready"`
 	// DaemonRemote is set when the engine talks to a daemon on another machine;
 	// then a host-published port on the daemon's loopback cannot be reached from
 	// here, which changes how readiness and verification are reported.
@@ -307,10 +362,21 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 	}
 	name := c.ContainerName(state)
 	port := c.Service.PrimaryPort()
+	alias := TargetAlias(c.ID(), state)
+	scNet := ""
+	if len(c.Service.Sidecars) > 0 {
+		scNet = SidecarNetworkName(c.ID(), state)
+	}
 
-	// Replace any stale container of the same name.
+	// Replace a stale container of the same name, and this state's sidecars.
+	// The other state's containers are left alone: they have their own names.
 	if err := r.Engine.ContainerRemove(ctx, name); err != nil {
 		return nil, err
+	}
+	for _, sc := range c.Service.Sidecars {
+		if err := r.Engine.ContainerRemove(ctx, SidecarContainerName(c.ID(), state, sc.Name)); err != nil {
+			return nil, err
+		}
 	}
 
 	spec := engine.ContainerSpec{
@@ -319,6 +385,7 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 		User:  c.Service.User,
 		Labels: map[string]string{
 			LabelManaged:       "true",
+			LabelRole:          RoleTarget,
 			builder.LabelID:    c.ID(),
 			builder.LabelState: state,
 		},
@@ -332,6 +399,9 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 		CapAdd:      c.Service.CapAdd,
 		CapDrop:     c.Service.CapDrop,
 	}
+	if scNet != "" {
+		spec.Labels[LabelSidecarNetwork] = scNet
+	}
 	for _, d := range c.Service.Devices {
 		spec.Devices = append(spec.Devices, engine.Device{PathOnHost: d, PathInContainer: d})
 	}
@@ -343,16 +413,28 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 		spec.Cmd = c.Service.Command
 	}
 
-	h := &Handle{ID: c.ID(), State: state, Container: name, Image: img, Exposure: exp,
+	h := &Handle{ID: c.ID(), State: state, Container: name, Image: img, Exposure: exp, SidecarNetwork: scNet,
 		EndpointPort: port.Container, Scheme: port.Scheme(), DaemonRemote: engineRemote(r.Engine)}
 
+	// The sidecar network. The target joins it next to its exposure network
+	// (internal, macvlan) or, in host mode, publishes its ports from it: either
+	// way it resolves its sidecars by name, which the default bridge cannot do.
+	// - internal: egress follows -no-egress, like the exposure network.
+	// - host: a plain bridge (ports cannot be published from an internal one).
+	// - macvlan: internal, so it adds no default route and the target's
+	//   traffic keeps leaving through its LAN address.
+	scSpec := engine.NetworkSpec{Name: scNet}
+	// primaryNet is the network the scanner-facing address is on.
+	primaryNet := ""
 	switch exp.Mode {
 	case ModeInternal:
 		if _, err := r.Engine.NetworkEnsure(ctx, engine.NetworkSpec{Name: exp.Network, Internal: exp.Internal}); err != nil {
 			return nil, fmt.Errorf("network %s: %w", exp.Network, err)
 		}
-		spec.Network = &engine.NetworkAttachment{Name: exp.Network, Aliases: []string{c.ID()}}
-		h.EndpointHost = c.ID()
+		primaryNet = exp.Network
+		spec.Network = &engine.NetworkAttachment{Name: exp.Network, Aliases: []string{alias}}
+		h.EndpointHost = alias
+		scSpec.Internal = exp.Internal
 		for _, pp := range c.Service.HostPublishPorts() {
 			h.PublishedPorts = append(h.PublishedPorts, PublishedPort{ContainerPort: pp.Container, Scheme: pp.Scheme()})
 		}
@@ -373,6 +455,10 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 				}
 			}
 		}
+		primaryNet = "bridge"
+		if scNet != "" {
+			primaryNet = scNet
+		}
 	case ModeMacvlan:
 		if exp.Parent == "" {
 			return nil, errors.New("macvlan exposure needs --parent <host interface>")
@@ -384,7 +470,9 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 		}); err != nil {
 			return nil, fmt.Errorf("macvlan network: %w", err)
 		}
+		primaryNet = netName
 		spec.Network = &engine.NetworkAttachment{Name: netName, IPv4: exp.IP}
+		scSpec.Internal = true
 		h.EndpointHost = exp.IP
 		if h.EndpointHost == "" {
 			h.EndpointHost = "<macvlan-ip>"
@@ -395,33 +483,58 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 	default:
 		return nil, fmt.Errorf("unknown exposure mode %q", exp.Mode)
 	}
+	spec.Labels[LabelNetwork] = primaryNet
 
-	sidecars, err := r.startSidecars(ctx, c, st, exp)
-	if err != nil {
+	// From here on anything created is torn down again on failure, on a fresh
+	// context so a cancelled run does not leak it.
+	fail := func(err error) (*Handle, error) {
+		cctx, cancel := CleanupContext(ctx)
+		defer cancel()
+		if cerr := r.cleanup(cctx, name, h.Sidecars, scNet); cerr != nil {
+			err = fmt.Errorf("%w (cleanup: %v)", err, cerr)
+		}
 		return nil, err
 	}
+	// The sidecar network: target state and its sidecars only. Any stale copy
+	// (its containers were removed above) is replaced so its settings match
+	// this run's exposure.
+	var targetExtraNet *engine.NetworkAttachment
+	if scNet != "" {
+		_ = r.Engine.NetworkRemove(ctx, scNet)
+		if _, err := r.Engine.NetworkEnsure(ctx, scSpec); err != nil {
+			return fail(fmt.Errorf("network %s: %w", scNet, err))
+		}
+		att := engine.NetworkAttachment{Name: scNet, Aliases: []string{c.ID(), alias}}
+		if spec.Network == nil {
+			spec.Network = &att // host mode: the target's only network
+		} else {
+			targetExtraNet = &att
+		}
+	}
+
+	sidecars, err := r.startSidecars(ctx, c, st, state, scNet)
 	h.Sidecars = sidecars
+	if err != nil {
+		return fail(err)
+	}
 
 	id, err := r.Engine.ContainerCreate(ctx, spec)
 	if err != nil {
-		r.cleanup(ctx, name, sidecars)
-		return nil, fmt.Errorf("create %s: %w", name, err)
+		return fail(fmt.Errorf("create %s: %w", name, err))
+	}
+	if targetExtraNet != nil {
+		if err := r.Engine.NetworkConnect(ctx, targetExtraNet.Name, id, targetExtraNet.Aliases); err != nil {
+			return fail(fmt.Errorf("connect %s to %s: %w", name, targetExtraNet.Name, err))
+		}
 	}
 	if err := r.Engine.ContainerStart(ctx, id); err != nil {
-		r.cleanup(ctx, name, sidecars)
-		return nil, fmt.Errorf("start %s: %w", name, err)
+		return fail(fmt.Errorf("start %s: %w", name, err))
 	}
 
-	// Discover the address a probe from this host can use.
+	// Discover the address a probe from this host can use: the one on the
+	// exposure network, never the private sidecar network.
 	if det, err := r.Engine.ContainerInspect(ctx, name); err == nil {
-		if ip, ok := det.IPs[exp.Network]; ok {
-			h.IP = ip
-		} else {
-			for _, ip := range det.IPs {
-				h.IP = ip
-				break
-			}
-		}
+		h.IP = pickIP(det.IPs, primaryNet, scNet)
 		if exp.Mode == ModeMacvlan && exp.IP == "" && h.IP != "" {
 			h.EndpointHost = h.IP
 		}
@@ -433,6 +546,25 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 		r.verify(ctx, c, st, h)
 	}
 	return h, nil
+}
+
+// pickIP returns the address on network prefer, else on any network other
+// than exclude (deterministically: by network name), else "".
+func pickIP(ips map[string]string, prefer, exclude string) string {
+	if ip, ok := ips[prefer]; ok && prefer != "" {
+		return ip
+	}
+	names := make([]string, 0, len(ips))
+	for n := range ips {
+		if n != exclude || exclude == "" {
+			names = append(names, n)
+		}
+	}
+	sort.Strings(names)
+	if len(names) == 0 {
+		return ""
+	}
+	return ips[names[0]]
 }
 
 // seed runs the state's seed steps once the target is ready, recording each
@@ -491,23 +623,42 @@ func tail(s string, n int) string {
 	return s
 }
 
-// Stop tears a handle down.
-func (r *Runner) Stop(ctx context.Context, h *Handle) {
-	r.cleanup(ctx, h.Container, h.Sidecars)
+// Stop tears a handle down: the target, its sidecars and their network. Every
+// removal is attempted; the errors of those that failed are returned joined.
+// Pass a context that is still live (see CleanupContext) when tearing down
+// after an interrupt.
+func (r *Runner) Stop(ctx context.Context, h *Handle) error {
+	return r.cleanup(ctx, h.Container, h.Sidecars, h.SidecarNetwork)
 }
 
-func (r *Runner) cleanup(ctx context.Context, container string, sidecars []string) {
-	_ = r.Engine.ContainerRemove(ctx, container)
-	for _, s := range sidecars {
-		_ = r.Engine.ContainerRemove(ctx, s)
+func (r *Runner) cleanup(ctx context.Context, container string, sidecars []string, network string) error {
+	var errs []error
+	if container != "" {
+		if err := r.Engine.ContainerRemove(ctx, container); err != nil {
+			errs = append(errs, fmt.Errorf("remove %s: %w", container, err))
+		}
 	}
+	for _, s := range sidecars {
+		if err := r.Engine.ContainerRemove(ctx, s); err != nil {
+			errs = append(errs, fmt.Errorf("remove sidecar %s: %w", s, err))
+		}
+	}
+	if network != "" && len(errs) == 0 { // a network with containers left on it cannot go
+		if err := r.Engine.NetworkRemove(ctx, network); err != nil {
+			errs = append(errs, fmt.Errorf("remove network %s: %w", network, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
-func (r *Runner) startSidecars(ctx context.Context, c *contract.Contract, st *contract.State, exp Exposure) ([]string, error) {
+// startSidecars starts the state's sidecars on the private network scNet,
+// each resolvable there under its template name. It returns the name of every
+// container it created, including one whose start then failed, so the caller
+// can remove them all.
+func (r *Runner) startSidecars(ctx context.Context, c *contract.Contract, st *contract.State, state, scNet string) ([]string, error) {
 	var names []string
 	for _, sc := range c.Service.Sidecars {
-		name := contract.ContainerNamePrefix + strings.ReplaceAll(c.ID(), "/", "-") + "-" + sc.Name
-		_ = r.Engine.ContainerRemove(ctx, name)
+		name := SidecarContainerName(c.ID(), state, sc.Name)
 		ref := st.SidecarRef(sc)
 		if exists, _ := r.Engine.ImageExists(ctx, ref); !exists {
 			if err := r.Engine.ImagePull(ctx, ref, nil); err != nil {
@@ -515,18 +666,23 @@ func (r *Runner) startSidecars(ctx context.Context, c *contract.Contract, st *co
 			}
 		}
 		spec := engine.ContainerSpec{Name: name, Image: ref, Cmd: sc.Command, Env: mergeEnv(nil, sc.Environment),
-			Labels: map[string]string{LabelManaged: "true", builder.LabelID: c.ID()}}
-		if exp.Mode == ModeInternal {
-			spec.Network = &engine.NetworkAttachment{Name: exp.Network, Aliases: []string{sc.Name}}
+			Labels: map[string]string{
+				LabelManaged:        "true",
+				LabelRole:           RoleSidecar,
+				builder.LabelID:     c.ID(),
+				builder.LabelState:  state,
+				LabelSidecarNetwork: scNet,
+			},
+			Network: &engine.NetworkAttachment{Name: scNet, Aliases: []string{sc.Name}},
 		}
 		id, err := r.Engine.ContainerCreate(ctx, spec)
 		if err != nil {
 			return names, fmt.Errorf("sidecar %s: %w", sc.Name, err)
 		}
+		names = append(names, name)
 		if err := r.Engine.ContainerStart(ctx, id); err != nil {
 			return names, fmt.Errorf("sidecar %s: %w", sc.Name, err)
 		}
-		names = append(names, name)
 	}
 	return names, nil
 }
@@ -789,7 +945,35 @@ type Target struct {
 	Ports []PublishedPort `json:"ports,omitempty"`
 }
 
-// Running lists running vulnsuite targets (not sidecars).
+// fleetMember classifies a listed container: whether vulnsuite manages it,
+// whether it is a target (not a sidecar), and its template id and state.
+// Containers from before the role/state labels fall back to the name.
+func fleetMember(row engine.ContainerInfo) (managed, target bool, id, state string) {
+	if row.Labels[LabelManaged] != "true" {
+		return false, false, "", ""
+	}
+	id, state = row.Labels[builder.LabelID], row.Labels[builder.LabelState]
+	switch row.Labels[LabelRole] {
+	case RoleSidecar:
+		return true, false, id, state
+	case RoleTarget:
+		if id != "" && state != "" {
+			return true, true, id, state
+		}
+	}
+	nid, nstate, ok := contract.ParseContainerName(row.Name)
+	if !ok {
+		return true, false, id, state // e.g. a legacy sidecar, vulnsuite-<id>-<sidecar>
+	}
+	if id == "" {
+		id = nid
+	}
+	return true, true, id, nstate
+}
+
+// Running lists running vulnsuite targets (not sidecars). A target's IP is its
+// address on the network its scanner-facing address lives on (its label), else
+// on network, never on its private sidecar network.
 func (r *Runner) Running(ctx context.Context, network string) ([]Target, error) {
 	if network == "" {
 		network = DefaultNetwork
@@ -800,20 +984,17 @@ func (r *Runner) Running(ctx context.Context, network string) ([]Target, error) 
 	}
 	var out []Target
 	for _, row := range rows {
-		id, state, ok := contract.ParseContainerName(row.Name)
-		if !ok {
+		managed, target, id, state := fleetMember(row)
+		if !managed || !target {
 			continue
 		}
 		t := Target{ID: id, State: state, Container: row.Name, Status: row.Status, Image: row.Image}
 		if det, err := r.Engine.ContainerInspect(ctx, row.Name); err == nil {
-			if ip, ok := det.IPs[network]; ok {
-				t.IP = ip
-			} else {
-				for _, ip := range det.IPs {
-					t.IP = ip
-					break
-				}
+			prefer := row.Labels[LabelNetwork]
+			if _, ok := det.IPs[prefer]; !ok || prefer == "" {
+				prefer = network
 			}
+			t.IP = pickIP(det.IPs, prefer, row.Labels[LabelSidecarNetwork])
 			for portProto, b := range det.Ports {
 				t.Ports = append(t.Ports, PublishedPort{ContainerPort: containerPortOf(portProto), HostIP: b.IP, HostPort: b.Port})
 			}
@@ -828,26 +1009,47 @@ func (r *Runner) Running(ctx context.Context, network string) ([]Target, error) 
 	return out, nil
 }
 
-// StopAll removes every vulnsuite container (optionally only one template's).
-// It returns the names removed.
+// StopAll removes every container vulnsuite manages (targets and sidecars, in
+// every state), or only those of one template, matched exactly on the
+// dev.vulnsuite.id label (so stopping "foo" leaves "foo-bar" alone), then the
+// private sidecar networks they used. Every removal is attempted; it returns
+// the container names removed and the failures joined.
 func (r *Runner) StopAll(ctx context.Context, templateID string) ([]string, error) {
-	prefix := contract.ContainerNamePrefix
-	if templateID != "" {
-		prefix += strings.ReplaceAll(templateID, "/", "-") + "-"
-	}
-	rows, err := r.Engine.ContainerList(ctx, true, prefix)
+	rows, err := r.Engine.ContainerList(ctx, true, contract.ContainerNamePrefix)
 	if err != nil {
 		return nil, err
 	}
 	var names []string
+	var errs []error
+	nets := map[string]bool{}
 	for _, row := range rows {
+		managed, _, id, _ := fleetMember(row)
+		if !managed || (templateID != "" && id != templateID) {
+			continue
+		}
+		if n := row.Labels[LabelSidecarNetwork]; n != "" {
+			nets[n] = true
+		}
 		if err := r.Engine.ContainerRemove(ctx, row.Name); err != nil {
-			return names, err
+			errs = append(errs, fmt.Errorf("remove %s: %w", row.Name, err))
+			continue
 		}
 		names = append(names, row.Name)
 	}
+	if len(errs) == 0 {
+		netNames := make([]string, 0, len(nets))
+		for n := range nets {
+			netNames = append(netNames, n)
+		}
+		sort.Strings(netNames)
+		for _, n := range netNames {
+			if err := r.Engine.NetworkRemove(ctx, n); err != nil {
+				errs = append(errs, fmt.Errorf("remove network %s: %w", n, err))
+			}
+		}
+	}
 	sort.Strings(names)
-	return names, nil
+	return names, errors.Join(errs...)
 }
 
 // PruneNetwork removes the internal network.

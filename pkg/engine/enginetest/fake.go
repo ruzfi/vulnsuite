@@ -31,6 +31,8 @@ type Container struct {
 	Spec    engine.ContainerSpec
 	Running bool
 	IP      string
+	// Networks are further networks attached with NetworkConnect.
+	Networks []engine.NetworkAttachment
 }
 
 // Fake is an in-memory engine.
@@ -51,6 +53,11 @@ type Fake struct {
 	// StartFn runs when a container starts (receives its spec), e.g. to stand
 	// up a listener on a published host port. An error fails the start.
 	StartFn func(spec engine.ContainerSpec) error
+	// RemoveFn runs before a container is removed (receives its name); an error
+	// fails the removal and leaves the container in place.
+	RemoveFn func(name string) error
+	// ListErr makes ContainerList fail when set.
+	ListErr error
 	// FailBuild makes every build fail with this message when set.
 	FailBuild string
 	// FailPull makes pulls fail.
@@ -167,7 +174,10 @@ func (f *Fake) ImageList(_ context.Context, prefix string) ([]string, error) {
 	return out, nil
 }
 
-func (f *Fake) ContainerCreate(_ context.Context, spec engine.ContainerSpec) (string, error) {
+func (f *Fake) ContainerCreate(ctx context.Context, spec engine.ContainerSpec) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if !f.Images[spec.Image] {
@@ -195,7 +205,10 @@ func (f *Fake) byIDOrName(id string) *Container {
 	return nil
 }
 
-func (f *Fake) ContainerStart(_ context.Context, id string) error {
+func (f *Fake) ContainerStart(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	c := f.byIDOrName(id)
 	if c == nil {
@@ -211,7 +224,19 @@ func (f *Fake) ContainerStart(_ context.Context, id string) error {
 	return nil
 }
 
-func (f *Fake) ContainerRemove(_ context.Context, id string) error {
+func (f *Fake) ContainerRemove(ctx context.Context, id string) error {
+	// Like the real engines, a cancelled context fails the removal.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	fn := f.RemoveFn
+	f.mu.Unlock()
+	if fn != nil {
+		if err := fn(id); err != nil {
+			return err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	c := f.byIDOrName(id)
@@ -221,9 +246,15 @@ func (f *Fake) ContainerRemove(_ context.Context, id string) error {
 	return nil
 }
 
-func (f *Fake) ContainerList(_ context.Context, all bool, prefix string) ([]engine.ContainerInfo, error) {
+func (f *Fake) ContainerList(ctx context.Context, all bool, prefix string) ([]engine.ContainerInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.ListErr != nil {
+		return nil, f.ListErr
+	}
 	var out []engine.ContainerInfo
 	for name, c := range f.Containers {
 		if !strings.HasPrefix(name, prefix) || (!all && !c.Running) {
@@ -249,6 +280,9 @@ func (f *Fake) ContainerInspect(_ context.Context, id string) (*engine.Container
 	d := &engine.ContainerDetail{ID: c.ID, Name: c.Spec.Name, Image: c.Spec.Image, Running: c.Running, IPs: map[string]string{}, Ports: map[string]engine.HostBinding{}}
 	if c.Spec.Network != nil {
 		d.IPs[c.Spec.Network.Name] = c.IP
+	}
+	for i, n := range c.Networks {
+		d.IPs[n.Name] = fmt.Sprintf("10.99.%d.%d", i, f.nextIP)
 	}
 	for _, p := range c.Spec.Ports {
 		d.Ports[fmt.Sprintf("%d/tcp", p.ContainerPort)] = engine.HostBinding{IP: p.HostIP, Port: p.HostPort}
@@ -282,7 +316,10 @@ func (f *Fake) ContainerLogs(_ context.Context, id string, _ int) (string, error
 }
 func (f *Fake) ContainerWait(context.Context, string) (int, error) { return 0, nil }
 
-func (f *Fake) NetworkEnsure(_ context.Context, spec engine.NetworkSpec) (string, error) {
+func (f *Fake) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.Networks[spec.Name] = spec
@@ -296,11 +333,102 @@ func (f *Fake) NetworkExists(_ context.Context, name string) (bool, error) {
 	return ok, nil
 }
 
-func (f *Fake) NetworkRemove(_ context.Context, name string) error {
+func (f *Fake) NetworkRemove(ctx context.Context, name string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	for cname, c := range f.Containers {
+		if attachedTo(c, name) {
+			return fmt.Errorf("network %s has active endpoints (%s)", name, cname)
+		}
+	}
 	delete(f.Networks, name)
 	return nil
+}
+
+// NetworkConnect attaches a container to a further network.
+func (f *Fake) NetworkConnect(ctx context.Context, network, container string, aliases []string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.Networks[network]; !ok {
+		return fmt.Errorf("no such network %s", network)
+	}
+	c := f.byIDOrName(container)
+	if c == nil {
+		return fmt.Errorf("no such container %s", container)
+	}
+	if attachedTo(c, network) {
+		return fmt.Errorf("container %s is already attached to %s", container, network)
+	}
+	c.Networks = append(c.Networks, engine.NetworkAttachment{Name: network, Aliases: aliases})
+	return nil
+}
+
+func attachedTo(c *Container, network string) bool {
+	if c.Spec.Network != nil && c.Spec.Network.Name == network {
+		return true
+	}
+	for _, n := range c.Networks {
+		if n.Name == network {
+			return true
+		}
+	}
+	return false
+}
+
+// Resolve answers a name lookup made from inside the container named from:
+// the containers sharing one of its user-defined networks under that name (an
+// alias or a container name), sorted. It models Docker's embedded DNS, which
+// does not exist on the default bridge.
+func (f *Fake) Resolve(from, name string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	src := f.byIDOrName(from)
+	if src == nil {
+		return nil
+	}
+	nets := map[string]bool{}
+	for _, n := range attachments(src) {
+		if n.Name != "" && n.Name != "bridge" {
+			nets[n.Name] = true
+		}
+	}
+	var out []string
+	for cname, c := range f.Containers {
+		for _, n := range attachments(c) {
+			if !nets[n.Name] {
+				continue
+			}
+			if cname == name || has(n.Aliases, name) {
+				out = append(out, cname)
+				break
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func attachments(c *Container) []engine.NetworkAttachment {
+	var out []engine.NetworkAttachment
+	if c.Spec.Network != nil {
+		out = append(out, *c.Spec.Network)
+	}
+	return append(out, c.Networks...)
+}
+
+func has(list []string, v string) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 var _ engine.Engine = (*Fake)(nil)

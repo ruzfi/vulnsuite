@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -159,13 +160,52 @@ Exposure modes:
 				return err
 			}
 			r := runner.New(eng)
+			host, herr := eng.Info(ctx)
+			if herr != nil {
+				return herr
+			}
+
+			// Drop what will not run here (requires, host access) before the
+			// concurrency cap, so a skipped target never takes a slot.
+			var skippedReq, skippedHost []string
+			platformFor := map[*contract.Contract]string{}
+			eligible := runnable[:0:0]
+			for _, c := range runnable {
+				if !c.Requires.Empty() {
+					d := runner.Preflight(c.Requires, host)
+					switch {
+					case d.Skip() && !ignoreRequires:
+						g.printf("skip %s: %s\n", c.ID(), d.Reason)
+						skippedReq = append(skippedReq, c.ID())
+						continue
+					case d.Skip() && ignoreRequires:
+						g.printf("%s does not meet requires (%s) -- running anyway (-ignore-requires)\n", c.ID(), d.Reason)
+					case d.Action == runner.ActionEmulated:
+						g.printf("%s: %s\n", c.ID(), d.Reason)
+						platformFor[c] = d.Platform
+					}
+				}
+				if !allowHostAccess {
+					if reason := runner.HostAccessReason(c); reason != "" {
+						g.printf("skip %s: needs host access (%s) -- re-run with -allow-host-access to include it\n", c.ID(), reason)
+						skippedHost = append(skippedHost, c.ID())
+						continue
+					}
+				}
+				eligible = append(eligible, c)
+			}
+			runnable = eligible
+			multi = len(runnable) > 1
 
 			// Concurrency cap: containers this batch replaces (same name) are not net new.
 			batch := map[string]bool{}
 			for _, c := range runnable {
 				batch[c.ContainerName(state)] = true
 			}
-			already, _ := r.Running(ctx, exp.Network)
+			already, err := r.Running(ctx, exp.Network)
+			if err != nil {
+				return fmt.Errorf("count running targets for -max-concurrent: %w", err)
+			}
 			netNew := 0
 			for _, t := range already {
 				if !batch[t.Container] {
@@ -198,57 +238,46 @@ Exposure modes:
 			if !g.JSON && !g.Quiet {
 				opts.Build.Output = g.Stdout
 			}
-			host, herr := eng.Info(ctx)
-			if herr != nil {
-				return herr
-			}
 			var idx *scanners.Index
 			if dir := scanners.ResolveDir(nucleiDir); dir != "" {
 				idx, _ = scanners.Load(dir)
 			}
 			var handles []*runner.Handle
-			var failures, skippedReq, skippedHost []string
+			var failures []string
 			// unhealthy: targets that came up but must not be handed out as-is
 			// (not ready, a seed failed, or verify failed). They fail the run.
 			var unhealthy []string
+			cancelled := false
 			for _, c := range runnable {
+				if ctx.Err() != nil {
+					cancelled = true
+					break
+				}
 				if multi {
 					g.printf("\n=== [%s] %s ===\n", c.ID(), state)
 				} else {
 					g.printf("[%s] %s: %s\n", c.ID(), state, c.Metadata.Summary)
 				}
 				tgtOpts := opts
-				if !c.Requires.Empty() {
-					d := runner.Preflight(c.Requires, host)
-					switch {
-					case d.Skip() && !ignoreRequires:
-						g.printf("  skip %s: %s\n", c.ID(), d.Reason)
-						skippedReq = append(skippedReq, c.ID())
-						continue
-					case d.Skip() && ignoreRequires:
-						g.printf("  %s does not meet requires (%s) -- running anyway (-ignore-requires)\n", c.ID(), d.Reason)
-					case d.Action == runner.ActionEmulated:
-						g.printf("  %s: %s\n", c.ID(), d.Reason)
-						if tgtOpts.Build.Platform == "" {
-							tgtOpts.Build.Platform = d.Platform
-						}
-					}
-				}
-				if !allowHostAccess {
-					if reason := runner.HostAccessReason(c); reason != "" {
-						g.printf("  skip %s: needs host access (%s) -- re-run with -allow-host-access to include it\n", c.ID(), reason)
-						skippedHost = append(skippedHost, c.ID())
-						continue
-					}
+				if p := platformFor[c]; p != "" && tgtOpts.Build.Platform == "" {
+					tgtOpts.Build.Platform = p
 				}
 				g.printf("resolving image (%s)...\n", c.BuildKind(state))
 				h, err := r.Run(ctx, c, state, exp, tgtOpts)
 				if err != nil {
+					if ctx.Err() != nil {
+						cancelled = true
+						break
+					}
 					g.errorf("  could not run %s: %v\n", c.ID(), err)
 					failures = append(failures, c.ID())
 					continue
 				}
 				handles = append(handles, h)
+				if ctx.Err() != nil {
+					cancelled = true
+					break
+				}
 				verb := "reused"
 				switch {
 				case h.Image.Built:
@@ -276,6 +305,15 @@ Exposure modes:
 				for _, line := range scanners.Match(c, idx).Lines(c) {
 					g.printf("  %s\n", line)
 				}
+			}
+			if cancelled {
+				// Interrupted: this batch never got handed out, so tear down what
+				// it started rather than leave half a batch behind.
+				g.errorf("\ninterrupted: tearing down %d started target(s)...\n", len(handles))
+				if err := teardown(ctx, g, r, handles); err != nil {
+					return err
+				}
+				return errInterrupted
 			}
 			if len(handles) == 0 {
 				if len(skippedHost) > 0 {
@@ -368,14 +406,35 @@ Exposure modes:
 			g.printf("\nHolding. Ctrl-C to tear down this batch.\n")
 			sigCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 			<-sigCtx.Done()
+			// Release the handler at once: a second Ctrl-C during teardown then
+			// terminates the process (main releases its own on the first).
 			stop()
 			g.printf("\ntearing down...\n")
-			for _, h := range handles {
-				r.Stop(context.Background(), h)
-			}
-			return runErr()
+			return errors.Join(runErr(), teardown(ctx, g, r, handles))
 		},
 	}
+}
+
+// errInterrupted reports a run cut short by Ctrl-C / SIGTERM.
+var errInterrupted = errors.New("interrupted")
+
+// teardown removes the handles' containers on a fresh context bounded by
+// runner.CleanupTimeout (the run's own context is usually cancelled by now),
+// reporting every removal that failed.
+func teardown(ctx context.Context, g *Global, r *runner.Runner, handles []*runner.Handle) error {
+	cctx, cancel := runner.CleanupContext(ctx)
+	defer cancel()
+	var failed []string
+	for _, h := range handles {
+		if err := r.Stop(cctx, h); err != nil {
+			g.errorf("  could not tear down %s [%s]: %v\n", h.ID, h.State, err)
+			failed = append(failed, h.Container)
+		}
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("teardown: %d target(s) not fully removed (%s); remove them with:  vulnsuite stop", len(failed), strings.Join(failed, ", "))
+	}
+	return nil
 }
 
 // reportableHostIP turns a binding's host IP into one a scanner can dial.
@@ -454,15 +513,19 @@ func cmdStop() *Command {
 				ids = []string{""}
 			}
 			var removed []string
+			var stopErrs []error
 			for _, id := range ids {
 				names, err := r.StopAll(ctx, id)
 				removed = append(removed, names...)
 				if err != nil {
-					return err
+					stopErrs = append(stopErrs, err)
 				}
 			}
 			if g.JSON {
-				return g.emitJSON(map[string]any{"removed": removed})
+				if err := g.emitJSON(map[string]any{"removed": removed}); err != nil {
+					return err
+				}
+				return errors.Join(stopErrs...)
 			}
 			if len(removed) == 0 {
 				g.printf("nothing to stop\n")
@@ -479,7 +542,7 @@ func cmdStop() *Command {
 					g.errorf("could not remove network %s: %v\n", network, err)
 				}
 			}
-			return nil
+			return errors.Join(stopErrs...)
 		},
 	}
 }
@@ -601,7 +664,7 @@ the subnet. Non-HTTP targets come out as host:port for network templates.`,
 				for _, pp := range published {
 					host := r.IP
 					if by == "alias" {
-						host = r.ID
+						host = runner.TargetAlias(r.ID, r.State)
 					}
 					if host == "" {
 						continue

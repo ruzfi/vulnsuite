@@ -42,7 +42,7 @@ directories once.
 
 | Field | Required | Notes |
 | --- | --- | --- |
-| `id` | yes | `^[a-z0-9]+([.-][a-z0-9]+)*$`, 3-80 characters (a valid Docker repository name: no leading, trailing or doubled `.`/`-`); unique; `<product>-<version>-<cve>` by convention. Also the container's network alias. |
+| `id` | yes | `^[a-z0-9]+([.-][a-z0-9]+)*$`, 3-80 characters (a valid Docker repository name: no leading, trailing or doubled `.`/`-`); unique; `<product>-<version>-<cve>` by convention. The running container's network alias is `<id>-<state>` (one per state). |
 | `summary` | yes | one line: what and how |
 | `vuln_refs` | | `CVE-YYYY-NNNN`, `GHSA-...`, or `PREFIX-ID` for flaws without a CVE (community templates use `VS-...`) |
 | `cwe` | | `CWE-NN` |
@@ -86,7 +86,7 @@ base: { kind: build, context: src, dockerfile: Dockerfile, build_args: {} }
 | `command` | string or list; overrides the image command |
 | `environment` | map; merged with the state's environment (state wins) |
 | `healthcheck` | `{ http: { path, status }, timeout: 60s }` or `{ tcp: { port }, timeout }`; `timeout` is `<n>s|m|h` |
-| `sidecars` | helper containers `{ name, image, digest, command, environment }` (names unique) started on the same network, reachable by `name` (`command` sets the container command, e.g. a `server ...` arg list for a clustered node) |
+| `sidecars` | helper containers `{ name, image, digest, command, environment }` (names unique) started with each target state on a private network shared only with that state's target, reachable there by `name` in every exposure mode; each state gets its own sidecars (`command` sets the container command, e.g. a `server ...` arg list for a clustered node) |
 | `user` | run-as `uid` or `uid:gid` |
 | `cap_add` / `cap_drop` | Linux capabilities, e.g. `cap_drop: [ALL]` then `cap_add: [CAP_NET_BIND_SERVICE]` |
 | `devices` | host devices to pass through, e.g. `/dev/kvm` |

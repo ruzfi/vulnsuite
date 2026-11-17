@@ -69,4 +69,13 @@ func (c *Client) NetworkRemove(ctx context.Context, name string) error {
 	return err
 }
 
+// NetworkConnect attaches a container to a further network under aliases.
+func (c *Client) NetworkConnect(ctx context.Context, network, container string, aliases []string) error {
+	body := map[string]any{"Container": container}
+	if len(aliases) > 0 {
+		body["EndpointConfig"] = map[string]any{"Aliases": aliases}
+	}
+	return c.doJSON(ctx, http.MethodPost, "/networks/"+url.PathEscape(network)+"/connect", nil, body, nil)
+}
+
 var _ engine.Engine = (*Client)(nil)
