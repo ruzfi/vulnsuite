@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"strings"
 	"text/tabwriter"
 
@@ -384,23 +385,41 @@ func cmdValidate() *Command {
 
 func cmdUpdateTemplates() *Command {
 	var repo, ref string
+	var force bool
 	return &Command{
 		Name: "update-templates", Aliases: []string{"ut"},
 		Short: "download or update the community templates (~/vulnsuite-templates)",
-		Usage: "[-repo OWNER/NAME] [-ref BRANCH|TAG]",
-		Long: `Fetches ` + templates.DefaultRepo + ` into the templates directory. A git
-checkout is pulled (fast-forward only); anything else is replaced by the GitHub
-archive of the branch or tag.`,
+		Usage: "[-repo OWNER/NAME] [-ref BRANCH|TAG|COMMIT] [-force]",
+		Long: `Fetches ` + templates.DefaultRepo + ` into the templates directory
+(-templates, $VULNSUITE_TEMPLATES, the templates repo you are in, or
+~/vulnsuite-templates).
+
+A git checkout is pulled (fast-forward only); with -ref, the ref is fetched
+from origin and checked out detached (refused while tracked files have
+uncommitted changes). A checkout is never replaced: if git is not on PATH the
+update fails.
+
+Anything else is replaced by the GitHub archive of -ref (default ` + templates.DefaultBranch + `), but
+only when the directory is missing, empty, or was installed by
+update-templates before; pass -force to replace any other directory.`,
 		Flags: func(fs *flag.FlagSet) {
-			fs.StringVar(&repo, "repo", templates.DefaultRepo, "GitHub repository")
-			fs.StringVar(&ref, "ref", templates.DefaultBranch, "branch or tag")
+			fs.StringVar(&repo, "repo", "", "GitHub repository for archive installs (default "+templates.DefaultRepo+")")
+			fs.StringVar(&ref, "ref", "", "branch, tag or commit (default: pull a checkout's branch, or "+templates.DefaultBranch+")")
+			fs.BoolVar(&force, "force", false, "replace a non-empty directory update-templates did not install")
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
-			dir := g.TemplatesDir
-			if dir == "" {
-				dir = templates.DefaultDir()
+			dir, err := templates.Resolve(g.TemplatesDir)
+			if err != nil {
+				return err
 			}
-			dir, version, err := templates.Update(ctx, templates.UpdateOptions{Dir: dir, Repo: repo, Ref: ref, Output: g.Stdout})
+			progress := g.Stdout
+			if g.JSON {
+				progress = g.Stderr // keep stdout valid JSON
+			}
+			if g.Quiet {
+				progress = io.Discard
+			}
+			dir, version, err := templates.Update(ctx, templates.UpdateOptions{Dir: dir, Repo: repo, Ref: ref, Force: force, Output: progress})
 			if err != nil {
 				return err
 			}
