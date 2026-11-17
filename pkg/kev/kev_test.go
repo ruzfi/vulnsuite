@@ -95,7 +95,7 @@ func TestTemplatesBeatsCache(t *testing.T) {
 	os.WriteFile(filepath.Join(data, "cisa-kev.txt"), []byte("CVE-2021-41773\n"), 0o644)
 
 	cacheDir := t.TempDir()
-	if err := writeCache(filepath.Join(cacheDir, "cisa-kev.json"), Set{"CVE-2014-0160": true}, "network", "t"); err != nil {
+	if err := writeCache(filepath.Join(cacheDir, "cisa-kev.json"), Set{"CVE-2014-0160": true}, "network", "t", ""); err != nil {
 		t.Fatal(err)
 	}
 	set, src, err := Resolve(context.Background(), Options{TemplatesDir: dir, CacheDir: cacheDir})
@@ -139,7 +139,7 @@ func TestCorruptCacheTreatedAsMissing(t *testing.T) {
 func TestEmptyTemplatesSnapshotFallsThroughToCache(t *testing.T) {
 	tpl, cache := t.TempDir(), t.TempDir()
 	writeFile(t, filepath.Join(tpl, "data", "cisa-kev.txt"), "# header only\n\n")
-	if err := writeCache(filepath.Join(cache, "cisa-kev.json"), Set{"CVE-2014-0160": true}, "network", "2026-01-01T00:00:00Z"); err != nil {
+	if err := writeCache(filepath.Join(cache, "cisa-kev.json"), Set{"CVE-2014-0160": true}, "network", "2026-01-01T00:00:00Z", ""); err != nil {
 		t.Fatal(err)
 	}
 	var warned []string
@@ -162,7 +162,7 @@ func TestWriteCacheAtomicLeavesNoTemp(t *testing.T) {
 	cache := t.TempDir()
 	path := filepath.Join(cache, "cisa-kev.json")
 	writeFile(t, path, "old")
-	if err := writeCache(path, Set{"CVE-2021-41773": true}, "network", "now"); err != nil {
+	if err := writeCache(path, Set{"CVE-2021-41773": true}, "network", "now", ""); err != nil {
 		t.Fatal(err)
 	}
 	ents, err := os.ReadDir(cache)
@@ -191,5 +191,86 @@ func TestCVERegexesAnchored(t *testing.T) {
 	}
 	if set.Len() != 1 || !set.Contains("CVE-2021-1234") {
 		t.Fatalf("loadCache = %v", set)
+	}
+}
+
+func TestFresherCacheBeatsStaleTemplates(t *testing.T) {
+	tpl := t.TempDir()
+	writeFile(t, filepath.Join(tpl, "data", "cisa-kev.txt"), "# catalogVersion: 2026.01.10  count: 1\nCVE-2021-41773\n")
+	cases := []struct {
+		name, cacheVersion, fetched string
+		want                        Origin
+	}{
+		{"newer catalog in cache", "2026.03.01", "2026-03-01T08:00:00Z", OriginCache},
+		{"older catalog in cache", "2025.12.01", "2026-03-01T08:00:00Z", OriginTemplates},
+		{"same catalog", "2026.01.10", "2026-01-11T08:00:00Z", OriginTemplates},
+		{"old cache without catalog version, fetched later", "", "2026-02-01T00:00:00Z", OriginCache},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := t.TempDir()
+			if err := writeCache(filepath.Join(cache, "cisa-kev.json"), Set{"CVE-2014-0160": true}, "network", tc.fetched, tc.cacheVersion); err != nil {
+				t.Fatal(err)
+			}
+			_, src, err := Resolve(context.Background(), Options{TemplatesDir: tpl, CacheDir: cache})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if src.Origin != tc.want {
+				t.Fatalf("origin %q, want %q (%+v)", src.Origin, tc.want, src)
+			}
+		})
+	}
+	// A snapshot with no catalogVersion header cannot be dated, so it stays
+	// the source of truth.
+	plain := t.TempDir()
+	writeFile(t, filepath.Join(plain, "data", "cisa-kev.txt"), "CVE-2021-41773\n")
+	cache := t.TempDir()
+	_ = writeCache(filepath.Join(cache, "cisa-kev.json"), Set{"CVE-2014-0160": true}, "network", "2026-03-01T08:00:00Z", "2026.03.01")
+	if _, src, _ := Resolve(context.Background(), Options{TemplatesDir: plain, CacheDir: cache}); src.Origin != OriginTemplates || !src.AsOf.IsZero() {
+		t.Fatalf("undated snapshot: %+v", src)
+	}
+}
+
+func TestSourceAgeAndStale(t *testing.T) {
+	tpl := t.TempDir()
+	writeFile(t, filepath.Join(tpl, "data", "cisa-kev.txt"), "# catalogVersion: 2026.10.01  count: 1\nCVE-2021-41773\n")
+	_, src, err := Resolve(context.Background(), Options{TemplatesDir: tpl, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if src.CatalogVersion != "2026.10.01" || !src.AsOf.Equal(time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("source %+v", src)
+	}
+	if !strings.Contains(src.String(), "catalog 2026.10.01") {
+		t.Fatalf("String() = %q", src.String())
+	}
+	if src.Stale(time.Date(2026, 10, 20, 0, 0, 0, 0, time.UTC)) {
+		t.Fatal("19 days is not stale")
+	}
+	now := time.Date(2026, 11, 18, 0, 0, 0, 0, time.UTC)
+	if !src.Stale(now) || src.Age(now) != 48*24*time.Hour {
+		t.Fatalf("age %s stale %v", src.Age(now), src.Stale(now))
+	}
+	if (Source{Origin: OriginTemplates}).Stale(now) {
+		t.Fatal("an undated source is never reported stale")
+	}
+}
+
+func TestRefreshRecordsCatalogVersion(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"catalogVersion":"2026.11.17","vulnerabilities":[{"cveID":"CVE-2021-41773"}]}`))
+	}))
+	defer srv.Close()
+	cache := t.TempDir()
+	opts := Options{TemplatesDir: t.TempDir(), Refresh: true, CacheDir: cache, Client: srv.Client(), FeedURL: srv.URL,
+		Now: func() time.Time { return time.Date(2026, 11, 18, 1, 0, 0, 0, time.UTC) }}
+	_, src, err := Resolve(context.Background(), opts)
+	if err != nil || src.CatalogVersion != "2026.11.17" || src.AsOf.Day() != 17 {
+		t.Fatalf("network: %+v %v", src, err)
+	}
+	_, cached, err := Resolve(context.Background(), Options{TemplatesDir: t.TempDir(), CacheDir: cache})
+	if err != nil || cached.Origin != OriginCache || cached.CatalogVersion != "2026.11.17" {
+		t.Fatalf("cache: %+v %v", cached, err)
 	}
 }

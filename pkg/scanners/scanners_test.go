@@ -138,3 +138,53 @@ func TestParseRefScannersAndKnown(t *testing.T) {
 		}
 	}
 }
+
+// Suggestions are keyed by (scanner, id): an nmap ref that shares a nuclei
+// template's id does not suppress that template's suggestion, while the same
+// nuclei ref does.
+func TestSuggestionsKeyedByScanner(t *testing.T) {
+	idx := fakeCheckout(t)
+	r := Match(contractWith("", []string{"nmap:apache-combo"}, []string{"CVE-2021-42013"}), idx)
+	if len(r.Suggested) != 1 || r.Suggested[0].ID != "apache-combo" {
+		t.Fatalf("nmap:apache-combo hid the nuclei suggestion: %+v", r.Suggested)
+	}
+	r = Match(contractWith("", []string{"nuclei:apache-combo"}, []string{"CVE-2021-42013"}), idx)
+	if len(r.Suggested) != 0 {
+		t.Fatalf("a declared nuclei template is still suggested: %+v", r.Suggested)
+	}
+	r = Match(contractWith("", []string{"apache-combo"}, []string{"CVE-2021-42013"}), idx)
+	if len(r.Suggested) != 0 {
+		t.Fatalf("a bare id is a nuclei ref: %+v", r.Suggested)
+	}
+}
+
+// A template id declared by two files is indexed and counted once.
+func TestDuplicateIDsCountedOnce(t *testing.T) {
+	root := t.TempDir()
+	for _, rel := range []string{"a/dup.yaml", "b/dup.yaml"} {
+		p := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("id: dup-id\ninfo:\n  classification:\n    cve-id: CVE-2021-44228\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	idx, err := Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idx.Count != 1 || len(idx.ByID) != 1 || len(idx.ByCVE["CVE-2021-44228"]) != 1 || idx.ByID["dup-id"].Path != "a/dup.yaml" {
+		t.Fatalf("count=%d byID=%d byCVE=%d first=%s", idx.Count, len(idx.ByID), len(idx.ByCVE["CVE-2021-44228"]), idx.ByID["dup-id"].Path)
+	}
+	nroot := t.TempDir()
+	for _, rel := range []string{"x/http-title.nse", "y/http-title.nse"} {
+		p := filepath.Join(nroot, filepath.FromSlash(rel))
+		_ = os.MkdirAll(filepath.Dir(p), 0o755)
+		_ = os.WriteFile(p, []byte("--"), 0o644)
+	}
+	nidx, err := LoadNmap(nroot)
+	if err != nil || nidx.Count != 1 {
+		t.Fatalf("nmap count %d, %v", nidx.Count, err)
+	}
+}

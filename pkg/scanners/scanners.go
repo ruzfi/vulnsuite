@@ -80,11 +80,13 @@ type Template struct {
 }
 
 // Index is a nuclei-templates checkout, indexed by template id and by CVE.
+// When two files declare the same id, the first in walk order (lexical by
+// path) is indexed and the other is skipped, so ByID, ByCVE and Count agree.
 type Index struct {
 	Root  string
 	ByID  map[string]*Template
 	ByCVE map[string][]*Template
-	Count int
+	Count int // distinct template ids
 }
 
 var cveRe = regexp.MustCompile(`(?i)\bCVE-\d{4}-\d{4,7}\b`)
@@ -141,6 +143,9 @@ func Load(root string) (*Index, error) {
 		}
 		if yaml.Unmarshal(data, &doc) != nil || doc.ID == "" {
 			return nil
+		}
+		if _, dup := idx.ByID[doc.ID]; dup {
+			return nil // a duplicate id: keep the first, count it once
 		}
 		rel, _ := filepath.Rel(root, p)
 		t := &Template{ID: doc.ID, Path: filepath.ToSlash(rel), Name: doc.Info.Name, Severity: doc.Info.Severity}
@@ -206,6 +211,9 @@ func LoadNmap(root string) (*Index, error) {
 			return nil
 		}
 		name := strings.TrimSuffix(d.Name(), ".nse")
+		if _, dup := idx.ByID[name]; dup {
+			return nil // the same script name in two directories: keep the first
+		}
 		rel, _ := filepath.Rel(root, p)
 		idx.ByID[name] = &Template{ID: name, Path: filepath.ToSlash(rel)}
 		idx.Count++
@@ -242,9 +250,11 @@ type Report struct {
 // Match resolves a contract's scanner links against idx (nil = no checkout).
 func Match(c *contract.Contract, idx *Index) Report {
 	rep := Report{Detection: c.Metadata.Detection, Indexed: idx != nil}
-	declared := map[string]bool{}
+	// Keyed by (scanner, id): an nmap script that happens to share a nuclei
+	// template's id must not hide that template's suggestion.
+	declared := map[Ref]bool{}
 	for _, r := range Refs(c) {
-		declared[r.ID] = true
+		declared[r] = true
 		l := Link{Ref: r, Verified: c.Metadata.Detection == "scanner"}
 		if idx != nil && r.Scanner == Nuclei {
 			if t, ok := idx.ByID[r.ID]; ok {
@@ -259,7 +269,7 @@ func Match(c *contract.Contract, idx *Index) Report {
 		seen := map[string]bool{}
 		for _, ref := range c.Metadata.VulnRefs {
 			for _, t := range idx.ByCVE[strings.ToUpper(ref)] {
-				if !declared[t.ID] && !seen[t.ID] {
+				if !declared[Ref{Scanner: Nuclei, ID: t.ID}] && !seen[t.ID] {
 					seen[t.ID] = true
 					rep.Suggested = append(rep.Suggested, t)
 				}

@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/ruzfi/vulnsuite/pkg/contract"
 	"github.com/ruzfi/vulnsuite/pkg/kev"
@@ -36,29 +37,70 @@ func gather(store *loader.Store, selectors []string, all, variants bool) ([]*con
 // -- list ---------------------------------------------------------------------
 
 type listRow struct {
-	ID         string   `json:"id"`
-	Group      string   `json:"group,omitempty"`
-	Variant    string   `json:"variant,omitempty"`
-	Primary    bool     `json:"primary,omitempty"`
-	GroupSize  int      `json:"group_size,omitempty"`
-	Category   string   `json:"category,omitempty"`
-	Severity   string   `json:"severity"`
-	Class      []string `json:"class,omitempty"`
-	CVE        bool     `json:"cve"`
-	KEV        *bool    `json:"kev,omitempty"`
-	Year       string   `json:"year,omitempty"`
-	Disclosed  string   `json:"disclosed,omitempty"`
-	States     []string `json:"states"`
-	BuildKind  string   `json:"build_kind"`
-	Fidelity   string   `json:"fidelity"`
-	VulnRefs   []string `json:"vuln_refs"`
-	Detection  string   `json:"detection,omitempty"`
-	DetectedBy []string `json:"detected_by,omitempty"`
-	Tags       []string `json:"tags,omitempty"`
-	HostAccess bool     `json:"host_access,omitempty"`
-	Summary    string   `json:"summary"`
-	Path       string   `json:"path"`
-	Error      string   `json:"error,omitempty"`
+	ID        string   `json:"id"`
+	Group     string   `json:"group,omitempty"`
+	Variant   string   `json:"variant,omitempty"`
+	Primary   bool     `json:"primary,omitempty"`
+	GroupSize int      `json:"group_size,omitempty"`
+	Category  string   `json:"category,omitempty"`
+	Severity  string   `json:"severity"`
+	Class     []string `json:"class,omitempty"`
+	CVE       bool     `json:"cve"`
+	KEV       *bool    `json:"kev,omitempty"`
+	// KEVSource is where the KEV column came from and how old it is (the same
+	// for every row; per row so -json stays a plain array).
+	KEVSource  *kevSourceInfo `json:"kev_source,omitempty"`
+	Year       string         `json:"year,omitempty"`
+	Disclosed  string         `json:"disclosed,omitempty"`
+	States     []string       `json:"states"`
+	BuildKind  string         `json:"build_kind"`
+	Fidelity   string         `json:"fidelity"`
+	VulnRefs   []string       `json:"vuln_refs"`
+	Detection  string         `json:"detection,omitempty"`
+	DetectedBy []string       `json:"detected_by,omitempty"`
+	Tags       []string       `json:"tags,omitempty"`
+	HostAccess bool           `json:"host_access,omitempty"`
+	Summary    string         `json:"summary"`
+	Path       string         `json:"path"`
+	Error      string         `json:"error,omitempty"`
+}
+
+// kevSourceInfo is the KEV data's provenance and age, for list -json.
+type kevSourceInfo struct {
+	Origin         string `json:"origin"`
+	Path           string `json:"path,omitempty"`
+	CatalogVersion string `json:"catalog_version,omitempty"`
+	AsOf           string `json:"as_of,omitempty"` // YYYY-MM-DD the data was current
+	AgeDays        *int   `json:"age_days,omitempty"`
+	Stale          bool   `json:"stale"`
+}
+
+func newKEVSourceInfo(src kev.Source, now time.Time) *kevSourceInfo {
+	info := &kevSourceInfo{Origin: string(src.Origin), Path: src.Path, CatalogVersion: src.CatalogVersion, Stale: src.Stale(now)}
+	if !src.AsOf.IsZero() {
+		info.AsOf = src.AsOf.Format("2006-01-02")
+		days := int(src.Age(now).Hours() / 24)
+		info.AgeDays = &days
+	}
+	return info
+}
+
+// kevAgeNote renders the KEV data's age for the status line ("" if unknown).
+func kevAgeNote(src kev.Source, now time.Time) string {
+	if src.AsOf.IsZero() {
+		if src.Origin == kev.OriginNone {
+			return ""
+		}
+		return "; age unknown"
+	}
+	days := int(src.Age(now).Hours() / 24)
+	switch {
+	case days <= 0:
+		return "; current as of today"
+	case days == 1:
+		return "; 1 day old"
+	}
+	return fmt.Sprintf("; %d days old", days)
 }
 
 func cmdList() *Command {
@@ -95,8 +137,11 @@ from contract metadata (taxonomy v2) and shown as columns:
 KEV membership is derived by cross-referencing a target's CVEs against the CISA
 KEV catalog. The catalog is read from the templates checkout's data/cisa-kev.txt
 (kept fresh upstream); -refresh-kev fetches the live CISA feed and caches it at
-` + "`~/.cache/vulnsuite/cisa-kev.json`" + `. Offline with neither present, KEV is
-shown as "?" and -kev/-no-kev cannot be used.`,
+` + "`~/.cache/vulnsuite/cisa-kev.json`" + `, and that cache is used instead
+whenever it holds a newer catalog than the checkout. The status line (and
+kev_source in -json) gives the source and its age; data more than 30 days old
+gets a warning. Offline with neither present, KEV is shown as "?" and
+-kev/-no-kev cannot be used.`,
 		Flags: func(fs *flag.FlagSet) {
 			f.register(fs)
 			fs.StringVar(&groupFilter, "group", "", "only members of this variant group (shows the whole family)")
@@ -123,6 +168,15 @@ shown as "?" and -kev/-no-kev cannot be used.`,
 			kevKnown := kevSrc.Origin != kev.OriginNone
 			if f.needsKEV() && !kevKnown {
 				return fmt.Errorf("cannot filter by KEV: catalog unavailable (offline and no cache). Run with -refresh-kev, or point -templates at a checkout with data/cisa-kev.txt")
+			}
+			now := time.Now()
+			var kevInfo *kevSourceInfo
+			if kevKnown {
+				kevInfo = newKEVSourceInfo(kevSrc, now)
+			}
+			if kevSrc.Stale(now) {
+				g.errorf("warning: the KEV data is %d days old (%s); refresh it with -refresh-kev or update-templates\n",
+					int(kevSrc.Age(now).Hours()/24), kevSrc)
 			}
 			groupSizes, err := store.Groups()
 			if err != nil {
@@ -182,6 +236,7 @@ shown as "?" and -kev/-no-kev cannot be used.`,
 				if kevKnown {
 					v := onKEV
 					row.KEV = &v
+					row.KEVSource = kevInfo
 				}
 				rows = append(rows, row)
 			}
@@ -218,7 +273,7 @@ shown as "?" and -kev/-no-kev cannot be used.`,
 			}
 			tw.Flush()
 			g.printf("\n%d templates in %s\n", len(rows), store.Root)
-			g.printf("KEV source: %s\n", kevSrc)
+			g.printf("KEV source: %s%s\n", kevSrc, kevAgeNote(kevSrc, now))
 			if anyHostAccess(rows) {
 				g.printf("* needs host access (device/elevated capability); run with -allow-host-access, and only for templates you trust.\n")
 			}
