@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -24,9 +25,37 @@ const suiteDir = "suites"
 type resolver struct {
 	store        *loader.Store
 	variants     bool
-	selectors    []string
+	selectors    []selector
 	filterSets   []filters
 	visitedSuite map[string]bool
+}
+
+// selector is one selector to resolve, with where it came from: "" for the
+// command line, "path:line" for a line of a -f or suite file, so a selector
+// that matches nothing points at the line to fix.
+type selector struct {
+	sel    string
+	origin string
+}
+
+// selectorLine is one line of a selectors file, with its 1-based line number.
+type selectorLine struct {
+	line int
+	text string   // a selector line
+	args []string // a filter line's tokens (text is then empty)
+}
+
+// atOrigin prefixes err with origin ("path:line: ..."), keeping a usage
+// error a usage error so the exit code is unchanged.
+func atOrigin(origin string, err error) error {
+	if origin == "" || err == nil {
+		return err
+	}
+	var ue usageError
+	if errors.As(err, &ue) {
+		return usageError{origin + ": " + ue.msg}
+	}
+	return fmt.Errorf("%s: %w", origin, err)
 }
 
 // suiteHandle returns the suite name when sel uses the suite: prefix.
@@ -38,15 +67,16 @@ func suiteHandle(sel string) (string, bool) {
 }
 
 // addSelector records one selector, expanding a suite: handle in place.
-func (r *resolver) addSelector(sel string) error {
+// origin is where the selector came from ("" for the command line).
+func (r *resolver) addSelector(sel, origin string) error {
 	sel = strings.TrimSpace(sel)
 	if sel == "" {
 		return nil
 	}
 	if name, ok := suiteHandle(sel); ok {
-		return r.addSuite(name)
+		return atOrigin(origin, r.addSuite(name))
 	}
-	r.selectors = append(r.selectors, sel)
+	r.selectors = append(r.selectors, selector{sel, origin})
 	return nil
 }
 
@@ -68,38 +98,41 @@ func (r *resolver) addSuite(name string) error {
 }
 
 // addFile reads a -f / suite file and folds its selector lines and filter lines
-// into the resolver.
+// into the resolver. Errors name the file and line.
 func (r *resolver) addFile(path string) error {
-	sels, filterLines, err := parseSelectorFile(path)
+	lines, err := parseSelectorFile(path)
 	if err != nil {
 		return err
 	}
-	for _, line := range filterLines {
-		f, err := parseFilterLine(path, line)
-		if err != nil {
-			return err
+	for _, l := range lines {
+		origin := fmt.Sprintf("%s:%d", path, l.line)
+		if l.args != nil {
+			f, err := parseFilterLine(l.args)
+			if err != nil {
+				return atOrigin(origin, err)
+			}
+			if f.active() {
+				r.filterSets = append(r.filterSets, f)
+			}
+			continue
 		}
-		if f.active() {
-			r.filterSets = append(r.filterSets, f)
-		}
-	}
-	for _, s := range sels {
-		if err := r.addSelector(s); err != nil {
+		if err := r.addSelector(l.text, origin); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// parseSelectorFile splits a selectors file into plain selector lines and filter
-// lines (token slices for lines that begin with '-'). Blank lines and comments
+// parseSelectorFile splits a selectors file into selector lines and filter
+// lines (lines that begin with '-'), in file order. Blank lines and comments
 // (`# ...`, or an inline ` # ...`) are ignored.
-func parseSelectorFile(path string) (selectors []string, filterLines [][]string, err error) {
+func parseSelectorFile(path string) ([]selectorLine, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	for _, raw := range strings.Split(string(data), "\n") {
+	var out []selectorLine
+	for i, raw := range strings.Split(string(data), "\n") {
 		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
@@ -111,28 +144,29 @@ func parseSelectorFile(path string) (selectors []string, filterLines [][]string,
 			continue
 		}
 		if strings.HasPrefix(line, "-") {
-			filterLines = append(filterLines, strings.Fields(line))
+			out = append(out, selectorLine{line: i + 1, args: strings.Fields(line)})
 			continue
 		}
-		selectors = append(selectors, line)
+		out = append(out, selectorLine{line: i + 1, text: line})
 	}
-	return selectors, filterLines, nil
+	return out, nil
 }
 
 // parseFilterLine turns a filter line's tokens into a validated filters value.
-func parseFilterLine(path string, tokens []string) (filters, error) {
+// Every mistake is a usage error, like the same mistake on the command line.
+func parseFilterLine(tokens []string) (filters, error) {
 	var f filters
 	fs := flag.NewFlagSet("filter", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	f.register(fs)
 	if err := fs.Parse(tokens); err != nil {
-		return f, fmt.Errorf("%s: bad filter line %q: %v", filepath.Base(path), strings.Join(tokens, " "), err)
+		return f, usageError{fmt.Sprintf("bad filter line %q: %v", strings.Join(tokens, " "), err)}
 	}
 	if fs.NArg() > 0 {
-		return f, fmt.Errorf("%s: filter line %q has stray arguments %v", filepath.Base(path), strings.Join(tokens, " "), fs.Args())
+		return f, usageError{fmt.Sprintf("filter line %q has stray arguments %v", strings.Join(tokens, " "), fs.Args())}
 	}
 	if err := f.validate(); err != nil {
-		return f, fmt.Errorf("%s: %v", filepath.Base(path), err)
+		return f, err
 	}
 	return f, nil
 }
@@ -156,7 +190,7 @@ func resolveTargets(ctx context.Context, store *loader.Store, sel, files []strin
 		r.filterSets = append(r.filterSets, cliFilters)
 	}
 	for _, s := range sel {
-		if err := r.addSelector(s); err != nil {
+		if err := r.addSelector(s, ""); err != nil {
 			return nil, err
 		}
 	}
@@ -185,9 +219,9 @@ func resolveTargets(ctx context.Context, store *loader.Store, sel, files []strin
 		add(ps)
 	}
 	for _, s := range r.selectors {
-		ps, err := store.FindMany([]string{s}, false, variants)
+		ps, err := store.FindMany([]string{s.sel}, false, variants)
 		if err != nil {
-			return nil, err
+			return nil, atOrigin(s.origin, err)
 		}
 		add(ps)
 	}

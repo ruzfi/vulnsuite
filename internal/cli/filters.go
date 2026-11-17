@@ -4,7 +4,9 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"regexp"
 	"strings"
+	"time"
 
 	"github.com/ruzfi/vulnsuite/pkg/contract"
 	"github.com/ruzfi/vulnsuite/pkg/kev"
@@ -61,8 +63,24 @@ func (f *filters) active() bool {
 // needsKEV reports whether evaluating the filter requires the KEV catalog.
 func (f *filters) needsKEV() bool { return f.onlyKEV || f.noKEV }
 
-// validate checks the filter values independently of any templates.
+// yearRe is the shape -year accepts: a four-digit year.
+var yearRe = regexp.MustCompile(`^\d{4}$`)
+
+// validate checks the filter values independently of any templates, so a typo
+// (-fidelity reel, -year 21, -since 2023/01/01) is a usage error rather than a
+// filter that silently matches nothing.
 func (f *filters) validate() error {
+	if f.fidelity != "" && !has(contract.Fidelities, f.fidelity) {
+		return usageError{fmt.Sprintf("unknown -fidelity %q; want one of %s", f.fidelity, strings.Join(contract.Fidelities, ", "))}
+	}
+	if f.year != "" && !yearRe.MatchString(f.year) {
+		return usageError{fmt.Sprintf("-year wants a four-digit year (YYYY), got %q", f.year)}
+	}
+	if f.since != "" {
+		if _, err := time.Parse(time.DateOnly, f.since); err != nil || len(f.since) != len(time.DateOnly) {
+			return usageError{fmt.Sprintf("-since wants an ISO date (YYYY-MM-DD), got %q", f.since)}
+		}
+	}
 	if f.cve && f.noCVE {
 		return usageError{"-cve and -no-cve are mutually exclusive"}
 	}
