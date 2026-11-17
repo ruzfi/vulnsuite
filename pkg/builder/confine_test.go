@@ -136,7 +136,8 @@ func TestBuildContextConfined(t *testing.T) {
 	}
 	noSecretInBuilds(t, fe)
 
-	// a real context: symlinks inside it are never followed into the tar
+	// a real context: symlinks inside it travel as symlinks (resolved by the
+	// daemon inside the context), never followed into the tar
 	c = tmpl(t, buildDoc)
 	src := filepath.Join(c.Folder, "src")
 	os.MkdirAll(src, 0o755)
@@ -153,9 +154,13 @@ func TestBuildContextConfined(t *testing.T) {
 	if files["app.conf"] != "cfg" || files["Dockerfile"] == "" {
 		t.Fatalf("context: %v", keys(files))
 	}
-	for name := range files {
-		if strings.HasPrefix(name, "creds") || strings.HasPrefix(name, "hostdir") {
-			t.Fatalf("symlink %s must not be carried into the context", name)
+	links := fe.Builds[0].Links
+	if links["creds"] != filepath.ToSlash(filepath.Join(outside, "credentials")) || links["hostdir"] != filepath.ToSlash(outside) {
+		t.Fatalf("symlinks must be carried as links: %v", links)
+	}
+	for name, body := range files {
+		if (name == "creds" || name == "hostdir") && body != "" || strings.HasPrefix(name, "hostdir/") {
+			t.Fatalf("symlink %s must not be followed into the context", name)
 		}
 	}
 
@@ -263,7 +268,7 @@ func TestDockerfileQuoteEscapesDollar(t *testing.T) {
 }
 
 func TestBakeEnvHonoursEscapeDirective(t *testing.T) {
-	mc := newMemContext()
+	mc := newBuildContext("")
 	mc.add("Dockerfile", []byte("# escape=`\nFROM scratch\n"), 0o644)
 	if err := bakeEnv(mc, "Dockerfile", map[string]string{"PW": "pa$word"}); err != nil {
 		t.Fatal(err)

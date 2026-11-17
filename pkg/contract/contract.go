@@ -800,7 +800,7 @@ func hashTree(root string) string {
 	}
 	var files []string
 	filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err == nil && d.Type().IsRegular() {
+		if err == nil && (d.Type().IsRegular() || d.Type()&fs.ModeSymlink != 0) {
 			files = append(files, p)
 		}
 		return nil
@@ -810,6 +810,12 @@ func hashTree(root string) string {
 	for _, p := range files {
 		rel, _ := filepath.Rel(root, p)
 		h.Write([]byte(filepath.ToSlash(rel)))
+		// A symlink travels in the build context as a link (never followed:
+		// it may point outside the folder), so its target text is what counts.
+		if target, err := os.Readlink(p); err == nil {
+			h.Write([]byte("\x00symlink\x00" + filepath.ToSlash(target)))
+			continue
+		}
 		b, err := os.ReadFile(p)
 		if err == nil {
 			h.Write(b)

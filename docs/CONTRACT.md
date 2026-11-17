@@ -153,7 +153,8 @@ How a state's image is produced (`vulnsuite list` shows it as KIND):
 | `build` | anything | `build` | `vulnsuite/<id>:<state>-<hash>` |
 
 `<hash>` covers the base identity, the state's `image`/`digest` override
-(what an overlay build starts `FROM`), the build context tree, the patch,
+(what an overlay build starts `FROM`), the build context tree (a symlink by
+its link text), the patch,
 every overlay's content, destination and `mode`, the environment and build
 args. Identical inputs produce an identical tag and are never rebuilt. The
 state image and `mode` enter the hash only when set, so templates that use
@@ -220,6 +221,11 @@ own:
   schema errors. A symlink is allowed only when its target is inside the template
   folder too; one pointing elsewhere is refused at build time and reported by
   `validate` as `path-escapes-template`.
+- The build context (`base.context`, or the `source` checkout) is sent as it
+  is on disk: symlinks inside it travel as symlinks and are never followed
+  (the daemon resolves them inside the context), `.git` is left out, and a
+  `.dockerignore` at the context root is honoured with Docker's pattern rules.
+  The Dockerfile and `.dockerignore` are always sent, as with `docker build`.
 - `overlay[].dest` is a plain path: letters, digits and `. _ @ % + = : , / -`,
   no whitespace, quotes, `$` or control characters, no `..` segments, and not
   `/` itself. For an `image` base it must be absolute.
