@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/distribution/reference"
 )
 
 // Config is one registry credential.
@@ -55,14 +57,30 @@ func loadConfig() *dockerConfig {
 	return cfg
 }
 
-// registryOf extracts the registry host of an image reference
-// ("ghcr.io/ruzfi/x" -> "ghcr.io", "nginx" -> "https://index.docker.io/v1/").
+// hubAddress is the key the docker CLI files Docker Hub credentials under.
+const hubAddress = "https://index.docker.io/v1/"
+
+// registryOf returns the credential key of an image reference's registry:
+// hubAddress for Docker Hub ("nginx", "nginx:1.25", "postgres@sha256:...",
+// "docker.io/library/nginx", ...) and host[:port] otherwise ("ghcr.io/x" ->
+// "ghcr.io", "localhost:5000/x" -> "localhost:5000"). Tags and digests are
+// ignored, so callers may pass the full reference.
 func registryOf(ref string) string {
-	first, _, _ := strings.Cut(ref, "/")
-	if strings.Contains(first, ".") || strings.Contains(first, ":") || first == "localhost" {
-		return first
+	var domain string
+	if named, err := reference.ParseNormalizedNamed(ref); err == nil {
+		domain = reference.Domain(named)
+	} else {
+		// Not a valid reference (e.g. upper case): apply the same rule by hand.
+		first, rest, ok := strings.Cut(ref, "/")
+		if ok && rest != "" && (strings.ContainsAny(first, ".:") || first == "localhost" || strings.HasPrefix(first, "[")) {
+			domain = first
+		}
 	}
-	return "https://index.docker.io/v1/"
+	switch domain {
+	case "", "docker.io", "index.docker.io", "registry-1.docker.io":
+		return hubAddress
+	}
+	return domain
 }
 
 // For returns the base64 X-Registry-Auth value for an image ref, or "" when
@@ -148,21 +166,44 @@ func Encode(a Config) string {
 // Empty is the header value for "no credentials".
 func Empty() string { return Encode(Config{}) }
 
-// Configs returns every plain credential in the docker config, keyed by
-// registry, for builds that pull from private registries.
+// Configs returns every credential the docker config knows about, keyed by
+// registry, for builds that pull from private registries. Each registry named
+// in auths or credHelpers is resolved through its credential helper (the
+// per-registry credHelpers entry, else credsStore) and falls back to the plain
+// base64 auth stored in auths.
 func Configs() map[string]Config {
 	conf := loadConfig()
 	m := map[string]Config{}
 	if conf == nil {
 		return m
 	}
-	for key, entry := range conf.Auths {
+	keys := map[string]bool{}
+	for key := range conf.Auths {
+		keys[key] = true
+	}
+	for key := range conf.CredHelpers {
+		keys[key] = true
+	}
+	for key := range keys {
+		helper := conf.CredsStore
+		if h, ok := conf.CredHelpers[key]; ok {
+			helper = h
+		}
+		if helper != "" {
+			if a, ok := fromHelper(helper, key); ok {
+				m[key] = a
+				continue
+			}
+		}
+		entry, ok := conf.Auths[key]
+		if !ok || entry.Auth == "" {
+			continue
+		}
 		raw, err := base64.StdEncoding.DecodeString(entry.Auth)
 		if err != nil {
 			continue
 		}
-		u, p, ok := strings.Cut(string(raw), ":")
-		if ok {
+		if u, p, ok := strings.Cut(string(raw), ":"); ok {
 			m[key] = Config{Username: u, Password: p, ServerAddress: key}
 		}
 	}

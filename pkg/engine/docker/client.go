@@ -17,20 +17,33 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ruzfi/vulnsuite/pkg/engine"
 )
 
-// APIVersion is the minimum Engine API version we need (Docker 20.10+).
-const APIVersion = "v1.41"
+// API versions this client speaks. The version actually used is negotiated
+// with the daemon on the first request (see negotiate), like the docker CLI.
+const (
+	// MinAPIVersion is the oldest Engine API we need (Docker 20.10), and the
+	// version assumed when the daemon does not advertise one.
+	MinAPIVersion = "1.41"
+	// MaxAPIVersion is the newest Engine API this client has been checked
+	// against; newer daemons are spoken to at this version.
+	MaxAPIVersion = "1.47"
+)
 
 // Client talks to one daemon.
 type Client struct {
 	http    *http.Client
-	baseURL string // http://docker/v1.41 (host is a placeholder for unix sockets)
+	baseURL string // http://docker (host is a placeholder for unix sockets)
 	host    string // what DOCKER_HOST resolved to, for messages
+
+	mu      sync.Mutex
+	version string // negotiated API version ("1.47"); empty until negotiated
 }
 
 // Error is an API error with the daemon's message.
@@ -91,27 +104,92 @@ func New(host string) (*Client, error) {
 			var d net.Dialer
 			return d.DialContext(ctx, "unix", path)
 		}
-		c.baseURL = "http://docker/" + APIVersion
+		c.baseURL = "http://docker"
 	case strings.HasPrefix(host, "tcp://"), strings.HasPrefix(host, "http://"):
 		u, err := url.Parse(host)
 		if err != nil {
 			return nil, err
 		}
-		c.baseURL = "http://" + u.Host + "/" + APIVersion
+		c.baseURL = "http://" + u.Host
 	case strings.HasPrefix(host, "npipe://"):
 		return nil, fmt.Errorf("npipe DOCKER_HOST is not supported yet; expose the daemon over tcp:// or use WSL")
 	default:
 		return nil, fmt.Errorf("unsupported DOCKER_HOST %q", host)
 	}
 	c.http = &http.Client{Transport: transport}
+	if v := os.Getenv("DOCKER_API_VERSION"); v != "" {
+		// As with the docker CLI, an explicit version disables negotiation.
+		c.version = strings.TrimPrefix(v, "v")
+	}
 	return c, nil
+}
+
+// APIVersion returns the Engine API version requests are sent at,
+// negotiating it with the daemon first if that has not happened yet.
+func (c *Client) APIVersion(ctx context.Context) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.version != "" {
+		return c.version, nil
+	}
+	// /_ping is unversioned, so it works whatever range the daemon accepts.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/_ping", nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", c.wrapDialError(err)
+	}
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
+	resp.Body.Close()
+	// The header is set even on error responses; only its absence (very old
+	// daemons, some proxies) leaves us guessing.
+	c.version = negotiate(resp.Header.Get("API-Version"))
+	return c.version, nil
+}
+
+// negotiate picks the API version to use given the daemon's advertised one:
+// min(server, MaxAPIVersion), or MinAPIVersion when the daemon gave none.
+func negotiate(server string) string {
+	server = strings.TrimPrefix(strings.TrimSpace(server), "v")
+	if _, _, ok := parseVersion(server); !ok {
+		return MinAPIVersion
+	}
+	if versionLess(MaxAPIVersion, server) {
+		return MaxAPIVersion
+	}
+	return server
+}
+
+func parseVersion(v string) (major, minor int, ok bool) {
+	a, b, found := strings.Cut(v, ".")
+	if !found {
+		return 0, 0, false
+	}
+	major, err1 := strconv.Atoi(a)
+	minor, err2 := strconv.Atoi(b)
+	if err1 != nil || err2 != nil || major < 0 || minor < 0 {
+		return 0, 0, false
+	}
+	return major, minor, true
+}
+
+// versionLess reports whether a < b; both must parse.
+func versionLess(a, b string) bool {
+	amaj, amin, _ := parseVersion(a)
+	bmaj, bmin, _ := parseVersion(b)
+	if amaj != bmaj {
+		return amaj < bmaj
+	}
+	return amin < bmin
 }
 
 // Host returns the daemon address in use.
 func (c *Client) Host() string { return c.host }
 
-func (c *Client) url(path string, q url.Values) string {
-	u := c.baseURL + path
+func (c *Client) url(version, path string, q url.Values) string {
+	u := c.baseURL + "/v" + version + path
 	if len(q) > 0 {
 		u += "?" + q.Encode()
 	}
@@ -120,7 +198,11 @@ func (c *Client) url(path string, q url.Values) string {
 
 // do performs a request and returns the response; non-2xx is turned into *Error.
 func (c *Client) do(ctx context.Context, method, path string, q url.Values, body io.Reader, headers map[string]string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, method, c.url(path, q), body)
+	version, err := c.APIVersion(ctx)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.url(version, path, q), body)
 	if err != nil {
 		return nil, err
 	}

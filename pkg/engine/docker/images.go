@@ -59,7 +59,7 @@ func (c *Client) ImagePull(ctx context.Context, ref, platform string, out io.Wri
 		q.Set("platform", platform)
 	}
 	headers := map[string]string{}
-	if auth := registryauth.For(from); auth != "" {
+	if auth := registryauth.For(ref); auth != "" {
 		headers["X-Registry-Auth"] = auth
 	}
 	resp, err := c.do(ctx, http.MethodPost, "/images/create", q, nil, headers)
@@ -129,7 +129,7 @@ func (c *Client) ImagePush(ctx context.Context, ref string, out io.Writer) error
 	if tag != "" {
 		q.Set("tag", tag)
 	}
-	auth := registryauth.For(repo)
+	auth := registryauth.For(ref)
 	if auth == "" {
 		auth = registryauth.Empty()
 	}
