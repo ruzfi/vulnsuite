@@ -180,7 +180,7 @@
             },
             "commit": {
               "type": "string",
-              "description": "Pinned commit -- an RC or unreleased vulnerable revision."
+              "description": "Pinned commit -- an RC or unreleased vulnerable revision. Must be a full 40-character (or 64-character SHA-256) commit id: `validate` reports a branch or tag as unpinned-base and an abbreviated id as short-commit."
             },
             "dockerfile": {
               "type": "string"
@@ -314,6 +314,7 @@
         },
         "sidecars": {
           "type": "array",
+          "description": "Helper containers started next to the target. Pin each image with digest (`validate`: unpinned-sidecar); under emulation they run on the target's platform.",
           "items": {
             "type": "object",
             "required": [
@@ -441,11 +442,12 @@
       "properties": {
         "image": {
           "type": "string",
-          "description": "Per-state image override (reuse-if-matches): e.g. patched = a newer tag."
+          "description": "Per-state image override (reuse-if-matches): e.g. patched = a newer tag. Pin it with digest (`validate`: unpinned-state-image). Part of the content hash of an overlay build."
         },
         "digest": {
           "type": "string",
-          "pattern": "^sha256:[0-9a-f]{64}$"
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "description": "Digest pinning the state's image override."
         },
         "patch": {
           "type": "string",
@@ -469,7 +471,8 @@
               },
               "mode": {
                 "type": "string",
-                "pattern": "^0[0-7]{3}$"
+                "pattern": "^0[0-7]{3}$",
+                "description": "File mode, set in the build context (no RUN chmod, so it works on non-root and shell-less bases). Part of the content hash."
               }
             }
           }
@@ -514,7 +517,7 @@
         },
         "sidecars": {
           "type": "object",
-          "description": "Per-state sidecar image overrides, keyed by sidecar name (e.g. the patched version on every node of a multi-node target).",
+          "description": "Per-state sidecar image overrides, keyed by sidecar name (e.g. the patched version on every node of a multi-node target). Pin each image with digest (`validate`: unpinned-sidecar).",
           "additionalProperties": {
             "type": "object",
             "required": [

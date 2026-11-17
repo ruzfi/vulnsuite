@@ -74,7 +74,13 @@ base: { kind: build, context: src, dockerfile: Dockerfile, build_args: {} }
 - `image` must pin `digest` to be reproducible (`validate` errors otherwise;
   `-allow-unpinned` downgrades it while authoring). Get it with
   `docker manifest inspect <image> -v | grep -m1 digest` or `docker buildx imagetools inspect <image>`.
-- `source` pins `commit`; the state's `patch` is applied on top.
+- `source` pins `commit` to a full 40-character (or 64-character SHA-256)
+  commit id; a branch or tag is unpinned, an abbreviated id a `short-commit`
+  warning. The state's `patch` is applied on top.
+- Per-state `image` overrides and every sidecar image (`service.sidecars`
+  and per-state `sidecars` overrides) must pin `digest` too
+  (`unpinned-state-image`, `unpinned-sidecar`; `-allow-unpinned` downgrades
+  them like the base).
 - `build` points at a folder inside the template with a Dockerfile; it is
   self-contained and therefore always considered pinned.
 
@@ -110,14 +116,16 @@ Preflight decisions (`vulnsuite run` / `build`):
 | Situation | Result |
 | --- | --- |
 | `arch` empty or includes the host arch | native |
-| host arch not in `arch`, `emulation` true, linux host | emulated (`--platform linux/<arch>`, with a warning) |
+| host arch not in `arch`, `emulation` true, linux host | emulated (`--platform linux/<arch>`, with a warning): images are pulled, built and run for that platform, sidecars included |
 | host arch not in `arch`, `emulation` false | skip (reason) |
 | `kvm: true` on a non-`linux/amd64` host | skip (reason) |
 | `host_os` set and the daemon OS is not in it | skip (reason) |
 
 A skipped target is reported and the rest of the batch continues;
 `-ignore-requires` runs it anyway. `list -arch <a>` hides targets that cannot
-run on that arch.
+run on that arch. The platform is decided per target, so a `build` of several
+targets emulates only those that need it; an explicit `-platform` applies to
+every target.
 
 ## `states`
 
@@ -128,7 +136,7 @@ scanner's discrimination cannot be checked). Each state:
 | --- | --- |
 | `image` / `digest` | per-state image override — the cheapest "patched": a newer tag |
 | `patch` | a git patch applied to a `source` or `build` base |
-| `overlay` | `[{ src, dest, mode }]` files from the template baked into the image (`image` base) or written into the build context (`source`/`build` base) |
+| `overlay` | `[{ src, dest, mode }]` files from the template baked into the image (`image` base) or written into the build context (`source`/`build` base). `mode` (e.g. `"0755"`) is set on the file in the build context and kept by `COPY`, so it also works on a non-root or shell-less base |
 | `environment` | baked into built images and passed at run time |
 | `command` | per-state command override |
 | `sidecars` | per-state sidecar image overrides, `{ <name>: { image, digest } }` -- swap a sidecar to another version for this state (e.g. the fixed release on every node of a multi-node cluster, which will not form across mixed versions) |
@@ -144,9 +152,14 @@ How a state's image is produced (`vulnsuite list` shows it as KIND):
 | `source` | anything | `source` | `vulnsuite/<id>:<state>-<hash>` |
 | `build` | anything | `build` | `vulnsuite/<id>:<state>-<hash>` |
 
-`<hash>` covers the base identity, the build context tree, the patch, every
-overlay's content and destination, the environment and build args. Identical
-inputs produce an identical tag and are never rebuilt.
+`<hash>` covers the base identity, the state's `image`/`digest` override
+(what an overlay build starts `FROM`), the build context tree, the patch,
+every overlay's content, destination and `mode`, the environment and build
+args. Identical inputs produce an identical tag and are never rebuilt. The
+state image and `mode` enter the hash only when set, so templates that use
+neither keep their tags. The platform is not part of the hash: an existing
+image is reused only when it was built for the platform wanted now (the
+emulation platform, else the daemon's own), otherwise it is rebuilt.
 
 ## `verify` probes
 
@@ -206,7 +219,10 @@ rather than failed; use `-expose host` or scan from a container.
 
 | Rule | Level | Meaning |
 | --- | --- | --- |
-| `unpinned-base` | error (warning with `-allow-unpinned`) | image has no digest / source has no commit |
+| `unpinned-base` | error (warning with `-allow-unpinned`) | image has no digest / source has no commit, or a commit that is not a commit id (a branch or tag) |
+| `unpinned-state-image` | error (warning with `-allow-unpinned`) | a state's `image` override has no digest |
+| `unpinned-sidecar` | error (warning with `-allow-unpinned`) | a sidecar image, or a state's sidecar override, has no digest |
+| `short-commit` | warning | `base.commit` is an abbreviated commit id; use the full SHA |
 | `missing-context`, `missing-dockerfile`, `missing-patch`, `missing-overlay` | error | a referenced file is not in the template |
 | `patch-needs-source` | error | a patch on an `image` base |
 | `empty-verify` | error | an http probe asserts nothing |

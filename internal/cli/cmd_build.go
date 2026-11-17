@@ -117,8 +117,11 @@ VULNSUITE_REGISTRY_USER / VULNSUITE_REGISTRY_TOKEN or ~/.docker/config.json.`,
 				return err
 			}
 			b := builder.New(eng)
-			// Preflight each job's target: skip unsupported hosts, emulate cross-arch.
-			platformFor := map[string]string{}
+			// Preflight each job's target: skip unsupported hosts, emulate
+			// cross-arch. The emulation platform is per job: one target needing
+			// linux/arm64 must not drag the rest of the batch along. An explicit
+			// -platform applies to every job (Options.Platform) instead.
+			emulated := map[string]bool{}
 			var kept []builder.Job
 			for _, j := range jobsList {
 				if j.Contract.Requires.Empty() {
@@ -130,22 +133,18 @@ VULNSUITE_REGISTRY_USER / VULNSUITE_REGISTRY_TOKEN or ~/.docker/config.json.`,
 					g.errorf("skip %s [%s]: %s\n", j.Contract.ID(), j.State, d.Reason)
 					continue
 				}
-				if d.Action == runner.ActionEmulated {
-					platformFor[j.Contract.ID()] = d.Platform
+				if d.Action == runner.ActionEmulated && platform == "" {
+					j.Platform = d.Platform
+					if !emulated[j.Contract.ID()] {
+						emulated[j.Contract.ID()] = true
+						g.printf("building %s under emulation for %s (host is %s/%s)\n", j.Contract.ID(), d.Platform, host.OS, host.Arch)
+					}
 				}
 				kept = append(kept, j)
 			}
 			jobsList = kept
 			if len(jobsList) == 0 {
 				return fmt.Errorf("nothing to build (all targets skipped by host requirements; -ignore-requires to override)")
-			}
-			if platform == "" && len(platformFor) > 0 {
-				// emulate: pick the single platform (targets needing emulation on
-				// this host all target the same arch).
-				for _, pf := range platformFor {
-					platform = pf
-				}
-				g.printf("building under emulation for %s (host is %s/%s)\n", platform, host.OS, host.Arch)
 			}
 			g.printf("building %d image(s) with %d worker(s)...\n", len(jobsList), jobs)
 			started := time.Now()

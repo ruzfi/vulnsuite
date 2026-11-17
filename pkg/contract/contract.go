@@ -241,15 +241,23 @@ const (
 	BaseBuild  = "build"
 )
 
-// Pinned reports whether the base is reproducible on another device.
+// Pinned reports whether the base is reproducible on another device. For a
+// source base this only checks that a commit is set; the validator also checks
+// that it is a full commit id rather than a branch or tag.
 func (b Base) Pinned() bool {
 	switch b.Kind {
 	case BaseImage:
-		return b.Digest != ""
+		return RefPinned(b.Image, b.Digest)
 	case BaseSource:
 		return b.Commit != ""
 	}
 	return true // a local build context is self-contained
+}
+
+// RefPinned reports whether an image reference is pinned to a digest, either
+// by a separate digest field or inline (image@sha256:...).
+func RefPinned(image, digest string) bool {
+	return digest != "" || strings.Contains(image, "@sha256:")
 }
 
 // ImageRef is the fully pinned image reference of an image base.
@@ -674,7 +682,15 @@ func (c *Contract) ContentHash(stateName string) string {
 	// The state name is deliberately not part of the hash: the hash is the
 	// identity of the *inputs*, so two states built from identical inputs are
 	// recognised as identical (the validator warns about that).
+	//
+	// Parts that were added after the first release (a state's image override,
+	// an overlay's mode) are appended only when set, so the tag of a template
+	// that does not use them is unchanged and no image is rebuilt needlessly.
 	parts := []string{c.Base.ContentKey()}
+	if st.Image != "" {
+		// An overlay build runs FROM the state's image, not the base's.
+		parts = append(parts, "state-image:"+st.EffectiveImage(c.Base))
+	}
 	if c.Base.Kind == BaseBuild && c.Base.Context != "" {
 		parts = append(parts, "context:"+hashTree(filepath.Join(c.Folder, c.Base.Context)))
 	}
@@ -682,7 +698,11 @@ func (c *Contract) ContentHash(stateName string) string {
 		parts = append(parts, fmt.Sprintf("patch:%s:%s", st.Patch, hashFile(filepath.Join(c.Folder, st.Patch))))
 	}
 	for _, o := range st.Overlay {
-		parts = append(parts, fmt.Sprintf("overlay:%s:%s", o.Dest, hashFile(filepath.Join(c.Folder, o.Src))))
+		part := fmt.Sprintf("overlay:%s:%s", o.Dest, hashFile(filepath.Join(c.Folder, o.Src)))
+		if o.Mode != "" {
+			part += ":mode=" + o.Mode
+		}
+		parts = append(parts, part)
 	}
 	if len(st.Environment) > 0 {
 		b, _ := json.Marshal(sortedMap(st.Environment))

@@ -21,3 +21,27 @@ func TestCappedBufferDrainsPastCap(t *testing.T) {
 		t.Fatalf("small: %q %v", small.String(), small.Truncated)
 	}
 }
+
+func TestPlatformMatches(t *testing.T) {
+	cases := []struct {
+		want, os, arch, variant string
+		ok                      bool
+	}{
+		{"", "", "", "", true},
+		{"", "linux", "arm64", "v8", true},
+		{"linux/amd64", "linux", "amd64", "", true},
+		{"linux/amd64", "linux", "x86_64", "", true},
+		{"linux/amd64", "linux", "arm64", "v8", false},
+		{"linux/amd64", "", "", "", false}, // unknown arch never satisfies an explicit platform
+		{"linux/arm64", "linux", "aarch64", "", true},
+		{"linux/arm64/v8", "linux", "arm64", "", true},
+		{"linux/arm/v7", "linux", "arm", "v6", false},
+		{"linux/arm/v7", "linux", "arm", "v7", true},
+		{"windows/amd64", "linux", "amd64", "", false},
+	}
+	for _, c := range cases {
+		if got := PlatformMatches(c.want, c.os, c.arch, c.variant); got != c.ok {
+			t.Errorf("PlatformMatches(%q, %q, %q, %q) = %v, want %v", c.want, c.os, c.arch, c.variant, got, c.ok)
+		}
+	}
+}

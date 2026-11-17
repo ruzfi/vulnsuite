@@ -29,8 +29,8 @@ func TestExecContract(t *testing.T) {
 			if _, err := eng.Ping(ctx); err != nil {
 				t.Skipf("no daemon: %v", err)
 			}
-			if ok, _ := eng.ImageExists(ctx, img); !ok {
-				if err := eng.ImagePull(ctx, img, nil); err != nil {
+			if ok, _ := eng.ImageExists(ctx, img, ""); !ok {
+				if err := eng.ImagePull(ctx, img, "", nil); err != nil {
 					t.Skipf("cannot pull %s: %v", img, err)
 				}
 				t.Cleanup(func() { _ = eng.ImageRemove(context.Background(), img, false) })

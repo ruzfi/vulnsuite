@@ -203,20 +203,65 @@ func refKey(c *contract.Contract) string {
 	return strings.Join(refs, "\x00")
 }
 
+// fullSHARe matches a full git commit id (SHA-1 or SHA-256); shortSHARe an
+// abbreviated one, which can become ambiguous as the repository grows.
+var (
+	fullSHARe  = regexp.MustCompile(`^(?i)[0-9a-f]{40}([0-9a-f]{24})?$`)
+	shortSHARe = regexp.MustCompile(`^(?i)[0-9a-f]{7,39}$`)
+)
+
+// pinning checks that every image a template runs or builds from is pinned:
+// the base (image digest / full source commit), per-state image overrides and
+// sidecar images. An unpinned ref is an error, or a warning with
+// AllowUnpinned; an abbreviated commit is always a warning.
 func (v *Validator) pinning(c *contract.Contract) []Finding {
-	if c.Base.Pinned() {
-		return nil
-	}
 	level := Error
 	if v.AllowUnpinned {
 		level = Warning
 	}
-	what := "image digest"
-	if c.Base.Kind == contract.BaseSource {
-		what = "source commit"
+	var out []Finding
+	switch {
+	case !c.Base.Pinned():
+		what := "image digest"
+		if c.Base.Kind == contract.BaseSource {
+			what = "source commit"
+		}
+		out = append(out, Finding{level, c.ID(), "unpinned-base",
+			"base has no " + what + "; a template must pin its base to be reproducible on another device"})
+	case c.Base.Kind == contract.BaseSource && fullSHARe.MatchString(c.Base.Commit):
+	case c.Base.Kind == contract.BaseSource && shortSHARe.MatchString(c.Base.Commit):
+		out = append(out, Finding{Warning, c.ID(), "short-commit",
+			fmt.Sprintf("base.commit %q is an abbreviated commit id; use the full 40-character SHA so it cannot become ambiguous", c.Base.Commit)})
+	case c.Base.Kind == contract.BaseSource:
+		out = append(out, Finding{level, c.ID(), "unpinned-base",
+			fmt.Sprintf("base.commit %q is not a commit id (a branch or tag moves); pin the full 40-character SHA", c.Base.Commit)})
 	}
-	return []Finding{{level, c.ID(), "unpinned-base",
-		"base has no " + what + "; a template must pin its base to be reproducible on another device"}}
+	for _, name := range c.DeclaredStates() {
+		st := c.States[name]
+		if st.Image != "" && !contract.RefPinned(st.Image, st.Digest) {
+			out = append(out, Finding{level, c.ID(), "unpinned-state-image",
+				fmt.Sprintf("states.%s.image %s has no digest; pin it to be reproducible on another device", name, st.Image)})
+		}
+		overrides := make([]string, 0, len(st.Sidecars))
+		for sc := range st.Sidecars {
+			overrides = append(overrides, sc)
+		}
+		sort.Strings(overrides)
+		for _, sc := range overrides {
+			ov := st.Sidecars[sc]
+			if ov.Image != "" && !contract.RefPinned(ov.Image, ov.Digest) {
+				out = append(out, Finding{level, c.ID(), "unpinned-sidecar",
+					fmt.Sprintf("states.%s.sidecars.%s image %s has no digest; pin it to be reproducible on another device", name, sc, ov.Image)})
+			}
+		}
+	}
+	for _, sc := range c.Service.Sidecars {
+		if !contract.RefPinned(sc.Image, sc.Digest) {
+			out = append(out, Finding{level, c.ID(), "unpinned-sidecar",
+				fmt.Sprintf("sidecar %s image %s has no digest; pin it to be reproducible on another device", sc.Name, sc.Image)})
+		}
+	}
+	return out
 }
 
 func (v *Validator) filesExist(c *contract.Contract) []Finding {
