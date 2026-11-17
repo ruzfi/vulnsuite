@@ -383,7 +383,11 @@ Exposure modes:
 				}
 				g.printf("  image: %s (%s)\n", h.Image.Ref, verb)
 				if !h.Ready {
-					g.printf("  ready: NO -- the healthcheck did not pass in time\n")
+					why := h.ReadyDetail
+					if why == "" {
+						why = "the healthcheck did not pass in time"
+					}
+					g.printf("  ready: NO -- %s\n", strings.ReplaceAll(why, "\n", "\n      "))
 				}
 				if noVerify {
 					// verify folds seed failures into its detail; without it, say so here.

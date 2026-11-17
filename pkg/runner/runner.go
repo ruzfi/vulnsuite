@@ -133,6 +133,13 @@ type Handle struct {
 	IP             string `json:"ip,omitempty"` // container ip (internal/macvlan)
 	Scheme         string `json:"scheme"`       // http | https | "" (raw tcp)
 	Ready          bool   `json:"ready"`
+	// ReadyDetail says why the target is not ready (the container exited, or
+	// the healthcheck did not pass in time) with the last container log lines.
+	// Empty when ready.
+	ReadyDetail string `json:"ready_detail,omitempty"`
+	// ExitCode is the container's exit code when it exited before it was
+	// ready (nil while it runs).
+	ExitCode *int `json:"exit_code,omitempty"`
 	// DaemonRemote is set when the engine talks to a daemon on another machine;
 	// then a host-published port on the daemon's loopback cannot be reached from
 	// here, which changes how readiness and verification are reported.
@@ -166,7 +173,11 @@ type SeedResult struct {
 func (h *Handle) Problem() string {
 	var why []string
 	if !h.Ready {
-		why = append(why, "not ready")
+		if h.ExitCode != nil {
+			why = append(why, fmt.Sprintf("not ready: container exited with code %d", *h.ExitCode))
+		} else {
+			why = append(why, "not ready")
+		}
 	}
 	for _, s := range h.Seeds {
 		if !s.OK && !s.Skipped { // a skip follows a failure or "not ready", already reported
@@ -326,7 +337,14 @@ type Runner struct {
 	// Reach decides whether a container address is routable from this host
 	// (default probes.Reachability; tests override it).
 	Reach func(host string, port int, timeout time.Duration) probes.Reach
+	// ExitPoll is how often awaitReady checks whether the container has
+	// exited (default 1s; tests shorten it).
+	ExitPoll time.Duration
 }
+
+// readyLogLines is how many trailing container log lines a not-ready target
+// reports.
+const readyLogLines = 20
 
 // New returns a Runner on eng.
 func New(eng engine.Engine) *Runner {
@@ -785,15 +803,84 @@ func (r *Runner) probeAddress(h *Handle, c *contract.Contract) (string, int) {
 	return "", 0
 }
 
+// awaitReady waits for the target's healthcheck. It stops early when the
+// container exits (a crash on boot need not cost the whole ready timeout), and
+// a target that is not ready gets a ReadyDetail with the reason and the last
+// container log lines.
 func (r *Runner) awaitReady(ctx context.Context, c *contract.Contract, h *Handle, override time.Duration) {
-	hc := c.Service.Healthcheck
-	timeout, err := contract.ParseDuration(hc.Timeout, 60*time.Second)
+	timeout, err := contract.ParseDuration(c.Service.Healthcheck.Timeout, 60*time.Second)
 	if err != nil {
 		timeout = 60 * time.Second
 	}
 	if override > 0 {
 		timeout = override
 	}
+	wctx, cancel := context.WithCancel(ctx)
+	exited := make(chan *engine.ContainerDetail, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.watchExit(wctx, h.Container, exited, cancel)
+	}()
+	r.waitReady(wctx, c, h, timeout)
+	cancel()
+	<-done
+	if h.Ready {
+		return
+	}
+	var det *engine.ContainerDetail
+	select {
+	case det = <-exited:
+	default:
+		// The wait ended for another reason; the container may still have
+		// exited in the meantime.
+		if d, err := r.Engine.ContainerInspect(ctx, h.Container); err == nil && !d.Running {
+			det = d
+		}
+	}
+	if det != nil {
+		code := det.ExitCode
+		h.ExitCode = &code
+		h.ReadyDetail = fmt.Sprintf("the container exited with code %d before it was ready", code)
+	} else if ctx.Err() != nil {
+		h.ReadyDetail = "cancelled before the target was ready"
+		return
+	} else {
+		h.ReadyDetail = fmt.Sprintf("the healthcheck did not pass within %s", timeout)
+	}
+	if logs, err := r.Engine.ContainerLogs(ctx, h.Container, readyLogLines); err == nil {
+		if logs = strings.TrimRight(logs, "\n"); strings.TrimSpace(logs) != "" {
+			h.ReadyDetail += fmt.Sprintf("; last %d log lines:\n%s", readyLogLines, logs)
+		}
+	}
+}
+
+// watchExit polls the container until ctx ends; when it is no longer running
+// it sends the detail on exited and calls stop.
+func (r *Runner) watchExit(ctx context.Context, container string, exited chan<- *engine.ContainerDetail, stop context.CancelFunc) {
+	every := r.ExitPoll
+	if every <= 0 {
+		every = time.Second
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		det, err := r.Engine.ContainerInspect(ctx, container)
+		if err == nil && !det.Running {
+			exited <- det
+			stop()
+			return
+		}
+	}
+}
+
+func (r *Runner) waitReady(ctx context.Context, c *contract.Contract, h *Handle, timeout time.Duration) {
+	hc := c.Service.Healthcheck
 	running := func() bool {
 		det, err := r.Engine.ContainerInspect(ctx, h.Container)
 		return err == nil && det.Running
@@ -801,14 +888,14 @@ func (r *Runner) awaitReady(ctx context.Context, c *contract.Contract, h *Handle
 	host, port := r.probeAddress(h, c)
 	if host == "" {
 		// Cannot reach it from here; the engine says whether it's running.
-		time.Sleep(2 * time.Second)
+		sleepCtx(ctx, 2*time.Second)
 		h.Ready = running()
 		return
 	}
 	if probeFromHereFutile(h) {
 		// A remote daemon's loopback-published port never comes up here; don't
 		// burn the whole healthcheck timeout against it. verify explains.
-		time.Sleep(time.Second)
+		sleepCtx(ctx, time.Second)
 		h.Ready = running()
 		return
 	}
@@ -823,7 +910,7 @@ func (r *Runner) awaitReady(ctx context.Context, c *contract.Contract, h *Handle
 			reach = probes.Reachability
 		}
 		if reach(host, port, 2*time.Second) == probes.Unreachable {
-			time.Sleep(time.Second)
+			sleepCtx(ctx, time.Second)
 			if reach(host, port, 2*time.Second) == probes.Unreachable {
 				if h.Exposure.Mode != ModeHost {
 					h.IP = "" // verify will explain instead of failing
@@ -856,6 +943,16 @@ func (r *Runner) awaitReady(ctx context.Context, c *contract.Contract, h *Handle
 		h.Ready = probes.WaitForPort(ctx, host, hcPort, time.Until(deadline))
 	default:
 		h.Ready = probes.WaitForPort(ctx, host, port, time.Until(deadline))
+	}
+}
+
+// sleepCtx sleeps for d or until ctx ends.
+func sleepCtx(ctx context.Context, d time.Duration) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
 	}
 }
 

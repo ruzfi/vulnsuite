@@ -33,7 +33,10 @@ type Container struct {
 	ID      string
 	Spec    engine.ContainerSpec
 	Running bool
-	IP      string
+	// ExitCode is reported by ContainerInspect once the container has exited
+	// (see Exit).
+	ExitCode int
+	IP       string
 	// Networks are further networks attached with NetworkConnect.
 	Networks []engine.NetworkAttachment
 }
@@ -328,7 +331,7 @@ func (f *Fake) ContainerInspect(_ context.Context, id string) (*engine.Container
 	if c == nil {
 		return nil, fmt.Errorf("no such container %s", id)
 	}
-	d := &engine.ContainerDetail{ID: c.ID, Name: c.Spec.Name, Image: c.Spec.Image, Running: c.Running, IPs: map[string]string{}, Ports: map[string]engine.HostBinding{}}
+	d := &engine.ContainerDetail{ID: c.ID, Name: c.Spec.Name, Image: c.Spec.Image, Running: c.Running, ExitCode: c.ExitCode, IPs: map[string]string{}, Ports: map[string]engine.HostBinding{}}
 	if c.Spec.Network != nil {
 		d.IPs[c.Spec.Network.Name] = c.IP
 	}
@@ -350,6 +353,16 @@ func (f *Fake) ContainerExec(_ context.Context, id, command string, _ time.Durat
 		return fn(id, command)
 	}
 	return 0, "", nil
+}
+
+// Exit marks a container as exited with code, as if its process ended.
+func (f *Fake) Exit(idOrName string, code int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if c := f.byIDOrName(idOrName); c != nil {
+		c.Running = false
+		c.ExitCode = code
+	}
 }
 
 func (f *Fake) ContainerLogs(_ context.Context, id string, _ int) (string, error) {
