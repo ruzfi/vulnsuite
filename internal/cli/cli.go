@@ -199,9 +199,8 @@ func mainWithEngine(ctx context.Context, eng engine.Engine, args []string, stdou
 	if cmd.Flags != nil {
 		cmd.Flags(fs)
 	}
-	// `run vulnerable -t x`: let the command take leading positionals before flags.
-	positional, flagArgs := splitLeadingPositionals(rest[1:])
-	if err := fs.Parse(flagArgs); err != nil {
+	argv, err := parseInterleaved(fs, rest[1:])
+	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			printCommandHelp(stdout, cmd)
 			return ExitOK
@@ -209,7 +208,6 @@ func mainWithEngine(ctx context.Context, eng engine.Engine, args []string, stdou
 		fmt.Fprintf(stderr, "vulnsuite %s: %v\n", cmd.Name, err)
 		return ExitUsage
 	}
-	argv := append(positional, fs.Args()...)
 	if err := cmd.Run(ctx, g, fs, argv); err != nil {
 		var ue usageError
 		if errors.As(err, &ue) {
@@ -226,9 +224,36 @@ func mainWithEngine(ctx context.Context, eng engine.Engine, args []string, stdou
 	return ExitOK
 }
 
+// parseInterleaved parses a command's flags wherever they appear among its
+// positionals (`run grafana patched -detach`, `build patched -t x`), returning
+// the positionals in order. The stdlib parser stops at the first positional;
+// this resumes after each run of positionals. A "--" ends flag parsing: what
+// follows is positional, verbatim.
+func parseInterleaved(fs *flag.FlagSet, args []string) ([]string, error) {
+	positional, flagArgs := splitLeadingPositionals(args)
+	for len(flagArgs) > 0 {
+		if err := fs.Parse(flagArgs); err != nil {
+			return nil, err
+		}
+		left := fs.Args()
+		if consumed := len(flagArgs) - len(left); consumed > 0 && flagArgs[consumed-1] == "--" {
+			return append(positional, left...), nil
+		}
+		var pos []string
+		pos, flagArgs = splitLeadingPositionals(left)
+		if len(pos) == 0 { // no progress; cannot happen, but never spin
+			return append(positional, flagArgs...), nil
+		}
+		positional = append(positional, pos...)
+	}
+	return positional, nil
+}
+
+// splitLeadingPositionals splits off the positionals before the first flag.
+// A lone "-" is a positional, as it is to the flag package.
 func splitLeadingPositionals(args []string) (pos, rest []string) {
 	for i, a := range args {
-		if strings.HasPrefix(a, "-") {
+		if len(a) > 1 && a[0] == '-' {
 			return args[:i], args[i:]
 		}
 	}

@@ -83,7 +83,8 @@ func cmdRun() *Command {
 		Name:  "run",
 		Short: "build if needed, then run target(s) in a state and verify them",
 		Usage: "[vulnerable|patched] -t SEL... | -f FILE | <filter> | -all [-variants] [-expose MODE] [-detach] [-targets-file FILE]",
-		Long: `Stands targets up (default state: vulnerable), waits until they are ready,
+		Long: `Stands targets up (default state: vulnerable; give vulnerable or patched
+anywhere among the arguments, e.g. ` + "`run grafana patched`" + `), waits until they are ready,
 and runs each state's verify probes so you know the target is genuinely in the
 declared state before you scan it. Many targets can run at once; each gets its
 own IP on the internal network. Without -detach the command holds the batch
@@ -133,10 +134,12 @@ Exposure modes:
 			if pinned && exp.Mode != runner.ModeHost {
 				return usageError{"-host-port / -host-port-map need -expose host"}
 			}
-			state := contract.StateVulnerable
-			if len(args) > 0 && has(contract.StateNames, args[0]) {
-				state = args[0]
-				args = args[1:]
+			state, args, err := takeState(args)
+			if err != nil {
+				return err
+			}
+			if state == "" {
+				state = contract.StateVulnerable
 			}
 			sel = append(sel, args...)
 			store, err := g.Store()
