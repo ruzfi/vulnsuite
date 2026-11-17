@@ -692,13 +692,13 @@ func (c *Contract) ContentHash(stateName string) string {
 		parts = append(parts, "state-image:"+st.EffectiveImage(c.Base))
 	}
 	if c.Base.Kind == BaseBuild && c.Base.Context != "" {
-		parts = append(parts, "context:"+hashTree(filepath.Join(c.Folder, c.Base.Context)))
+		parts = append(parts, "context:"+hashTree(c.hashPath(c.Base.Context)))
 	}
 	if st.Patch != "" {
-		parts = append(parts, fmt.Sprintf("patch:%s:%s", st.Patch, hashFile(filepath.Join(c.Folder, st.Patch))))
+		parts = append(parts, fmt.Sprintf("patch:%s:%s", st.Patch, hashFile(c.hashPath(st.Patch))))
 	}
 	for _, o := range st.Overlay {
-		part := fmt.Sprintf("overlay:%s:%s", o.Dest, hashFile(filepath.Join(c.Folder, o.Src)))
+		part := fmt.Sprintf("overlay:%s:%s", o.Dest, hashFile(c.hashPath(o.Src)))
 		if o.Mode != "" {
 			part += ":mode=" + o.Mode
 		}
@@ -767,7 +767,20 @@ func sortedMap(m map[string]string) map[string]string {
 	return m
 }
 
+// hashPath resolves a template path for hashing; a path that escapes the
+// template folder hashes as missing rather than reading a host file.
+func (c *Contract) hashPath(rel string) string {
+	p, err := c.TemplatePath(rel)
+	if err != nil && p == "" {
+		return ""
+	}
+	return p
+}
+
 func hashFile(path string) string {
+	if path == "" {
+		return "missing"
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return "missing"
@@ -778,6 +791,9 @@ func hashFile(path string) string {
 
 // hashTree hashes a directory tree's relative paths and contents.
 func hashTree(root string) string {
+	if root == "" {
+		return "missing"
+	}
 	info, err := os.Stat(root)
 	if err != nil || !info.IsDir() {
 		return "missing"

@@ -8,8 +8,11 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/ruzfi/vulnsuite/pkg/contract"
 )
 
 // memContext is an in-memory build context, written out as a tar stream.
@@ -83,11 +86,20 @@ func (m *memContext) tar() io.Reader {
 
 // overlayDockerfile generates the tiny Dockerfile that bakes overlay files and
 // environment into a prebuilt image, so the running container needs no volume
-// mounts and the result is a portable image.
-func overlayDockerfile(baseRef string, overlays []overlayEntry, env map[string]string) string {
+// mounts and the result is a portable image. esc is the Dockerfile escape
+// character in effect where the lines end up.
+//
+// Every value is template-controlled, so nothing may break out of its line:
+// dest is re-checked (a plain path, no whitespace or shell metacharacters),
+// env keys/values may not contain control characters, and values are quoted
+// with $ escaped so they are baked literally.
+func overlayDockerfile(baseRef string, overlays []overlayEntry, env map[string]string, esc rune) (string, error) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "FROM %s\n", baseRef)
 	for _, o := range overlays {
+		if err := contract.CheckOverlayDest(o.dest, true); err != nil {
+			return "", fmt.Errorf("overlay dest %q: %w", o.dest, err)
+		}
 		// The file's mode is set in the build-context tar header and COPY
 		// keeps it, so no RUN chmod (which fails on non-root or shell-less bases).
 		fmt.Fprintf(&b, "COPY %s %s\n", o.local, o.dest)
@@ -98,19 +110,49 @@ func overlayDockerfile(baseRef string, overlays []overlayEntry, env map[string]s
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		fmt.Fprintf(&b, "ENV %s=%s\n", k, dockerfileQuote(env[k]))
+		if err := contract.CheckEnv(k, env[k]); err != nil {
+			return "", fmt.Errorf("environment: %w", err)
+		}
+		fmt.Fprintf(&b, "ENV %s=%s\n", k, dockerfileQuote(env[k], esc))
 	}
-	return b.String()
+	return b.String(), nil
 }
+
+var modeRe = regexp.MustCompile(`^0[0-7]{3}$`)
 
 type overlayEntry struct {
 	local string // file name inside the build context
 	dest  string // absolute path inside the image
 }
 
-func dockerfileQuote(v string) string {
-	if strings.ContainsAny(v, " \t\"\\$") {
-		return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(v) + `"`
+// plainValueRe is an ENV value that needs no quoting.
+var plainValueRe = regexp.MustCompile(`^[A-Za-z0-9_./:@%+,=-]*$`)
+
+// dockerfileQuote renders an ENV value so the Dockerfile parser reads it back
+// literally: anything beyond a plain token is double-quoted, and the escape
+// character, '"' and '$' (variable expansion) are escaped with esc.
+func dockerfileQuote(v string, esc rune) string {
+	if plainValueRe.MatchString(v) && v != "" {
+		return v
 	}
-	return v
+	e := string(esc)
+	return `"` + strings.NewReplacer(e, e+e, `"`, e+`"`, `$`, e+`$`).Replace(v) + `"`
+}
+
+// directiveRe matches a Dockerfile parser directive line ("# escape=`").
+var directiveRe = regexp.MustCompile(`^#\s*([A-Za-z][A-Za-z0-9_-]*)\s*=\s*(\S+)\s*$`)
+
+// escapeToken returns the escape character a Dockerfile declares with the
+// "# escape=" parser directive, or the default backslash.
+func escapeToken(dockerfile []byte) rune {
+	for _, line := range strings.Split(string(dockerfile), "\n") {
+		m := directiveRe.FindStringSubmatch(strings.TrimSpace(strings.TrimPrefix(line, "\ufeff")))
+		if m == nil {
+			break // directives only appear before any other line
+		}
+		if strings.EqualFold(m[1], "escape") && m[2] == "`" {
+			return '`'
+		}
+	}
+	return '\\'
 }

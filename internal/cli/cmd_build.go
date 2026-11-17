@@ -104,7 +104,10 @@ for -state: ` + "`build patched -t grafana`" + `.
 
 With -push, each image is also tagged <registry>/<id>:<state> and
 <registry>/<id>:<state>-<hash> and pushed. Credentials come from
-VULNSUITE_REGISTRY_USER / VULNSUITE_REGISTRY_TOKEN or ~/.docker/config.json.`,
+~/.docker/config.json or VULNSUITE_REGISTRY_USER / VULNSUITE_REGISTRY_TOKEN.
+The env pair is only sent when pushing, never on pulls of template images,
+unless VULNSUITE_REGISTRY names a registry: then it is used for that registry
+only (pulls and pushes).`,
 		Flags: func(fs *flag.FlagSet) {
 			fs.Var(&sel, "t", "template selector: id, group handle, folder, file or suite:<name> (repeatable)")
 			fs.Var(&files, "f", "read selectors from a file, one per line (# comments allowed); repeatable")

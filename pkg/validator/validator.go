@@ -4,6 +4,7 @@
 package validator
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -269,34 +270,69 @@ func (v *Validator) pinning(c *contract.Contract) []Finding {
 
 func (v *Validator) filesExist(c *contract.Contract) []Finding {
 	var out []Finding
-	isFile := func(rel string) bool {
-		info, err := os.Stat(filepath.Join(c.Folder, filepath.FromSlash(rel)))
-		return err == nil && info.Mode().IsRegular()
+	// resolve confines a template path to the folder (following symlinks);
+	// a path that escapes it is reported once as path-escapes-template.
+	escapes := func(what, rel string) {
+		out = append(out, Finding{Error, c.ID(), "path-escapes-template",
+			fmt.Sprintf("%s %s resolves outside the template folder (a symlink or .. path); templates may only reference their own files", what, rel)})
+	}
+	// isFile reports a regular file inside the folder; ok is false when the
+	// path escapes (already reported).
+	isFile := func(what, rel string) (found, ok bool) {
+		p, err := c.TemplatePath(rel)
+		if errors.Is(err, contract.ErrPathEscapes) {
+			escapes(what, rel)
+			return false, false
+		}
+		if err != nil {
+			return false, true
+		}
+		info, err := os.Stat(p)
+		return err == nil && info.Mode().IsRegular(), true
 	}
 	if c.Base.Kind == contract.BaseBuild {
-		ctx := filepath.Join(c.Folder, filepath.FromSlash(c.Base.Context))
-		if info, err := os.Stat(ctx); err != nil || !info.IsDir() {
+		ctx, err := c.TemplatePath(c.Base.Context)
+		switch {
+		case errors.Is(err, contract.ErrPathEscapes):
+			escapes("build context", c.Base.Context)
+		case err != nil:
 			out = append(out, Finding{Error, c.ID(), "missing-context",
 				"build context " + c.Base.Context + " not found in the template folder"})
-		} else {
+		default:
+			if info, err := os.Stat(ctx); err != nil || !info.IsDir() {
+				out = append(out, Finding{Error, c.ID(), "missing-context",
+					"build context " + c.Base.Context + " not found in the template folder"})
+				break
+			}
 			df := c.Base.Dockerfile
 			if df == "" {
 				df = "Dockerfile"
 			}
-			if _, err := os.Stat(filepath.Join(ctx, filepath.FromSlash(df))); err != nil {
+			p, err := contract.ConfinedPath(ctx, df)
+			switch {
+			case errors.Is(err, contract.ErrPathEscapes):
+				escapes("dockerfile", df)
+			case err != nil:
 				out = append(out, Finding{Error, c.ID(), "missing-dockerfile",
 					"build context has no " + df})
+			default:
+				if info, err := os.Stat(p); err != nil || !info.Mode().IsRegular() {
+					out = append(out, Finding{Error, c.ID(), "missing-dockerfile",
+						"build context has no " + df})
+				}
 			}
 		}
 	}
 	for _, name := range c.DeclaredStates() {
 		st := c.States[name]
-		if st.Patch != "" && !isFile(st.Patch) {
-			out = append(out, Finding{Error, c.ID(), "missing-patch",
-				fmt.Sprintf("%s: patch %s not found in the template folder", name, st.Patch)})
+		if st.Patch != "" {
+			if found, ok := isFile(name+": patch", st.Patch); ok && !found {
+				out = append(out, Finding{Error, c.ID(), "missing-patch",
+					fmt.Sprintf("%s: patch %s not found in the template folder", name, st.Patch)})
+			}
 		}
 		for _, o := range st.Overlay {
-			if !isFile(o.Src) {
+			if found, ok := isFile(name+": overlay source", o.Src); ok && !found {
 				out = append(out, Finding{Error, c.ID(), "missing-overlay",
 					fmt.Sprintf("%s: overlay source %s not found", name, o.Src)})
 			}

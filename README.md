@@ -303,6 +303,17 @@ Built images carry labels (`dev.vulnsuite.id`, `.state`, `.hash`,
 self-contained: `docker run ghcr.io/you/vulnsuite/<id>:vulnerable` is the
 vulnerable target, no vulnsuite needed.
 
+Push credentials come from `~/.docker/config.json` (or its credential
+helpers), or from `VULNSUITE_REGISTRY_USER` / `VULNSUITE_REGISTRY_TOKEN`. The
+env pair names no registry, so it is scoped: by default it is sent **only when
+pushing** to `-registry`, never when pulling the base or sidecar images a
+template names. Set `VULNSUITE_REGISTRY` (a host such as `ghcr.io`, or the
+`-registry` prefix) to also use it for pulls from that registry; it is then
+used for that registry only, pulls and pushes alike. `docker.io` (or a Hub
+prefix such as `docker.io/you`) matches every Docker Hub reference, bare ones
+like `nginx:1.25` included. The pair is never put in a build's registry
+config.
+
 ### Running and verifying
 
 ```bash

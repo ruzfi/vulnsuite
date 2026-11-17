@@ -3,8 +3,8 @@ package contract
 import (
 	"errors"
 	"fmt"
-	"path"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/goccy/go-yaml"
@@ -244,14 +244,19 @@ func (c *Contract) checkStructure() error {
 		if b.Image != "" || b.Digest != "" || b.Repo != "" || b.Commit != "" {
 			return se("base", "kind: build allows only context, dockerfile, build_args")
 		}
-		if path.IsAbs(b.Context) || strings.HasPrefix(path.Clean(b.Context), "..") {
-			return se("base/context", "must be a relative path inside the template folder")
+		if err := checkLocalPath(b.Context); err != nil {
+			return se("base/context", "%q %v", b.Context, err)
 		}
 	default:
 		return se("base/kind", "%q is not one of image, source, build", b.Kind)
 	}
 	if b.Digest != "" && !digestRe.MatchString(b.Digest) {
 		return se("base/digest", "must look like sha256:<64 hex>")
+	}
+	if b.Dockerfile != "" {
+		if err := checkLocalPath(b.Dockerfile); err != nil {
+			return se("base/dockerfile", "%q %v", b.Dockerfile, err)
+		}
 	}
 
 	for i, o := range c.Requires.HostOS {
@@ -335,12 +340,28 @@ func (c *Contract) checkStructure() error {
 		if st.Digest != "" && !digestRe.MatchString(st.Digest) {
 			return se(loc+"/digest", "must look like sha256:<64 hex>")
 		}
+		if st.Patch != "" {
+			if err := checkLocalPath(st.Patch); err != nil {
+				return se(loc+"/patch", "%q %v", st.Patch, err)
+			}
+		}
 		for i, o := range st.Overlay {
 			if o.Src == "" || o.Dest == "" {
 				return se(fmt.Sprintf("%s/overlay/%d", loc, i), "src and dest are required")
 			}
+			if err := checkLocalPath(o.Src); err != nil {
+				return se(fmt.Sprintf("%s/overlay/%d/src", loc, i), "%q %v", o.Src, err)
+			}
+			if err := checkOverlayDest(o.Dest, b.Kind == BaseImage); err != nil {
+				return se(fmt.Sprintf("%s/overlay/%d/dest", loc, i), "%q %v", o.Dest, err)
+			}
 			if o.Mode != "" && !modeRe.MatchString(o.Mode) {
 				return se(fmt.Sprintf("%s/overlay/%d/mode", loc, i), "must be an octal mode like 0644")
+			}
+		}
+		for _, k := range sortedKeys(st.Environment) {
+			if err := CheckEnv(k, st.Environment[k]); err != nil {
+				return se(loc+"/environment", "%v", err)
 			}
 		}
 		for scName, ov := range st.Sidecars {
@@ -441,4 +462,13 @@ func dangerousDevice(d string) bool {
 		}
 	}
 	return false
+}
+
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }

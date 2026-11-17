@@ -129,7 +129,7 @@ func (c *Client) ImagePush(ctx context.Context, ref string, out io.Writer) error
 	if tag != "" {
 		q.Set("tag", tag)
 	}
-	auth := registryauth.For(ref)
+	auth := registryauth.ForPush(ref)
 	if auth == "" {
 		auth = registryauth.Empty()
 	}

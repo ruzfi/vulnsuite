@@ -159,7 +159,7 @@ func (e *Engine) ImageTag(ctx context.Context, source, target string) error {
 }
 
 func (e *Engine) ImagePush(ctx context.Context, ref string, out io.Writer) error {
-	auth := registryauth.For(ref)
+	auth := registryauth.ForPush(ref)
 	if auth == "" {
 		auth, _ = authconfig.Encode(registry.AuthConfig{})
 	}

@@ -30,7 +30,7 @@ var supportedKeywords = map[string]bool{
 	"properties": true, "additionalProperties": true, "required": true,
 	"minProperties": true, "maxProperties": true,
 	"items": true, "minItems": true, "uniqueItems": true,
-	"pattern": true, "minLength": true, "maxLength": true,
+	"pattern": true, "minLength": true, "maxLength": true, "propertyNames": true,
 	"minimum": true, "maximum": true, "exclusiveMinimum": true,
 	"oneOf": true, "$ref": true, "$defs": true,
 	// annotations
@@ -350,6 +350,11 @@ func schemaCheck(root, s map[string]any, v any, loc string) []string {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
+		if pn, ok := s["propertyNames"].(map[string]any); ok {
+			for _, k := range keys {
+				errs = append(errs, schemaCheck(root, pn, k, loc+"/"+k+" (name)")...)
+			}
+		}
 		for _, k := range keys {
 			if ps, ok := props[k].(map[string]any); ok {
 				errs = append(errs, schemaCheck(root, ps, x[k], loc+"/"+k)...)
@@ -384,7 +389,7 @@ func schemaCheck(root, s map[string]any, v any, loc string) []string {
 		}
 	case string:
 		if p, ok := s["pattern"].(string); ok {
-			if !regexp.MustCompile(p).MatchString(x) {
+			if re := schemaRegexp(p); re != nil && !re.MatchString(x) {
 				fail("%q does not match %s", x, p)
 			}
 		}
@@ -431,3 +436,18 @@ func resolveRef(root map[string]any, ref string) map[string]any {
 	m, _ := cur.(map[string]any)
 	return m
 }
+
+// schemaRegexp compiles a JSON-Schema (ECMA-262) pattern with Go's regexp,
+// rewriting the \uXXXX escapes ECMA-262 allows into Go's \x{XXXX}. It returns
+// nil for a pattern RE2 cannot express (the template-path patterns use
+// lookaheads); those rules are enforced and tested on the decoder side
+// (TestParseRejectsEscapingPaths, TestConfinedPath), so this checker skips them.
+func schemaRegexp(p string) *regexp.Regexp {
+	re, err := regexp.Compile(ecmaUnicodeEscape.ReplaceAllString(p, `\x{$1}`))
+	if err != nil {
+		return nil
+	}
+	return re
+}
+
+var ecmaUnicodeEscape = regexp.MustCompile(`\\u([0-9A-Fa-f]{4})`)

@@ -136,8 +136,8 @@ scanner's discrimination cannot be checked). Each state:
 | --- | --- |
 | `image` / `digest` | per-state image override — the cheapest "patched": a newer tag |
 | `patch` | a git patch applied to a `source` or `build` base |
-| `overlay` | `[{ src, dest, mode }]` files from the template baked into the image (`image` base) or written into the build context (`source`/`build` base). `mode` (e.g. `"0755"`) is set on the file in the build context and kept by `COPY`, so it also works on a non-root or shell-less base |
-| `environment` | baked into built images and passed at run time |
+| `overlay` | `[{ src, dest, mode }]` files from the template baked into the image (`image` base) or written into the build context (`source`/`build` base). `src` is relative to the template folder; `dest` is an absolute path in the image for an `image` base, or a path in the build context for a `source`/`build` base. `mode` (e.g. `"0755"`) is set on the file in the build context and kept by `COPY`, so it also works on a non-root or shell-less base. See **Paths** below. |
+| `environment` | baked into built images and passed at run time. Names must match `^[A-Za-z_][A-Za-z0-9_.-]*$`; values may not contain newlines or other control characters (they become Dockerfile `ENV` lines; `$` is kept literally). |
 | `command` | per-state command override |
 | `sidecars` | per-state sidecar image overrides, `{ <name>: { image, digest } }` -- swap a sidecar to another version for this state (e.g. the fixed release on every node of a multi-node cluster, which will not form across mixed versions) |
 | `seed` | `[{ run: "..." }]` shell steps executed inside the container once it is ready (skipped if it never becomes ready). A step that exits non-zero stops the rest, fails verify and fails `run` |
@@ -209,6 +209,24 @@ template says. Chunked responses are decoded. `https` ports skip certificate
 verification. A `status`-only assertion on the vulnerable state is a
 `weak-verify` warning: assert the body or a header.
 
+### Paths
+
+Templates are untrusted input, so every file a template references must be its
+own:
+
+- `overlay[].src`, `patch`, `base.context` and `base.dockerfile` are relative
+  paths inside the template folder (`base.dockerfile` inside the context).
+  Absolute paths (`/etc/x`, `C:/x`), `..` segments and control characters are
+  schema errors. A symlink is allowed only when its target is inside the template
+  folder too; one pointing elsewhere is refused at build time and reported by
+  `validate` as `path-escapes-template`.
+- `overlay[].dest` is a plain path: letters, digits and `. _ @ % + = : , / -`,
+  no whitespace, quotes, `$` or control characters, no `..` segments, and not
+  `/` itself. For an `image` base it must be absolute.
+- `overlay[].mode` is four octal digits starting with `0` (`"0755"`): plain
+  permission bits only, no setuid, setgid or sticky bit. It is set on the file
+  in the build context's tar header, never through a generated `RUN` line.
+
 Probes run from the vulnsuite host against the container's IP (internal /
 macvlan) or the published port (host). Where the host cannot route to
 container IPs (Docker Desktop), verification is skipped with an explanation
@@ -225,6 +243,7 @@ rather than failed; use `-expose host` or scan from a container.
 | `unpinned-sidecar` | error (warning with `-allow-unpinned`) | a sidecar image, or a state's sidecar override, has no digest |
 | `short-commit` | warning | `base.commit` is an abbreviated commit id; use the full SHA |
 | `missing-context`, `missing-dockerfile`, `missing-patch`, `missing-overlay` | error | a referenced file is not in the template |
+| `path-escapes-template` | error | a referenced path resolves (through a symlink) outside the template folder |
 | `patch-needs-source` | error | a patch on an `image` base |
 | `empty-verify` | error | an http probe asserts nothing |
 | `bad-regex`, `bad-timeout` | error | malformed values |

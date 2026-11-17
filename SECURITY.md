@@ -29,8 +29,38 @@ vulnsuite stands up **knowingly vulnerable** targets. Two trust boundaries matte
   runs **without** `--unsafe-paths` (so it confines to the working tree) and the
   GNU `patch` fallback uses `--no-absolute-filenames`. Without this, a crafted
   patch could write `~/.ssh/authorized_keys` or a cron entry on the host.
+- **template paths cannot leave the template folder.** Overlay `src`, `patch`,
+  `base.context` and `base.dockerfile` must be relative paths; absolute paths
+  (POSIX or Windows) and `..` segments are rejected when the contract is
+  parsed. At build time every path is resolved with its symlinks followed and
+  must still be inside the (resolved) template folder, so a symlink such as
+  `files/app.conf -> ~/.aws/credentials` is refused instead of being baked into
+  an image (`vulnsuite validate` reports it as `path-escapes-template`). The
+  build-context walk never follows or includes symlinks.
+- **generated Dockerfile lines cannot be injected into.** Overlay `dest` must be
+  a plain path (letters, digits and `. _ @ % + = : , / -`; absolute for an
+  image base; no `..` segments), state environment names must be plain
+  variable names, and values may not contain newlines or other control
+  characters. Values are double-quoted with `"`, `$` and the escape character
+  escaped (honouring a Dockerfile's `# escape=` directive), so `pa$word` is
+  baked literally. Without this a `dest` or env value containing `\nRUN ...`
+  would add build instructions to a "no code" overlay build.
 - Build steps (`Dockerfile` `RUN`, overlays, `seed`) execute inside the
   container/build sandbox, not on the host.
+
+### Registry credentials
+
+- `VULNSUITE_REGISTRY_USER` / `VULNSUITE_REGISTRY_TOKEN` name no registry, and
+  templates choose which images are pulled, so the pair is scoped: it is sent
+  only when **pushing** (to the `-registry` the user chose), never on pulls of
+  base or sidecar images. If `VULNSUITE_REGISTRY` is set (a host such as
+  `ghcr.io`, or a repository prefix), the pair is used for that registry only,
+  pulls and pushes alike, and never for any other (Docker Hub matches however
+  it is spelt: `docker.io`, `index.docker.io`, or a bare `nginx:1.25`). The
+  pair is never included in the registry config sent with a build, whose
+  Dockerfile pulls are template-chosen too. Credentials from
+  `~/.docker/config.json` and credential helpers are keyed by registry and are
+  used as the docker CLI would.
 
 ### Run time
 

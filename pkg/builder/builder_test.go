@@ -173,7 +173,10 @@ func TestResolveAllParallelAndPublish(t *testing.T) {
 }
 
 func TestOverlayDockerfileQuoting(t *testing.T) {
-	df := overlayDockerfile("img:1", []overlayEntry{{local: "f", dest: "/etc/f"}}, map[string]string{"B": "x y", "A": `q"uote`})
+	df, err := overlayDockerfile("img:1", []overlayEntry{{local: "f", dest: "/etc/f"}}, map[string]string{"B": "x y", "A": `q"uote`}, '\\')
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := "FROM img:1\nCOPY f /etc/f\nENV A=\"q\\\"uote\"\nENV B=\"x y\"\n"
 	if df != want {
 		t.Fatalf("got:\n%s\nwant:\n%s", df, want)

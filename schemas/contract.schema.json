@@ -183,7 +183,9 @@
               "description": "Pinned commit -- an RC or unreleased vulnerable revision. Must be a full 40-character (or 64-character SHA-256) commit id: `validate` reports a branch or tag as unpinned-base and an abbreviated id as short-commit."
             },
             "dockerfile": {
-              "type": "string"
+              "type": "string",
+              "pattern": "^(?![/\\\\]|[A-Za-z]:)(?!(.*[/\\\\])?\\.\\.([/\\\\]|$))[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]+$",
+              "description": "Dockerfile path inside the build context. Relative to the template folder: not absolute, no .. segments, no control characters; a symlink must resolve inside the folder."
             },
             "build_args": {
               "type": "object",
@@ -205,10 +207,13 @@
             },
             "context": {
               "type": "string",
-              "description": "Folder inside the template with a Dockerfile + source (e.g. a Python/Go socket sim)."
+              "description": "Folder inside the template with a Dockerfile + source (e.g. a Python/Go socket sim). Relative to the template folder: not absolute, no .. segments, no control characters; a symlink must resolve inside the folder.",
+              "pattern": "^(?![/\\\\]|[A-Za-z]:)(?!(.*[/\\\\])?\\.\\.([/\\\\]|$))[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]+$"
             },
             "dockerfile": {
-              "type": "string"
+              "type": "string",
+              "pattern": "^(?![/\\\\]|[A-Za-z]:)(?!(.*[/\\\\])?\\.\\.([/\\\\]|$))[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]+$",
+              "description": "Dockerfile path inside the build context. Relative to the template folder: not absolute, no .. segments, no control characters; a symlink must resolve inside the folder."
             },
             "build_args": {
               "type": "object",
@@ -451,7 +456,8 @@
         },
         "patch": {
           "type": "string",
-          "description": "Git patch applied to a source base to reach this state."
+          "description": "Git patch applied to a source base to reach this state. Relative to the template folder: not absolute, no .. segments, no control characters; a symlink must resolve inside the folder.",
+          "pattern": "^(?![/\\\\]|[A-Za-z]:)(?!(.*[/\\\\])?\\.\\.([/\\\\]|$))[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]+$"
         },
         "overlay": {
           "type": "array",
@@ -464,10 +470,14 @@
             "additionalProperties": false,
             "properties": {
               "src": {
-                "type": "string"
+                "type": "string",
+                "pattern": "^(?![/\\\\]|[A-Za-z]:)(?!(.*[/\\\\])?\\.\\.([/\\\\]|$))[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]+$",
+                "description": "Template file to bake in. Relative to the template folder: not absolute, no .. segments, no control characters; a symlink must resolve inside the folder."
               },
               "dest": {
-                "type": "string"
+                "type": "string",
+                "pattern": "^(?!(.*/)?\\.\\.(/|$))(?![/.]*$)[A-Za-z0-9._@%+=:,/-]+$",
+                "description": "Absolute path in the image (image base) or a path in the build context (source/build base). A plain path: letters, digits and . _ @ % + = : , / -; no whitespace, quotes, $ or control characters; no .. segments; not the root."
               },
               "mode": {
                 "type": "string",
@@ -480,8 +490,13 @@
         "environment": {
           "type": "object",
           "additionalProperties": {
-            "type": "string"
-          }
+            "type": "string",
+            "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]*$"
+          },
+          "propertyNames": {
+            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+          },
+          "description": "Baked into built images as ENV lines and passed at run time. Names are plain variable names; values may not contain control characters."
         },
         "seed": {
           "type": "array",

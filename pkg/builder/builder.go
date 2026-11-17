@@ -24,7 +24,9 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -216,23 +218,39 @@ func (b *Builder) buildOverlay(ctx context.Context, c *contract.Contract, st *co
 	mc := newMemContext()
 	var entries []overlayEntry
 	for i, o := range st.Overlay {
-		data, err := os.ReadFile(filepath.Join(c.Folder, filepath.FromSlash(o.Src)))
+		if err := contract.CheckOverlayDest(o.Dest, true); err != nil {
+			return fmt.Errorf("overlay dest %q: %w", o.Dest, err)
+		}
+		data, err := readTemplateFile(c, o.Src)
 		if err != nil {
 			return fmt.Errorf("overlay %s: %w", o.Src, err)
 		}
-		local := fmt.Sprintf("overlay_%d_%s", i, filepath.Base(o.Dest))
-		mc.add(local, data, modeOf(o.Mode))
+		mode, err := modeOf(o.Mode)
+		if err != nil {
+			return err
+		}
+		local := fmt.Sprintf("overlay_%d_%s", i, path.Base(o.Dest))
+		mc.add(local, data, mode)
 		entries = append(entries, overlayEntry{local: local, dest: o.Dest})
 	}
-	mc.add("Dockerfile", []byte(overlayDockerfile(baseRef, entries, st.Environment)), 0o644)
+	df, err := overlayDockerfile(baseRef, entries, st.Environment, '\\')
+	if err != nil {
+		return err
+	}
+	mc.add("Dockerfile", []byte(df), 0o644)
 	return b.build(ctx, c, st, contract.BuildKindOverlay, tag, "Dockerfile", mc.tar(), opts)
 }
 
 // -- local build (simulations, devices) ---------------------------------------
 
 func (b *Builder) buildLocal(ctx context.Context, c *contract.Contract, st *contract.State, tag string, opts Options) error {
-	ctxDir := filepath.Join(c.Folder, filepath.FromSlash(c.Base.Context))
-	if info, err := os.Stat(ctxDir); err != nil || !info.IsDir() {
+	// The context is resolved (symlinks followed) and must stay inside the
+	// template folder; the tree walk below then never follows a symlink.
+	ctxDir, err := c.TemplatePath(c.Base.Context)
+	if errors.Is(err, contract.ErrPathEscapes) {
+		return fmt.Errorf("build context: %w", err)
+	}
+	if info, serr := os.Stat(ctxDir); err != nil || serr != nil || !info.IsDir() {
 		return fmt.Errorf("build context %s not found", c.Base.Context)
 	}
 	src := ctxDir
@@ -247,7 +265,11 @@ func (b *Builder) buildLocal(ctx context.Context, c *contract.Contract, st *cont
 		if err := copyTree(ctxDir, src); err != nil {
 			return err
 		}
-		if err := b.applyPatch(ctx, src, filepath.Join(c.Folder, filepath.FromSlash(st.Patch))); err != nil {
+		patch, err := c.TemplatePath(st.Patch)
+		if err != nil {
+			return fmt.Errorf("patch: %w", err)
+		}
+		if err := b.applyPatch(ctx, src, patch); err != nil {
 			return err
 		}
 	}
@@ -255,12 +277,8 @@ func (b *Builder) buildLocal(ctx context.Context, c *contract.Contract, st *cont
 	if err := mc.addTree(src, ""); err != nil {
 		return err
 	}
-	for _, o := range st.Overlay {
-		data, err := os.ReadFile(filepath.Join(c.Folder, filepath.FromSlash(o.Src)))
-		if err != nil {
-			return fmt.Errorf("overlay %s: %w", o.Src, err)
-		}
-		mc.add(strings.TrimPrefix(o.Dest, "/"), data, modeOf(o.Mode))
+	if err := addOverlays(mc, c, st); err != nil {
+		return err
 	}
 	dockerfile := c.Base.Dockerfile
 	if dockerfile == "" {
@@ -295,7 +313,11 @@ func (b *Builder) buildSource(ctx context.Context, c *contract.Contract, st *con
 		return fmt.Errorf("checkout %s: %s", c.Base.Commit, tail(out))
 	}
 	if st.Patch != "" {
-		if err := b.applyPatch(ctx, repo, filepath.Join(c.Folder, filepath.FromSlash(st.Patch))); err != nil {
+		patch, err := c.TemplatePath(st.Patch)
+		if err != nil {
+			return fmt.Errorf("patch: %w", err)
+		}
+		if err := b.applyPatch(ctx, repo, patch); err != nil {
 			return err
 		}
 	}
@@ -303,12 +325,8 @@ func (b *Builder) buildSource(ctx context.Context, c *contract.Contract, st *con
 	if err := mc.addTree(repo, ""); err != nil {
 		return err
 	}
-	for _, o := range st.Overlay {
-		data, err := os.ReadFile(filepath.Join(c.Folder, filepath.FromSlash(o.Src)))
-		if err != nil {
-			return fmt.Errorf("overlay %s: %w", o.Src, err)
-		}
-		mc.add(strings.TrimPrefix(o.Dest, "/"), data, modeOf(o.Mode))
+	if err := addOverlays(mc, c, st); err != nil {
+		return err
 	}
 	dockerfile := c.Base.Dockerfile
 	if dockerfile == "" {
@@ -318,6 +336,43 @@ func (b *Builder) buildSource(ctx context.Context, c *contract.Contract, st *con
 		return err
 	}
 	return b.build(ctx, c, st, contract.BuildKindSource, tag, dockerfile, mc.tar(), opts)
+}
+
+// readTemplateFile reads a file the contract references, refusing any path
+// (.., absolute, or a symlink) that resolves outside the template folder.
+func readTemplateFile(c *contract.Contract, rel string) ([]byte, error) {
+	p, err := c.TemplatePath(rel)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", rel)
+	}
+	return os.ReadFile(p)
+}
+
+// addOverlays writes a source/build state's overlay files into the build
+// context; dest is a path inside the context.
+func addOverlays(mc *memContext, c *contract.Contract, st *contract.State) error {
+	for _, o := range st.Overlay {
+		if err := contract.CheckOverlayDest(o.Dest, false); err != nil {
+			return fmt.Errorf("overlay dest %q: %w", o.Dest, err)
+		}
+		data, err := readTemplateFile(c, o.Src)
+		if err != nil {
+			return fmt.Errorf("overlay %s: %w", o.Src, err)
+		}
+		mode, err := modeOf(o.Mode)
+		if err != nil {
+			return err
+		}
+		mc.add(strings.TrimPrefix(path.Clean("/"+o.Dest), "/"), data, mode)
+	}
+	return nil
 }
 
 // bakeEnv appends the state's environment to the Dockerfile so the published
@@ -330,7 +385,10 @@ func bakeEnv(mc *memContext, dockerfile string, env map[string]string) error {
 	if !ok {
 		return fmt.Errorf("build context has no %s", dockerfile)
 	}
-	extra := overlayDockerfile("", nil, env)
+	extra, err := overlayDockerfile("", nil, env, escapeToken(f.data))
+	if err != nil {
+		return err
+	}
 	extra = strings.TrimPrefix(extra, "FROM \n")
 	data := append([]byte{}, f.data...)
 	if len(data) > 0 && data[len(data)-1] != '\n' {
@@ -459,16 +517,21 @@ func tail(s string) string {
 	return s
 }
 
-func modeOf(mode string) int64 {
+// modeOf is the tar-header mode of an overlay file. The mode is template
+// input that reaches the build context directly, so it is re-checked here:
+// only permission bits ("0755"), never setuid/setgid/sticky or file type.
+func modeOf(mode string) (int64, error) {
 	if mode == "" {
-		return 0o644
+		return 0o644, nil
 	}
-	var m int64
-	fmt.Sscanf(mode, "%o", &m)
+	if !modeRe.MatchString(mode) {
+		return 0, fmt.Errorf("overlay mode %q must be an octal mode like 0644", mode)
+	}
+	m, _ := strconv.ParseInt(mode, 8, 64)
 	if m == 0 {
-		return 0o644
+		return 0o644, nil
 	}
-	return m
+	return m, nil
 }
 
 func copyTree(src, dst string) error {
