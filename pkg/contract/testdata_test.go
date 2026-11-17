@@ -35,6 +35,7 @@ func TestTestdataContracts(t *testing.T) {
 				t.Fatal(err)
 			}
 			first, _, _ := strings.Cut(string(data), "\n")
+			first = strings.TrimRight(first, "\r") // CRLF checkouts (Windows)
 			want, ok := strings.CutPrefix(first, "# want: ")
 			if !ok {
 				t.Fatal(`bad testdata must start with "# want: <error substring>"`)
