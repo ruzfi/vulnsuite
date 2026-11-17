@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -35,7 +36,9 @@ func TestExecContract(t *testing.T) {
 				}
 				t.Cleanup(func() { _ = eng.ImageRemove(context.Background(), img, false) })
 			}
-			name := "vulnsuite-e2e-exec-" + kind
+			// Unique per run: two e2e runs sharing a daemon must not remove
+			// each other's container.
+			name := fmt.Sprintf("vulnsuite-e2e-exec-%s-%d-%d", kind, os.Getpid(), time.Now().UnixNano())
 			_ = eng.ContainerRemove(ctx, name)
 			id, err := eng.ContainerCreate(ctx, engine.ContainerSpec{Name: name, Image: img, Cmd: []string{"sleep", "300"},
 				Labels: map[string]string{"dev.vulnsuite.managed": "true"}})

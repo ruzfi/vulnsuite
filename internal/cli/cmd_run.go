@@ -116,6 +116,23 @@ Exposure modes:
 			fs.BoolVar(&allowHostAccess, "allow-host-access", false, "honor a template's host device passthrough and elevated capabilities (host-access primitives; only for templates you trust)")
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
+			// Flag mistakes are usage errors (exit 2), caught before any
+			// template is resolved or image pulled/built.
+			switch exp.Mode {
+			case runner.ModeInternal, runner.ModeHost, runner.ModeMacvlan:
+			default:
+				return usageError{fmt.Sprintf("unknown -expose mode %q (internal, host or macvlan)", exp.Mode)}
+			}
+			if maxConcurrent < 1 {
+				return usageError{fmt.Sprintf("-max-concurrent must be at least 1, got %d", maxConcurrent)}
+			}
+			pinned := exp.HostPort != 0 || len(exp.HostPortMap) > 0
+			if exp.HostPort < 0 || exp.HostPort > 65535 {
+				return usageError{fmt.Sprintf("-host-port must be 1..65535, got %d", exp.HostPort)}
+			}
+			if pinned && exp.Mode != runner.ModeHost {
+				return usageError{"-host-port / -host-port-map need -expose host"}
+			}
 			state := contract.StateVulnerable
 			if len(args) > 0 && has(contract.StateNames, args[0]) {
 				state = args[0]
@@ -146,14 +163,6 @@ Exposure modes:
 			}
 			if len(runnable) == 0 {
 				return fmt.Errorf("no templates have a %q state", state)
-			}
-			multi := len(runnable) > 1
-			if multi && exp.Mode == runner.ModeMacvlan && exp.IP != "" {
-				return usageError{"-ip pins one address; run one template at a time in macvlan mode, or omit -ip"}
-			}
-			if multi {
-				exp.HostPort = 0
-				exp.HostPortMap = nil
 			}
 			eng, err := g.Engine(ctx)
 			if err != nil {
@@ -195,7 +204,6 @@ Exposure modes:
 				eligible = append(eligible, c)
 			}
 			runnable = eligible
-			multi = len(runnable) > 1
 
 			// Concurrency cap: containers this batch replaces (same name) are not net new.
 			batch := map[string]bool{}
@@ -224,7 +232,17 @@ Exposure modes:
 				overCap, runnable = runnable[free:], runnable[:free]
 				g.printf("max concurrent is %d (%d already running): starting %d, skipping %d.\n", maxConcurrent, netNew, len(runnable), len(overCap))
 				g.printf("  raise it with -max-concurrent, or run the rest after `vulnsuite stop`.\n\n")
-				multi = len(runnable) > 1
+			}
+			// Single-target pins are judged on what will actually start, after
+			// the requires/host-access skips and the cap: a batch that ends up
+			// with one target keeps its pin, and a pin that would have to serve
+			// several targets is refused rather than silently dropped.
+			multi := len(runnable) > 1
+			if multi && exp.Mode == runner.ModeMacvlan && exp.IP != "" {
+				return usageError{fmt.Sprintf("-ip pins one address but %d targets would start (%s); run one template at a time in macvlan mode, or omit -ip", len(runnable), contractIDs(runnable))}
+			}
+			if multi && pinned {
+				return usageError{fmt.Sprintf("-host-port / -host-port-map pin one target's ports but %d targets would start (%s); select one target, or omit them for free ports", len(runnable), contractIDs(runnable))}
 			}
 
 			opts := runner.Options{Verify: !noVerify, AllowHostAccess: allowHostAccess, Build: builder.Options{Pull: !noPull, NoCache: noCache, Force: force, Platform: platform}}
@@ -391,11 +409,7 @@ Exposure modes:
 				g.printf("  these request host devices or elevated capabilities; if you trust them, re-run with -allow-host-access.\n")
 			}
 			if len(overCap) > 0 {
-				ids := make([]string, 0, len(overCap))
-				for _, c := range overCap {
-					ids = append(ids, c.ID())
-				}
-				g.printf("\n%d not started (over the -max-concurrent %d cap): %s\n", len(overCap), maxConcurrent, strings.Join(ids, ", "))
+				g.printf("\n%d not started (over the -max-concurrent %d cap): %s\n", len(overCap), maxConcurrent, contractIDs(overCap))
 			}
 			if !g.JSON {
 				g.printf("\nTear down:  vulnsuite stop   (brings down all %d target(s))\n", len(handles))
@@ -413,6 +427,15 @@ Exposure modes:
 			return errors.Join(runErr(), teardown(ctx, g, r, handles))
 		},
 	}
+}
+
+// contractIDs joins the contracts' ids for messages.
+func contractIDs(cs []*contract.Contract) string {
+	ids := make([]string, 0, len(cs))
+	for _, c := range cs {
+		ids = append(ids, c.ID())
+	}
+	return strings.Join(ids, ", ")
 }
 
 // errInterrupted reports a run cut short by Ctrl-C / SIGTERM.
@@ -512,7 +535,7 @@ func cmdStop() *Command {
 			} else {
 				ids = []string{""}
 			}
-			var removed []string
+			removed := []string{} // -json prints [] (not null) when nothing ran
 			var stopErrs []error
 			for _, id := range ids {
 				names, err := r.StopAll(ctx, id)
@@ -521,13 +544,21 @@ func cmdStop() *Command {
 					stopErrs = append(stopErrs, err)
 				}
 			}
+			// Prune before reporting, so -json carries the outcome too. A network
+			// that cannot be removed (still in use, already gone) is a warning,
+			// not a failed stop.
+			networkRemoved := false
+			var pruneErr error
+			if pruneNet && len(sel) == 0 {
+				if pruneErr = r.PruneNetwork(ctx, network); pruneErr == nil {
+					networkRemoved = true
+				}
+			}
 			if g.JSON {
-				if err := g.emitJSON(map[string]any{"removed": removed}); err != nil {
+				if err := g.emitJSON(map[string]any{"removed": removed, "network_removed": networkRemoved}); err != nil {
 					return err
 				}
-				return errors.Join(stopErrs...)
-			}
-			if len(removed) == 0 {
+			} else if len(removed) == 0 {
 				g.printf("nothing to stop\n")
 			} else {
 				g.printf("stopped %d container(s):\n", len(removed))
@@ -535,12 +566,11 @@ func cmdStop() *Command {
 					g.printf("  %s\n", n)
 				}
 			}
-			if pruneNet && len(sel) == 0 {
-				if err := r.PruneNetwork(ctx, network); err == nil {
-					g.printf("removed network %s\n", network)
-				} else {
-					g.errorf("could not remove network %s: %v\n", network, err)
-				}
+			switch {
+			case networkRemoved:
+				g.printf("removed network %s\n", network)
+			case pruneErr != nil:
+				g.errorf("could not remove network %s: %v\n", network, pruneErr)
 			}
 			return errors.Join(stopErrs...)
 		},
@@ -610,6 +640,11 @@ the subnet. Non-HTTP targets come out as host:port for network templates.`,
 			fs.StringVar(&network, "network", runner.DefaultNetwork, "internal network name")
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
+			switch by {
+			case "auto", "ip", "alias", "host":
+			default:
+				return usageError{fmt.Sprintf("unknown -by %q (auto, ip, alias or host)", by)}
+			}
 			store, err := g.Store()
 			if err != nil {
 				return err
@@ -675,9 +710,8 @@ the subnet. Non-HTTP targets come out as host:port for network templates.`,
 			if len(pairs) == 0 {
 				return fmt.Errorf("running targets have no resolvable address yet (try again in a moment, or -by alias)")
 			}
-			if g.JSON {
-				return g.emitJSON(pairs)
-			}
+			// -file is written whatever the output format, so
+			// `vulnsuite -json targets -file F && nuclei -l F` works.
 			if file != "" {
 				var lines []string
 				for _, p := range pairs {
@@ -686,11 +720,18 @@ the subnet. Non-HTTP targets come out as host:port for network templates.`,
 				if err := os.WriteFile(file, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
 					return err
 				}
+			}
+			if g.JSON {
+				return g.emitJSON(pairs)
+			}
+			if file != "" {
 				g.printf("wrote %s (%d targets, by %s)\nscan exactly these (no subnet sweep):\n  nuclei -l %s\n", file, len(pairs), by, file)
 				return nil
 			}
+			// The URL list is this command's output, not progress: -q keeps it
+			// and silences only the hint below.
 			for _, p := range pairs {
-				g.printf("%-48s # %s %s\n", p.URL, p.ID, p.State)
+				fmt.Fprintf(g.Stdout, "%-48s # %s %s\n", p.URL, p.ID, p.State)
 			}
 			g.printf("\n%d targets. Scan just these instead of the subnet, e.g.:\n  vulnsuite targets -file targets.txt && nuclei -l targets.txt\n", len(pairs))
 			return nil

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"runtime"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/ruzfi/vulnsuite/pkg/builder"
 	"github.com/ruzfi/vulnsuite/pkg/contract"
+	"github.com/ruzfi/vulnsuite/pkg/loader"
 	"github.com/ruzfi/vulnsuite/pkg/runner"
 )
 
@@ -94,8 +96,12 @@ VULNSUITE_REGISTRY_USER / VULNSUITE_REGISTRY_TOKEN or ~/.docker/config.json.`,
 			if err != nil {
 				return err
 			}
+			// A template that fails to load is a failed build, not a silent
+			// skip: report it, carry it into the results, and exit non-zero.
+			var loadFailed []buildResult
 			for _, e := range loadErrs {
 				g.errorf("ERROR %v\n", e)
+				loadFailed = append(loadFailed, buildResult{ID: loadErrID(e), Error: e.Error()})
 			}
 			var jobsList []builder.Job
 			for _, c := range cs {
@@ -106,6 +112,14 @@ VULNSUITE_REGISTRY_USER / VULNSUITE_REGISTRY_TOKEN or ~/.docker/config.json.`,
 				}
 			}
 			if len(jobsList) == 0 {
+				if len(loadFailed) > 0 {
+					if g.JSON {
+						if err := g.emitJSON(loadFailed); err != nil {
+							return err
+						}
+					}
+					return fmt.Errorf("%d template(s) failed to load; nothing to build", len(loadFailed))
+				}
 				return fmt.Errorf("nothing to build")
 			}
 			eng, err := g.Engine(ctx)
@@ -148,8 +162,9 @@ VULNSUITE_REGISTRY_USER / VULNSUITE_REGISTRY_TOKEN or ~/.docker/config.json.`,
 			}
 			g.printf("building %d image(s) with %d worker(s)...\n", len(jobsList), jobs)
 			started := time.Now()
-			results := make([]buildResult, 0, len(jobsList))
-			var failed int
+			results := make([]buildResult, 0, len(jobsList)+len(loadFailed))
+			results = append(results, loadFailed...)
+			failed := len(loadFailed)
 			outcomes := b.ResolveAll(ctx, jobsList, jobs, builder.Options{Pull: !noPull, NoCache: noCache, Force: force, Platform: platform},
 				func(o builder.Outcome) {
 					r := buildResult{ID: o.Job.Contract.ID(), State: o.Job.State}
@@ -217,6 +232,19 @@ VULNSUITE_REGISTRY_USER / VULNSUITE_REGISTRY_TOKEN or ~/.docker/config.json.`,
 	}
 }
 
+// loadErrID names the template behind a load error: its id when the file can
+// be peeked, else its path.
+func loadErrID(err error) string {
+	var le *loader.Error
+	if errors.As(err, &le) {
+		if id := loader.PeekID(le.Path); id != "" {
+			return id
+		}
+		return le.Path
+	}
+	return ""
+}
+
 func defaultJobs() int {
 	n := runtime.NumCPU()
 	if n > 4 {
@@ -277,13 +305,31 @@ func cmdImages() *Command {
 				return err
 			}
 			sort.Strings(refs)
+			if refs == nil {
+				refs = []string{} // -json prints [] (not null) when there are none
+			}
 			if rm {
+				type rmFailure struct {
+					Ref   string `json:"ref"`
+					Error string `json:"error"`
+				}
+				removed, failed := []string{}, []rmFailure{}
 				for _, r := range refs {
 					if err := eng.ImageRemove(ctx, r, true); err != nil {
 						g.errorf("could not remove %s: %v\n", r, err)
+						failed = append(failed, rmFailure{r, err.Error()})
 						continue
 					}
+					removed = append(removed, r)
 					g.printf("removed %s\n", r)
+				}
+				if g.JSON {
+					if err := g.emitJSON(map[string]any{"removed": removed, "failed": failed}); err != nil {
+						return err
+					}
+				}
+				if len(failed) > 0 {
+					return fmt.Errorf("%d of %d image(s) could not be removed", len(failed), len(refs))
 				}
 				return nil
 			}

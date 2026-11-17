@@ -74,7 +74,11 @@ when unique). A ref-shaped selector (CVE-..., GHSA-..., GO-..., VS-...) that
 matches no id/file/folder resolves against vuln_refs instead, so
 ` + "`search CVE-2026-109619`" + ` just works. With no selector every template is listed.
 
-Filters compose (all must match). Finding class, CVE and KEV status are derived
+Filters compose (all must match). With no selector, a filter looks at every
+template, variant-group members included -- the same set run and build select
+for that filter -- while a bare list shows one row per group (its primary)
+unless -variants is given. With a selector, filters narrow what it selected.
+Finding class, CVE and KEV status are derived
 from contract metadata (taxonomy v2) and shown as columns:
 
   -ref         a specific vuln_refs id -- CVE-, GHSA-, GO- or VS-... (repeatable;
@@ -124,7 +128,14 @@ shown as "?" and -kev/-no-kev cannot be used.`,
 			if err != nil {
 				return err
 			}
-			expanded := variants || groupFilter != ""
+			// A filter with no selector selects from every template, variant
+			// members included, exactly as it does on run and build (#36: "a
+			// filter that matches a variant member includes that member
+			// regardless of collapse"), so `list <filter>` previews what
+			// `run <filter>` / `build <filter>` will stand up. A bare `list`
+			// (like -all) still collapses each group to its primary.
+			filterAll := len(args) == 0 && groupFilter == "" && f.active()
+			expanded := variants || groupFilter != "" || filterAll
 			var paths []string
 			switch {
 			case groupFilter != "":
@@ -139,14 +150,14 @@ shown as "?" and -kev/-no-kev cannot be used.`,
 					paths = append(paths, m.Path)
 				}
 			case len(args) == 0:
-				paths, err = store.FindMany(nil, true, variants)
+				paths, err = store.FindMany(nil, true, variants || filterAll)
 			default:
 				paths, err = store.FindMany(args, false, variants)
 			}
 			if err != nil {
 				return err
 			}
-			var rows []listRow
+			rows := []listRow{} // -json prints [] (not null) when nothing matches
 			for _, p := range paths {
 				c, err := store.Load(p)
 				if err != nil {
@@ -361,6 +372,9 @@ func cmdValidate() *Command {
 					LoadErrs  []string            `json:"load_errors,omitempty"`
 					Findings  []validator.Finding `json:"findings"`
 				}
+				if findings == nil {
+					findings = []validator.Finding{}
+				}
 				o := out{Templates: len(cs), Errors: nerr, Warnings: nwarn, Findings: findings}
 				for _, e := range loadErrs {
 					o.LoadErrs = append(o.LoadErrs, e.Error())
@@ -444,7 +458,7 @@ func cmdVersion() *Command {
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
 			dir, _ := templates.Resolve(g.TemplatesDir)
 			if g.JSON {
-				return g.emitJSON(map[string]string{"version": Version, "commit": Commit, "date": Date,
+				return g.emitJSON(map[string]string{"version": resolvedVersion(), "commit": Commit, "date": Date,
 					"templates_dir": dir, "templates_version": templates.Version(dir)})
 			}
 			fmt.Fprintln(g.Stdout, versionString())
