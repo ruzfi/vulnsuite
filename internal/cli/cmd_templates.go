@@ -108,7 +108,11 @@ shown as "?" and -kev/-no-kev cannot be used.`,
 			}
 			// Resolve the KEV set always, to populate the column; -kev/-no-kev
 			// additionally require it to be known.
-			kevSet, kevSrc, err := kev.Resolve(ctx, kev.Options{TemplatesDir: store.Root, Refresh: f.refreshKEV})
+			kevSet, kevSrc, err := kev.Resolve(ctx, kev.Options{
+				TemplatesDir: store.Root,
+				Refresh:      f.refreshKEV,
+				Warn:         func(msg string) { g.errorf("warning: %s\n", msg) },
+			})
 			if err != nil {
 				return err
 			}

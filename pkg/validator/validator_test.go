@@ -339,3 +339,34 @@ func TestGroupMultiCategory(t *testing.T) {
 		t.Fatal("a group spanning two categories must warn")
 	}
 }
+
+func TestIdenticalStatesSeesSidecarsAndSeed(t *testing.T) {
+	v := &Validator{}
+	withSidecar := strings.Replace(base, "healthcheck:", "sidecars: [ { name: db, image: \"mysql:8.0.1\" } ], healthcheck:", 1)
+	// Same main image, but patched swaps the sidecar to the fixed release.
+	c := parse(t, strings.Replace(withSidecar, "  patched:\n", "  patched:\n    sidecars: { db: { image: \"mysql:8.0.2\" } }\n", 1))
+	if _, bad := rules(v.Check(c))["identical-states"]; bad {
+		t.Fatal("states that differ only in a sidecar override must not be identical")
+	}
+	// An override to the same image is still identical.
+	c = parse(t, strings.Replace(withSidecar, "  patched:\n", "  patched:\n    sidecars: { db: { image: \"mysql:8.0.1\" } }\n", 1))
+	if rules(v.Check(c))["identical-states"] != Warning {
+		t.Fatal("a no-op sidecar override must still warn")
+	}
+	// Different seed data.
+	c = parse(t, strings.Replace(base, "  patched:\n", "  patched:\n    seed: [ { run: \"echo fixed\" } ]\n", 1))
+	if _, bad := rules(v.Check(c))["identical-states"]; bad {
+		t.Fatal("states that differ only in seed must not be identical")
+	}
+}
+
+func TestPrimaryWithoutGroup(t *testing.T) {
+	v := &Validator{}
+	c := parse(t, strings.Replace(base, "summary: x,", "summary: x, primary: true,", 1))
+	if rules(v.Check(c))["primary-no-group"] != Warning {
+		t.Fatal("primary without group must warn")
+	}
+	if _, bad := rules(v.Check(parse(t, base)))["primary-no-group"]; bad {
+		t.Fatal("no primary, no warning")
+	}
+}

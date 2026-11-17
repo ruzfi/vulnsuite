@@ -64,6 +64,11 @@ type rawState struct {
 	Verify      []Probe                    `yaml:"verify,omitempty"`
 }
 
+const (
+	idMinLen = 3
+	idMaxLen = 80
+)
+
 // SchemaError is a structural error in a contract document (the equivalent of
 // a JSON-schema violation).
 type SchemaError struct {
@@ -74,7 +79,9 @@ type SchemaError struct {
 func (e *SchemaError) Error() string { return fmt.Sprintf("schema: %s: %s", e.Loc, e.Message) }
 
 var (
-	idRe      = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{2,79}$`)
+	// idRe is a valid Docker repository path component (no leading, trailing
+	// or doubled separators); idMinLen/idMaxLen bound it as the schema does.
+	idRe      = regexp.MustCompile(`^[a-z0-9]+([.-][a-z0-9]+)*$`)
 	vulnRefRe = regexp.MustCompile(`^(CVE-\d{4}-\d{4,7}|GHSA-[a-z0-9-]+|[A-Z]{2,8}-[A-Z0-9-]+)$`)
 	// refShapeRe is vulnRefRe case-insensitively, for recognising a ref-shaped
 	// selector or filter value (CVE-, GHSA-, GO-, VS-... in any case).
@@ -106,6 +113,9 @@ func Parse(data []byte) (*Contract, error) {
 	var raw rawContract
 	if err := yaml.UnmarshalWithOptions(data, &raw, yaml.Strict()); err != nil {
 		return nil, fmt.Errorf("invalid YAML: %s", strings.TrimSpace(yaml.FormatError(err, false, false)))
+	}
+	if err := checkDocument(data); err != nil {
+		return nil, err
 	}
 	c := &Contract{
 		APIVersion: raw.APIVersion,
@@ -163,8 +173,8 @@ func (c *Contract) checkStructure() error {
 		return se("kind", "must be %q", Kind)
 	}
 	m := c.Metadata
-	if !idRe.MatchString(m.ID) {
-		return se("metadata/id", "%q must match %s", m.ID, idRe)
+	if !idRe.MatchString(m.ID) || len(m.ID) < idMinLen || len(m.ID) > idMaxLen {
+		return se("metadata/id", "%q must match %s and be %d-%d characters", m.ID, idRe, idMinLen, idMaxLen)
 	}
 	if strings.TrimSpace(m.Summary) == "" {
 		return se("metadata/summary", "is required")
@@ -291,10 +301,15 @@ func (c *Contract) checkStructure() error {
 	if s.Healthcheck.Timeout != "" && !timeoutRe.MatchString(s.Healthcheck.Timeout) {
 		return se("service/healthcheck/timeout", "must look like 60s or 5m")
 	}
+	seenSidecar := map[string]bool{}
 	for i, sc := range s.Sidecars {
 		if sc.Name == "" || sc.Image == "" {
 			return se(fmt.Sprintf("service/sidecars/%d", i), "name and image are required")
 		}
+		if seenSidecar[sc.Name] {
+			return se(fmt.Sprintf("service/sidecars/%d/name", i), "sidecar %q is declared more than once", sc.Name)
+		}
+		seenSidecar[sc.Name] = true
 		if sc.Digest != "" && !digestRe.MatchString(sc.Digest) {
 			return se(fmt.Sprintf("service/sidecars/%d/digest", i), "must look like sha256:<64 hex>")
 		}
@@ -356,11 +371,17 @@ func (c *Contract) checkStructure() error {
 			n := 0
 			if p.HTTP != nil {
 				n++
+				if err := checkProbeNums(ploc+"/http", p.HTTP.Port, p.HTTP.Timeout); err != nil {
+					return err
+				}
 			}
 			if p.Exec != nil {
 				n++
 				if p.Exec.Run == "" {
 					return se(ploc+"/exec/run", "is required")
+				}
+				if err := checkProbeNums(ploc+"/exec", 0, p.Exec.Timeout); err != nil {
+					return err
 				}
 			}
 			if p.TCP != nil {
@@ -368,17 +389,35 @@ func (c *Contract) checkStructure() error {
 				if p.TCP.Port == 0 {
 					return se(ploc+"/tcp/port", "is required")
 				}
+				if err := checkProbeNums(ploc+"/tcp", p.TCP.Port, p.TCP.Timeout); err != nil {
+					return err
+				}
 			}
 			if p.Net != nil {
 				n++
 				if len(p.Net.Steps) == 0 {
 					return se(ploc+"/net/steps", "at least one step is required")
 				}
+				if err := checkProbeNums(ploc+"/net", p.Net.Port, p.Net.Timeout); err != nil {
+					return err
+				}
 			}
 			if n != 1 {
-				return se(ploc, "exactly one of http, exec, tcp must be set")
+				return se(ploc, "exactly one of http, exec, tcp, net must be set")
 			}
 		}
+	}
+	return nil
+}
+
+// checkProbeNums enforces a probe's port range (0 = the default, primary port)
+// and a non-negative timeout (0 = the default).
+func checkProbeNums(loc string, port int, timeout float64) error {
+	if port < 0 || port > 65535 {
+		return se(loc+"/port", "must be 1..65535")
+	}
+	if timeout < 0 {
+		return se(loc+"/timeout", "must be greater than 0")
 	}
 	return nil
 }
