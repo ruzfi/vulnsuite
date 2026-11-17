@@ -71,10 +71,42 @@ func reportVerify(g *Global, h *runner.Handle, indent string) {
 	}
 }
 
+// Reasons a target lands in a -summary's skipped or failed list. They are
+// stable strings a pipeline can switch on; detail carries the human text.
+const (
+	reasonNoState    = "no-state"    // the template has no such state
+	reasonRequires   = "requires"    // the host does not meet requires
+	reasonHostAccess = "host-access" // needs -allow-host-access
+	reasonOverCap    = "over-cap"    // over the -max-concurrent cap
+	reasonCancelled  = "cancelled"   // interrupted before it started (or torn down by the interrupt)
+	reasonAborted    = "aborted"     // not attempted: the command stopped on another target's error
+	reasonLoad       = "load"        // the template failed to load
+	reasonStart      = "start"       // could not be built, pulled or started
+	reasonUnhealthy  = "unhealthy"   // started, but not ready / seed failed / verify failed
+)
+
+// outcomeEntry is one skipped or failed target in a -summary.
+type outcomeEntry struct {
+	ID     string `json:"id"`
+	State  string `json:"state,omitempty"`
+	Reason string `json:"reason"`
+	Detail string `json:"detail,omitempty"`
+}
+
+// runSummary is `run -json -summary`: what started, what failed and what was
+// skipped, so a pipeline can tell the three apart (a target in none of them
+// was not selected). A target that started but is not confirmed in its state
+// is in targets (it is running) and in failed (it fails the run).
+type runSummary struct {
+	Targets []*runner.Handle `json:"targets"`
+	Failed  []outcomeEntry   `json:"failed"`
+	Skipped []outcomeEntry   `json:"skipped"`
+}
+
 func cmdRun() *Command {
 	var sel, files multiFlag
 	var flt filters
-	var all, variants, detach, noVerify, noPull, noCache, force bool
+	var all, variants, detach, noVerify, noPull, noCache, force, summary bool
 	var maxConcurrent int
 	var targetsFile, platform, readyTimeout, nucleiDir string
 	var ignoreRequires, allowHostAccess bool
@@ -115,8 +147,33 @@ Exposure modes:
 			fs.StringVar(&nucleiDir, "nuclei-templates", "", "nuclei-templates checkout used to resolve the scanner templates shown for each target")
 			fs.BoolVar(&ignoreRequires, "ignore-requires", false, "run even when the host does not meet a target's requires (arch/kvm/host_os)")
 			fs.BoolVar(&allowHostAccess, "allow-host-access", false, "honor a template's host device passthrough and elevated capabilities (host-access primitives; only for templates you trust)")
+			fs.BoolVar(&summary, "summary", false, "with -json, print {targets, failed, skipped} instead of the bare array of started targets")
 		},
-		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
+		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) (retErr error) {
+			if summary && !g.JSON {
+				return usageError{"-summary shapes the -json output; add -json"}
+			}
+			// sum collects every selected target's fate for -summary. Once the
+			// selection is resolved it is emitted on every way out (success,
+			// failure, interrupt) except a usage error, so a pipeline always
+			// gets a document to parse.
+			sum := runSummary{Targets: []*runner.Handle{}, Failed: []outcomeEntry{}, Skipped: []outcomeEntry{}}
+			resolved, emitted := false, false
+			emitSummary := func() error {
+				emitted = true
+				return g.emitJSON(sum)
+			}
+			defer func() {
+				var ue usageError
+				if summary && resolved && !emitted && !errors.As(retErr, &ue) {
+					retErr = errors.Join(retErr, emitSummary())
+				}
+			}()
+			skip := func(cs []*contract.Contract, state, reason, detail string) {
+				for _, c := range cs {
+					sum.Skipped = append(sum.Skipped, outcomeEntry{ID: c.ID(), State: state, Reason: reason, Detail: detail})
+				}
+			}
 			// Flag mistakes are usage errors (exit 2), caught before any
 			// template is resolved or image pulled/built.
 			switch exp.Mode {
@@ -150,10 +207,13 @@ Exposure modes:
 			if err != nil {
 				return err
 			}
+			resolved = true
 			if len(loadErrs) > 0 {
 				for _, e := range loadErrs {
 					g.errorf("ERROR %v\n", e)
+					sum.Failed = append(sum.Failed, outcomeEntry{ID: loadErrID(e), Reason: reasonLoad, Detail: e.Error()})
 				}
+				skip(cs, state, reasonAborted, "not attempted: other templates failed to load")
 				return fmt.Errorf("%d template(s) failed to load", len(loadErrs))
 			}
 			var runnable []*contract.Contract
@@ -162,6 +222,7 @@ Exposure modes:
 					runnable = append(runnable, c)
 				} else {
 					g.printf("skip %s: no %q state\n", c.ID(), state)
+					skip([]*contract.Contract{c}, state, reasonNoState, fmt.Sprintf("no %q state", state))
 				}
 			}
 			if len(runnable) == 0 {
@@ -169,11 +230,13 @@ Exposure modes:
 			}
 			eng, err := g.Engine(ctx)
 			if err != nil {
+				skip(runnable, state, reasonAborted, err.Error())
 				return err
 			}
 			r := runner.New(eng)
 			host, herr := eng.Info(ctx)
 			if herr != nil {
+				skip(runnable, state, reasonAborted, herr.Error())
 				return herr
 			}
 
@@ -189,6 +252,7 @@ Exposure modes:
 					case d.Skip() && !ignoreRequires:
 						g.printf("skip %s: %s\n", c.ID(), d.Reason)
 						skippedReq = append(skippedReq, c.ID())
+						skip([]*contract.Contract{c}, state, reasonRequires, d.Reason)
 						continue
 					case d.Skip() && ignoreRequires:
 						g.printf("%s does not meet requires (%s) -- running anyway (-ignore-requires)\n", c.ID(), d.Reason)
@@ -201,6 +265,7 @@ Exposure modes:
 					if reason := runner.HostAccessReason(c); reason != "" {
 						g.printf("skip %s: needs host access (%s) -- re-run with -allow-host-access to include it\n", c.ID(), reason)
 						skippedHost = append(skippedHost, c.ID())
+						skip([]*contract.Contract{c}, state, reasonHostAccess, reason)
 						continue
 					}
 				}
@@ -215,6 +280,7 @@ Exposure modes:
 			}
 			already, err := r.Running(ctx, exp.Network)
 			if err != nil {
+				skip(runnable, state, reasonAborted, err.Error())
 				return fmt.Errorf("count running targets for -max-concurrent: %w", err)
 			}
 			netNew := 0
@@ -229,10 +295,13 @@ Exposure modes:
 			}
 			var overCap []*contract.Contract
 			if len(runnable) > free {
+				capDetail := fmt.Sprintf("over the -max-concurrent %d cap (%d already running)", maxConcurrent, netNew)
 				if free == 0 {
+					skip(runnable, state, reasonOverCap, capDetail)
 					return fmt.Errorf("max concurrent (%d) already reached: %d target(s) running. bring some down first:  vulnsuite stop", maxConcurrent, netNew)
 				}
 				overCap, runnable = runnable[free:], runnable[:free]
+				skip(overCap, state, reasonOverCap, capDetail)
 				g.printf("max concurrent is %d (%d already running): starting %d, skipping %d.\n", maxConcurrent, netNew, len(runnable), len(overCap))
 				g.printf("  raise it with -max-concurrent, or run the rest after `vulnsuite stop`.\n\n")
 			}
@@ -269,11 +338,15 @@ Exposure modes:
 			// (not ready, a seed failed, or verify failed). They fail the run.
 			var unhealthy []string
 			cancelled := false
+			// attempted counts the targets the loop reached; on an interrupt
+			// the rest never started.
+			attempted := 0
 			for _, c := range runnable {
 				if ctx.Err() != nil {
 					cancelled = true
 					break
 				}
+				attempted++
 				if multi {
 					g.printf("\n=== [%s] %s ===\n", c.ID(), state)
 				} else {
@@ -287,11 +360,13 @@ Exposure modes:
 				h, err := r.Run(ctx, c, state, exp, tgtOpts)
 				if err != nil {
 					if ctx.Err() != nil {
+						attempted-- // cut short by the interrupt: it never started
 						cancelled = true
 						break
 					}
 					g.errorf("  could not run %s: %v\n", c.ID(), err)
 					failures = append(failures, c.ID())
+					sum.Failed = append(sum.Failed, outcomeEntry{ID: c.ID(), State: state, Reason: reasonStart, Detail: err.Error()})
 					continue
 				}
 				handles = append(handles, h)
@@ -321,6 +396,7 @@ Exposure modes:
 				reportVerify(g, h, "  ")
 				if p := h.Problem(); p != "" {
 					unhealthy = append(unhealthy, fmt.Sprintf("%s [%s] (%s)", c.ID(), state, p))
+					sum.Failed = append(sum.Failed, outcomeEntry{ID: c.ID(), State: state, Reason: reasonUnhealthy, Detail: p})
 				}
 				g.printf("  scanner templates:\n")
 				for _, line := range scanners.Match(c, idx).Lines(c) {
@@ -331,6 +407,12 @@ Exposure modes:
 				// Interrupted: this batch never got handed out, so tear down what
 				// it started rather than leave half a batch behind.
 				g.errorf("\ninterrupted: tearing down %d started target(s)...\n", len(handles))
+				// Everything this batch reached is torn down, and the rest never
+				// started: all of it is cancelled, none of it is running.
+				for _, h := range handles {
+					sum.Skipped = append(sum.Skipped, outcomeEntry{ID: h.ID, State: h.State, Reason: reasonCancelled, Detail: "started, then torn down by the interrupt"})
+				}
+				skip(runnable[attempted:], state, reasonCancelled, "interrupted before it started")
 				if err := teardown(ctx, g, r, handles); err != nil {
 					return err
 				}
@@ -343,11 +425,17 @@ Exposure modes:
 				return fmt.Errorf("nothing came up")
 			}
 
-			if g.JSON {
+			sum.Targets = append(sum.Targets, handles...)
+			switch {
+			case summary:
+				if err := emitSummary(); err != nil {
+					return err
+				}
+			case g.JSON:
 				if err := g.emitJSON(handles); err != nil {
 					return err
 				}
-			} else {
+			default:
 				g.printf("\nScan these with your probe:\n")
 				for _, h := range handles {
 					extra := ""

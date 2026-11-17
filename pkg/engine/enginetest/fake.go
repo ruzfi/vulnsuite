@@ -71,8 +71,11 @@ type Fake struct {
 	FailBuild string
 	// FailPull makes pulls fail.
 	FailPull bool
-	nextIP   int
-	nextID   int
+	// PullFn runs before an image is pulled (receives its ref); an error fails
+	// the pull.
+	PullFn func(ref string) error
+	nextIP int
+	nextID int
 	// HostInfo is what Info reports (default linux/amd64).
 	HostInfo engine.HostInfo
 	// HostAddr is the daemon address Host() reports (empty = local socket).
@@ -121,6 +124,11 @@ func (f *Fake) setPlatform(ref, platform string) {
 }
 
 func (f *Fake) ImagePull(_ context.Context, ref, platform string, out io.Writer) error {
+	if f.PullFn != nil {
+		if err := f.PullFn(ref); err != nil {
+			return err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.FailPull {

@@ -312,6 +312,41 @@ probes and prints `verify: ok` (or exactly which assertion failed). Up to 10
 targets run at once by default (`-max-concurrent`); a bigger batch starts as
 many as fit and reports the rest.
 
+### Results for pipelines: `-json -summary`
+
+`run -json` prints the array of started targets and `build -json` the array
+of build results, as before. Add `-summary` to either one to get a single
+document that also says what did not happen and why, so a pipeline can tell
+skipped from failed from not selected:
+
+```bash
+vulnsuite -json run -all -detach -summary
+# {"targets": [...handles...], "failed": [...], "skipped": [...]}
+vulnsuite -json build -all -summary
+# {"built": [...results...], "failed": [...results with "error"...], "skipped": [...]}
+```
+
+Each `skipped` / `failed` entry of `run` is `{id, state, reason, detail}`, and
+each `skipped` entry of `build` has the same shape. `reason` is a stable code:
+
+| reason | list | meaning |
+| --- | --- | --- |
+| `no-state` | skipped | the template has no such state |
+| `requires` | skipped | the host does not meet `requires` (override: `-ignore-requires`) |
+| `host-access` | skipped | needs host devices/capabilities (`-allow-host-access`) |
+| `over-cap` | skipped | over the `-max-concurrent` cap |
+| `cancelled` | skipped | interrupted before it started, or torn down by the interrupt |
+| `aborted` | skipped | not attempted: the command stopped on another error (e.g. a load error) |
+| `load` | failed | the template failed to load |
+| `start` | failed | could not be built, pulled or started |
+| `unhealthy` | failed | started but not ready, a seed failed, or verify failed (also in `targets`: it is running) |
+
+The document is printed on failure and on Ctrl-C too, and the exit code is
+unchanged: non-zero whenever anything failed or was interrupted. In `build`,
+jobs an interrupt stopped before they started are counted (`N ok, M failed, K
+cancelled before starting`); in the bare `-json` array they appear with an
+`error`.
+
 ### Exposure modes — how your scanner reaches the target
 
 | Mode | What happens | Use when |
