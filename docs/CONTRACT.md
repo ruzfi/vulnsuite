@@ -12,8 +12,20 @@ relative to that folder, so a template is self-contained.
   src/                 Dockerfile + source for a `build` base
 ```
 
-Unknown fields are rejected. The machine-readable form of this document is
-[`schemas/contract.schema.json`](../schemas/contract.schema.json).
+Unknown fields are rejected, and so is a value of the wrong type: a quoted
+number where an integer is expected (`container: "80"`), a number or `null`
+where a string is expected (`summary: 123`, an `environment` value of `1`,
+`true` or `null` -- quote it: `FOO: "1"`). A file must hold a single YAML
+document. The machine-readable form of this document is
+[`schemas/contract.schema.json`](../schemas/contract.schema.json); the loader
+enforces the same rules.
+
+Discovery walks the templates tree and takes at most one contract per folder
+(the first of `contract.yaml`, `contract.yml`, `template.yaml`). It never
+enters dot-directories (`.git`, `.github`, ...) or `node_modules`, skips a
+template's own `files/`, `patches/` and `src/` (only inside a folder that holds
+a contract, so a category may be called `files`), and follows symlinked
+directories once.
 
 ## Top level
 
@@ -30,15 +42,15 @@ Unknown fields are rejected. The machine-readable form of this document is
 
 | Field | Required | Notes |
 | --- | --- | --- |
-| `id` | yes | `^[a-z0-9][a-z0-9.-]{2,79}$`; unique; `<product>-<version>-<cve>` by convention. Also the container's network alias. |
+| `id` | yes | `^[a-z0-9]+([.-][a-z0-9]+)*$`, 3-80 characters (a valid Docker repository name: no leading, trailing or doubled `.`/`-`); unique; `<product>-<version>-<cve>` by convention. Also the container's network alias. |
 | `summary` | yes | one line: what and how |
 | `vuln_refs` | | `CVE-YYYY-NNNN`, `GHSA-...`, or `PREFIX-ID` for flaws without a CVE (community templates use `VS-...`) |
 | `cwe` | | `CWE-NN` |
 | `severity` | | `info`, `low`, `medium`, `high`, `critical` |
-| `class` | | finding class(es) (taxonomy v2), orthogonal to the product surface (the top directory level): `vuln` (a tracked software vulnerability, usually a CVE), `misconfig` (an insecure configuration), `exposure` (data/interface reachable that should not be), `default-login` (default/weak credentials), `weak-crypto`. One or more, unique. `vulnsuite list --class` filters on it. |
+| `class` | | non-empty list of finding class(es) (taxonomy v2), orthogonal to the product surface (the top directory level): `vuln` (a tracked software vulnerability, usually a CVE), `misconfig` (an insecure configuration), `exposure` (data/interface reachable that should not be), `default-login` (default/weak credentials), `weak-crypto`. One or more, unique. `vulnsuite list --class` filters on it. |
 | `disclosed` | | optional public-disclosure date (`YYYY-MM-DD`); drives `list --year`/`--since` and a timeline view, falling back to the CVE-id year when unset. |
 | `group` | | variant-family handle (`^[a-z0-9]+(-[a-z0-9]+)*$`). Targets that share a `group` are variants of one vulnerability: `-t <group>` resolves to the group's **primary**, and `-variants` expands to every member. A lone target that sets a `group` is simply a nickname for its id (no `primary`/`variant` needed). A handle must not equal any target `id`. |
-| `primary` | | `true` marks the canonical member of a group. Exactly one member of a multi-member group must set it; a single-member group's lone member is the primary implicitly. |
+| `primary` | | `true` marks the canonical member of a group. Exactly one member of a multi-member group must set it; a single-member group's lone member is the primary implicitly. Without a `group` it has no effect (`primary-no-group` warning). |
 | `variant` | | discriminator within a group (`^[a-z0-9]+(-[a-z0-9]+)*$`), e.g. `waf-evasion`; unique within the group. Every non-primary member of a multi-member group needs one. Requires `group`. |
 | `tags` | | free-form; `vulnsuite list -tag` filters on them |
 | `references` | | the advisory and the fix |
@@ -74,7 +86,7 @@ base: { kind: build, context: src, dockerfile: Dockerfile, build_args: {} }
 | `command` | string or list; overrides the image command |
 | `environment` | map; merged with the state's environment (state wins) |
 | `healthcheck` | `{ http: { path, status }, timeout: 60s }` or `{ tcp: { port }, timeout }`; `timeout` is `<n>s|m|h` |
-| `sidecars` | helper containers `{ name, image, digest, command, environment }` started on the same network, reachable by `name` (`command` sets the container command, e.g. a `server ...` arg list for a clustered node) |
+| `sidecars` | helper containers `{ name, image, digest, command, environment }` (names unique) started on the same network, reachable by `name` (`command` sets the container command, e.g. a `server ...` arg list for a clustered node) |
 | `user` | run-as `uid` or `uid:gid` |
 | `cap_add` / `cap_drop` | Linux capabilities, e.g. `cap_drop: [ALL]` then `cap_add: [CAP_NET_BIND_SERVICE]` |
 | `devices` | host devices to pass through, e.g. `/dev/kvm` |
@@ -121,7 +133,7 @@ scanner's discrimination cannot be checked). Each state:
 | `command` | per-state command override |
 | `sidecars` | per-state sidecar image overrides, `{ <name>: { image, digest } }` -- swap a sidecar to another version for this state (e.g. the fixed release on every node of a multi-node cluster, which will not form across mixed versions) |
 | `seed` | `[{ run: "..." }]` shell steps executed inside the container once it is up |
-| `verify` | probes that prove the state |
+| `verify` | probes that prove the state; when present, at least one |
 
 How a state's image is produced (`vulnsuite list` shows it as KIND):
 
@@ -138,7 +150,8 @@ inputs produce an identical tag and are never rebuilt.
 
 ## `verify` probes
 
-Exactly one kind per probe. Probes are independent of any scanner: they
+Exactly one kind per probe (`http`, `tcp`, `net` or `exec`). A probe `port` is
+1-65535 and a `timeout` (seconds) is greater than 0. Probes are independent of any scanner: they
 demonstrate the *impact* from the advisory, not a matcher.
 
 ```yaml
@@ -204,13 +217,18 @@ rather than failed; use `-expose host` or scan from a container.
 | `group-id-collision` | error | a group handle equals a template `id` |
 | `group-multi-category` | warning | a group spans more than one product surface |
 | `group-divergent-refs` | warning | members of a group cite differing `vuln_refs` |
-| `no-patched`, `no-verify`, `weak-verify`, `identical-states` | warning | the template proves less than it could |
+| `no-ports` | error | `service` declares no ports |
+| `no-patched`, `no-verify`, `weak-verify`, `identical-states` | warning | the template proves less than it could (`identical-states`: vulnerable and patched have the same image, build inputs, command, sidecar images and seed) |
 | `source-no-diff` | warning | a source base where states have no patch/image difference |
 | `no-healthcheck`, `no-vuln-ref`, `no-references`, `scanner-unnamed` | warning | missing provenance |
 | `no-detected-by` | warning | no scanner template linked and `detection` unset |
 | `fidelity-unset` | warning | metadata.fidelity is not set (real or simulated) |
 | `simulated-on-image-base` | warning | fidelity: simulated but the base is a prebuilt image |
 | `kvm-without-requires` | warning | service.devices has /dev/kvm but requires.kvm is not set |
+| `host-device-access` | warning | `service.devices` passes a host device through; `run` needs `-allow-host-access` |
+| `elevated-capability` | warning | `cap_add` adds a capability that can escape the container; `run` needs `-allow-host-access` |
+| `primary-no-group` | warning | `primary: true` is set without a `group` |
+| `unknown-scanner` | warning | a `detected_by` entry names a scanner other than `nuclei` or `nmap` |
 | `unknown-scanner-template`, `undeclared-scanner-template` | warning | with a nuclei-templates checkout: a declared id does not exist / a template for the target's CVE is not declared |
 
 `-strict` turns warnings into failures (use it in CI).

@@ -19,8 +19,14 @@ import (
 // ContractNames are the file names a template contract may use.
 var ContractNames = []string{"contract.yaml", "contract.yml", "template.yaml"}
 
-// skipDirs are never descended into while discovering templates.
-var skipDirs = map[string]bool{".git": true, "node_modules": true, ".venv": true, "src": true, "files": true, "patches": true}
+// skipDirs are never descended into while discovering templates (nor is any
+// dot-directory: .git, .github, .venv, a .trash folder...).
+var skipDirs = map[string]bool{"node_modules": true}
+
+// contentDirs hold a template's own build inputs. They are skipped only inside a
+// contract folder, so a category that happens to be called "files" is still
+// discovered.
+var contentDirs = map[string]bool{"src": true, "files": true, "patches": true}
 
 // Error is a load/discovery error tied to a path or selector.
 type Error struct {
@@ -85,8 +91,13 @@ func (s *Store) Find(selector string) ([]string, error) {
 	refShaped := contract.IsVulnRef(selector)
 	var exact, fuzzy, refMatch []string
 	var group []GroupMember
+	var unreadable []string
 	for _, f := range all {
-		p := peek(f)
+		p, perr := peek(f)
+		if perr != nil {
+			unreadable = append(unreadable, fmt.Sprintf("%s: %v", f, perr))
+			continue
+		}
 		switch {
 		case p.ID == selector:
 			exact = append(exact, f)
@@ -137,7 +148,14 @@ func (s *Store) Find(selector string) ([]string, error) {
 		}
 		return nil, &Error{Path: selector, Message: "ambiguous selector; matches " + strings.Join(ids, ", ")}
 	}
-	return nil, &Error{Path: selector, Message: "no template found (folder, file, id, group or vuln_ref)"}
+	msg := "no template found (folder, file, id, group or vuln_ref)"
+	if len(unreadable) > 0 {
+		// The wanted template may be one that does not parse; say so rather
+		// than hiding the YAML error behind "not found".
+		msg += fmt.Sprintf("; %d template(s) could not be read and may be the one you meant:\n  %s",
+			len(unreadable), strings.Join(unreadable, "\n  "))
+	}
+	return nil, &Error{Path: selector, Message: msg}
 }
 
 // FindMany resolves several selectors, de-duplicated, preserving order.
@@ -314,30 +332,64 @@ func (s *Store) ByID() (map[string]*contract.Contract, error) {
 	return out, nil
 }
 
+// contractsIn discovers contract files under folder. Each folder contributes
+// at most one contract (the first of ContractNames present); dot-directories
+// and skipDirs are never entered, contentDirs are skipped inside a contract
+// folder, and symlinked directories are followed once (a directory reached
+// again through a link loop is not re-entered).
 func contractsIn(folder string) ([]string, error) {
+	root, err := filepath.Abs(folder)
+	if err != nil {
+		root = folder
+	}
 	var out []string
-	err := filepath.WalkDir(folder, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			if errors.Is(err, fs.ErrPermission) {
+	visited := map[string]bool{}
+	var walk func(dir string, top bool) error
+	walk = func(dir string, top bool) error {
+		if real, err := filepath.EvalSymlinks(dir); err == nil {
+			if visited[real] {
 				return nil
+			}
+			visited[real] = true
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if !top || errors.Is(err, fs.ErrPermission) {
+				return nil // an unreadable subfolder is skipped, as before
 			}
 			return err
 		}
-		if d.IsDir() {
-			if p != folder && skipDirs[d.Name()] {
-				return filepath.SkipDir
+		files := map[string]bool{}
+		for _, e := range entries {
+			if !e.IsDir() {
+				files[e.Name()] = true
 			}
-			return nil
 		}
+		inContract := false
 		for _, n := range ContractNames {
-			if d.Name() == n {
-				abs, _ := filepath.Abs(p)
-				out = append(out, abs)
+			if files[n] {
+				out = append(out, filepath.Join(dir, n))
+				inContract = true
+				break
+			}
+		}
+		for _, e := range entries {
+			name := e.Name()
+			isDir := e.IsDir()
+			if e.Type()&fs.ModeSymlink != 0 {
+				info, err := os.Stat(filepath.Join(dir, name))
+				isDir = err == nil && info.IsDir()
+			}
+			if !isDir || strings.HasPrefix(name, ".") || skipDirs[name] || (inContract && contentDirs[name]) {
+				continue
+			}
+			if err := walk(filepath.Join(dir, name), false); err != nil {
+				return err
 			}
 		}
 		return nil
-	})
-	if err != nil {
+	}
+	if err := walk(root, true); err != nil {
 		return nil, &Error{Path: folder, Message: err.Error(), Err: err}
 	}
 	sort.Strings(out)
@@ -354,16 +406,19 @@ type peeked struct {
 	Primary bool
 }
 
-// peekID reads just metadata.id without full validation.
-func peekID(path string) string { return peek(path).ID }
+// peekID reads just metadata.id without full validation ("" when unreadable).
+func peekID(path string) string {
+	p, _ := peek(path)
+	return p.ID
+}
 
 // peek reads the resolution-relevant metadata (id, vuln_refs, group, variant,
 // primary) without full validation, for cheap id/reference/group resolution
-// over a whole tree.
-func peek(path string) peeked {
+// over a whole tree. The error is the read or YAML error, if any.
+func peek(path string) (peeked, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return peeked{}
+		return peeked{}, err
 	}
 	var doc struct {
 		Metadata struct {
@@ -375,10 +430,10 @@ func peek(path string) peeked {
 		} `yaml:"metadata"`
 	}
 	if err := yaml.Unmarshal(data, &doc); err != nil {
-		return peeked{}
+		return peeked{}, fmt.Errorf("invalid YAML: %s", strings.TrimSpace(yaml.FormatError(err, false, false)))
 	}
 	m := doc.Metadata
-	return peeked{ID: m.ID, Refs: m.VulnRefs, Group: m.Group, Variant: m.Variant, Primary: m.Primary}
+	return peeked{ID: m.ID, Refs: m.VulnRefs, Group: m.Group, Variant: m.Variant, Primary: m.Primary}, nil
 }
 
 // PeekID exposes peekID for callers that only need ids (e.g. listing).
@@ -401,7 +456,7 @@ func (s *Store) groups() (map[string][]GroupMember, error) {
 	}
 	out := map[string][]GroupMember{}
 	for _, f := range all {
-		p := peek(f)
+		p, _ := peek(f) // an unreadable contract is in no group; Load reports it
 		if p.Group == "" {
 			continue
 		}

@@ -33,9 +33,14 @@ import (
 // FeedURL is the public CISA KEV JSON feed.
 const FeedURL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 
-// cveRe matches a bare CVE id anywhere in a line (case-insensitive; ids are
-// upper-cased on insertion).
-var cveRe = regexp.MustCompile(`(?i)CVE-\d{4}-\d{4,7}`)
+// cveRe matches a bare CVE id within a line (case-insensitive; ids are
+// upper-cased on insertion). The word boundaries keep it from taking a prefix of
+// a longer token (CVE-2021-12345678 is not CVE-2021-1234567).
+var cveRe = regexp.MustCompile(`(?i)\bCVE-\d{4}-\d{4,7}\b`)
+
+// cveExactRe matches a value that is exactly one CVE id, for whole-value
+// checks of cache and feed entries.
+var cveExactRe = regexp.MustCompile(`(?i)^CVE-\d{4}-\d{4,7}$`)
 
 // Set is a set of KEV-listed CVE ids (upper-cased).
 type Set map[string]bool
@@ -107,6 +112,18 @@ type Options struct {
 	FeedURL string
 	// Now overrides the clock used for cache timestamps (tests).
 	Now func() time.Time
+	// Warn receives non-fatal problems (a corrupt cache, an empty snapshot).
+	// Nil writes them to stderr.
+	Warn func(msg string)
+}
+
+func (o Options) warn(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	if o.Warn != nil {
+		o.Warn(msg)
+		return
+	}
+	fmt.Fprintln(os.Stderr, "warning: "+msg)
 }
 
 func (o Options) feedURL() string {
@@ -138,7 +155,9 @@ func (o Options) now() time.Time {
 
 // Resolve loads the KEV CVE-id set per the sourcing rules. It never errors on a
 // missing source; it only errors when Refresh is set and the fetch fails, or on
-// an unreadable existing file.
+// an unreadable templates snapshot. A corrupt or unreadable cache is treated as
+// missing (with a warning), and an empty templates snapshot falls through to
+// the cache, so a bad file cannot break every listing.
 func Resolve(ctx context.Context, opts Options) (Set, Source, error) {
 	cachePath, cacheErr := opts.cachePath()
 
@@ -161,7 +180,12 @@ func Resolve(ctx context.Context, opts Options) (Set, Source, error) {
 	if opts.TemplatesDir != "" {
 		txt := filepath.Join(opts.TemplatesDir, "data", "cisa-kev.txt")
 		if data, err := os.ReadFile(txt); err == nil {
-			return parseTxt(data), Source{Origin: OriginTemplates, Path: txt}, nil
+			if set := parseTxt(data); set.Len() > 0 {
+				return set, Source{Origin: OriginTemplates, Path: txt}, nil
+			}
+			// An empty snapshot (e.g. a failed sync committed an empty file) is
+			// not authoritative: fall through to the cache.
+			opts.warn("%s contains no CVE ids; ignoring it", txt)
 		} else if !os.IsNotExist(err) {
 			return nil, Source{}, fmt.Errorf("read %s: %w", txt, err)
 		}
@@ -172,7 +196,8 @@ func Resolve(ctx context.Context, opts Options) (Set, Source, error) {
 		if set, fetched, err := loadCache(cachePath); err == nil {
 			return set, Source{Origin: OriginCache, Path: cachePath, Fetched: fetched}, nil
 		} else if !os.IsNotExist(err) {
-			return nil, Source{}, fmt.Errorf("read KEV cache %s: %w", cachePath, err)
+			// A truncated or unreadable cache is treated as missing.
+			opts.warn("ignoring KEV cache %s: %v (run with -refresh-kev to rebuild it)", cachePath, err)
 		}
 	}
 
@@ -213,7 +238,7 @@ func loadCache(path string) (Set, string, error) {
 	}
 	set := Set{}
 	for _, id := range cf.CVEs {
-		if cveRe.MatchString(id) {
+		if cveExactRe.MatchString(id) {
 			set[strings.ToUpper(id)] = true
 		}
 	}
@@ -229,7 +254,26 @@ func writeCache(path string, set Set, source, fetched string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	// Write a temp file in the same directory and rename it into place, so a
+	// crash or a concurrent -refresh-kev never leaves a truncated cache.
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".cisa-kev-*.json.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after a successful rename
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // feedDoc is the subset of the CISA KEV JSON feed we read.
@@ -266,7 +310,7 @@ func fetch(ctx context.Context, client *http.Client, url string) (Set, error) {
 	}
 	set := Set{}
 	for _, v := range doc.Vulnerabilities {
-		if cveRe.MatchString(v.CveID) {
+		if cveExactRe.MatchString(v.CveID) {
 			set[strings.ToUpper(v.CveID)] = true
 		}
 	}

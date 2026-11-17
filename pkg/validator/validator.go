@@ -308,7 +308,17 @@ func (v *Validator) states(c *contract.Contract) []Finding {
 		sameImg := vs.EffectiveImage(c.Base) == ps.EffectiveImage(c.Base)
 		sameHash := c.ContentHash(contract.StateVulnerable) == c.ContentHash(contract.StatePatched)
 		sameCmd := fmt.Sprint(vs.Command) == fmt.Sprint(ps.Command)
-		if sameImg && sameHash && sameCmd {
+		// The states also differ when a sidecar resolves to another image (the
+		// multi-node pattern: patched swaps each node to the fixed release) or
+		// when they seed different data.
+		sameSidecars := true
+		for _, sc := range c.Service.Sidecars {
+			if vs.SidecarRef(sc) != ps.SidecarRef(sc) {
+				sameSidecars = false
+			}
+		}
+		sameSeed := fmt.Sprint(vs.Seed) == fmt.Sprint(ps.Seed)
+		if sameImg && sameHash && sameCmd && sameSidecars && sameSeed {
 			out = append(out, Finding{Warning, c.ID(), "identical-states",
 				"vulnerable and patched resolve to the same build"})
 		}
@@ -415,6 +425,10 @@ func (v *Validator) provenance(c *contract.Contract) []Finding {
 	if len(c.Metadata.VulnRefs) == 0 {
 		out = append(out, Finding{Warning, c.ID(), "no-vuln-ref",
 			"no vuln_refs; a scanner cross-reference has nothing to match"})
+	}
+	if c.Metadata.Primary && c.Metadata.Group == "" {
+		out = append(out, Finding{Warning, c.ID(), "primary-no-group",
+			"primary: true has no effect without a group; set metadata.group or drop primary"})
 	}
 	if len(c.Metadata.References) == 0 {
 		out = append(out, Finding{Warning, c.ID(), "no-references",
