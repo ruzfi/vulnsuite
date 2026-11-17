@@ -164,7 +164,8 @@ emulation platform, else the daemon's own), otherwise it is rebuilt.
 ## `verify` probes
 
 Exactly one kind per probe (`http`, `tcp`, `net` or `exec`). A probe `port` is
-1-65535 and a `timeout` (seconds) is greater than 0. Probes are independent of any scanner: they
+1-65535 and a `timeout` (seconds) is greater than 0; leave either out for the
+default (an explicit `port: 0` or `timeout: 0` is rejected). Probes are independent of any scanner: they
 demonstrate the *impact* from the advisory, not a matcher.
 
 ```yaml
@@ -234,6 +235,8 @@ rather than failed; use `-expose host` or scan from a container.
 | `group-multi-category` | warning | a group spans more than one product surface |
 | `group-divergent-refs` | warning | members of a group cite differing `vuln_refs` |
 | `no-ports` | error | `service` declares no ports |
+| `undeclared-port` | warning | `healthcheck.tcp.port` or a verify probe's `port` is not declared in `service.ports` (usually a typo; a `tcp` probe with `closed: true` is exempt) |
+| `shadowed-contract` | warning | the template folder holds a second contract file (`contract.yaml`, `contract.yml`, `template.yaml`); only the first is loaded |
 | `no-patched`, `no-verify`, `weak-verify`, `identical-states` | warning | the template proves less than it could (`identical-states`: vulnerable and patched have the same image, build inputs, command, sidecar images and seed) |
 | `source-no-diff` | warning | a source base where states have no patch/image difference |
 | `no-healthcheck`, `no-vuln-ref`, `no-references`, `scanner-unnamed` | warning | missing provenance |

@@ -315,3 +315,20 @@ func TestFindSurfacesYAMLErrors(t *testing.T) {
 		t.Fatalf("web-ok: %v %v", p, err)
 	}
 }
+
+func TestShadowed(t *testing.T) {
+	dir := t.TempDir()
+	for _, n := range []string{"contract.yaml", "contract.yml", "notes.yaml"} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := Shadowed(filepath.Join(dir, "contract.yaml"))
+	if len(got) != 1 || filepath.Base(got[0]) != "contract.yml" {
+		t.Fatalf("Shadowed = %v, want [contract.yml]", got)
+	}
+	found, err := New(dir).All()
+	if err != nil || len(found) != 1 {
+		t.Fatalf("discovery must still load one contract per folder: %v %v", found, err)
+	}
+}
