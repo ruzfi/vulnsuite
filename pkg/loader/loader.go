@@ -502,3 +502,20 @@ func primaryOf(members []GroupMember) (path string, ok bool) {
 	}
 	return "", false
 }
+
+// Shadowed returns the other contract files in the folder of the contract at
+// path: discovery uses only the first of ContractNames present in a folder, so
+// any other one is silently ignored. Callers (validate) report them.
+func Shadowed(path string) []string {
+	dir, self := filepath.Dir(path), filepath.Base(path)
+	var out []string
+	for _, n := range ContractNames {
+		if n == self {
+			continue
+		}
+		if info, err := os.Stat(filepath.Join(dir, n)); err == nil && info.Mode().IsRegular() {
+			out = append(out, filepath.Join(dir, n))
+		}
+	}
+	return out
+}

@@ -41,6 +41,43 @@ func checkDocument(data []byte) error {
 
 var commandType = reflect.TypeOf(Command(nil))
 
+// probeTypes are the verify-probe structs whose port and timeout the schema
+// bounds (port 1..65535, timeout > 0). Their Go fields are plain numbers where
+// 0 means "the default", so an explicit `port: 0` or `timeout: 0` cannot be
+// told apart from an absent key after decoding; checkNodeType rejects it here,
+// where the key's presence is still visible.
+var probeTypes = map[reflect.Type]bool{
+	reflect.TypeOf(HTTPProbe{}): true,
+	reflect.TypeOf(ExecProbe{}): true,
+	reflect.TypeOf(TCPProbe{}):  true,
+	reflect.TypeOf(NetProbe{}):  true,
+}
+
+// checkPositive rejects an explicit non-positive probe port or timeout.
+func checkPositive(n ast.Node, key, loc string) error {
+	var v float64
+	switch x := unwrap(n).(type) {
+	case *ast.IntegerNode:
+		switch i := x.Value.(type) {
+		case int64:
+			v = float64(i)
+		case uint64:
+			v = float64(i)
+		}
+	case *ast.FloatNode:
+		v = x.Value
+	default:
+		return nil // a type error is reported by checkNodeType
+	}
+	switch {
+	case key == "port" && v < 1:
+		return se(loc, "must be 1..65535")
+	case key == "timeout" && v <= 0:
+		return se(loc, "must be greater than 0")
+	}
+	return nil
+}
+
 // nonEmptyLists are the list fields the schema declares with minItems: 1
 // (metadata.class, service.ports, states.*.verify, net.steps), by key name.
 var nonEmptyLists = map[string]bool{"class": true, "ports": true, "verify": true, "steps": true}
@@ -207,6 +244,11 @@ func checkNodeType(n ast.Node, t reflect.Type, loc string) error {
 			}
 			if err := checkNodeType(e.Value, f.Type, join(loc, key)); err != nil {
 				return err
+			}
+			if probeTypes[t] && (key == "port" || key == "timeout") {
+				if err := checkPositive(e.Value, key, join(loc, key)); err != nil {
+					return err
+				}
 			}
 		}
 	}

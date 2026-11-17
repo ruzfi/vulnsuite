@@ -370,3 +370,52 @@ func TestPrimaryWithoutGroup(t *testing.T) {
 		t.Fatal("no primary, no warning")
 	}
 }
+
+func TestUndeclaredPortRefs(t *testing.T) {
+	v := &Validator{}
+	if l, ok := rules(v.Check(parse(t, base)))["undeclared-port"]; ok {
+		t.Fatalf("declared ports flagged: %v", l)
+	}
+	cases := map[string]string{
+		"healthcheck": strings.Replace(base, "tcp: { port: 80 }", "tcp: { port: 8080 }", 1),
+		"http":        strings.Replace(base, "{ http: { path: /, status: 200,", "{ http: { port: 8443, path: /, status: 200,", 1),
+		"tcp":         strings.Replace(base, `[ { http: { path: /, status_in: [404] } } ]`, `[ { tcp: { port: 22 } } ]`, 1),
+		"net":         strings.Replace(base, `[ { http: { path: /, status_in: [404] } } ]`, `[ { net: { port: 25, steps: [ { expect: "220" } ] } } ]`, 1),
+	}
+	for name, doc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if doc == base {
+				t.Fatal("replacement did not apply")
+			}
+			fs := v.Check(parse(t, doc))
+			if rules(fs)["undeclared-port"] != Warning {
+				t.Fatalf("want undeclared-port warning, got %v", fs)
+			}
+		})
+	}
+	// Proving a port is closed needs no declaration.
+	closed := strings.Replace(base, `[ { http: { path: /, status_in: [404] } } ]`, `[ { tcp: { port: 9229, closed: true } } ]`, 1)
+	if _, ok := rules(v.Check(parse(t, closed)))["undeclared-port"]; ok {
+		t.Fatal("tcp closed: true must not need a declared port")
+	}
+}
+
+func TestShadowedContract(t *testing.T) {
+	c := parse(t, base)
+	c.SourcePath = filepath.Join(c.Folder, "contract.yaml")
+	for _, n := range []string{"contract.yaml", "template.yaml"} {
+		if err := os.WriteFile(filepath.Join(c.Folder, n), []byte(base), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fs := (&Validator{}).Check(c)
+	if rules(fs)["shadowed-contract"] != Warning {
+		t.Fatalf("want shadowed-contract warning, got %v", fs)
+	}
+	if err := os.Remove(filepath.Join(c.Folder, "template.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := rules((&Validator{}).Check(c))["shadowed-contract"]; ok {
+		t.Fatal("a lone contract must not be reported as shadowed")
+	}
+}

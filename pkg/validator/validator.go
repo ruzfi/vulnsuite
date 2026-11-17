@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/ruzfi/vulnsuite/pkg/contract"
+	"github.com/ruzfi/vulnsuite/pkg/loader"
 	"github.com/ruzfi/vulnsuite/pkg/scanners"
 )
 
@@ -65,6 +66,8 @@ func (v *Validator) Check(c *contract.Contract) []Finding {
 	out = append(out, v.states(c)...)
 	out = append(out, v.verify(c)...)
 	out = append(out, v.ports(c)...)
+	out = append(out, v.portRefs(c)...)
+	out = append(out, v.shadowed(c)...)
 	out = append(out, v.provenance(c)...)
 	out = append(out, v.fidelity(c)...)
 	out = append(out, v.requires(c)...)
@@ -445,6 +448,61 @@ func (v *Validator) ports(c *contract.Contract) []Finding {
 			"no healthcheck; the runner cannot tell when the target is ready"})
 	} else if _, err := contract.ParseDuration(c.Service.Healthcheck.Timeout, 0); err != nil {
 		out = append(out, Finding{Error, c.ID(), "bad-timeout", err.Error()})
+	}
+	return out
+}
+
+// portRefs checks that every container port a template refers to elsewhere
+// (healthcheck.tcp.port, verify http/tcp/net port) is declared in
+// service.ports. An undeclared port is never published in host mode and is
+// usually a typo, which otherwise surfaces only as a hang or a failed verify
+// at run time. It is a warning, not an error: a template may deliberately
+// probe a port only one state opens (a debug listener the vulnerable command
+// line enables). A tcp probe asserting closed: true is exempt, since proving a
+// port is shut needs no declaration.
+func (v *Validator) portRefs(c *contract.Contract) []Finding {
+	declared := map[int]bool{}
+	for _, p := range c.Service.Ports {
+		declared[p.Container] = true
+	}
+	var out []Finding
+	check := func(where string, port int) {
+		if port == 0 || declared[port] {
+			return // 0 is the default: the primary port
+		}
+		out = append(out, Finding{Warning, c.ID(), "undeclared-port",
+			fmt.Sprintf("%s refers to port %d, which is not declared in service.ports", where, port)})
+	}
+	if hc := c.Service.Healthcheck.TCP; hc != nil {
+		check("healthcheck.tcp.port", hc.Port)
+	}
+	for _, name := range c.DeclaredStates() {
+		for i, p := range c.States[name].Verify {
+			where := fmt.Sprintf("%s: verify probe #%d (%s)", name, i+1, p.Kind())
+			switch {
+			case p.HTTP != nil:
+				check(where, p.HTTP.Port)
+			case p.TCP != nil && !p.TCP.Closed:
+				check(where, p.TCP.Port)
+			case p.Net != nil:
+				check(where, p.Net.Port)
+			}
+		}
+	}
+	return out
+}
+
+// shadowed reports other contract files in the template's folder: discovery
+// loads one contract per folder, so the others are silently ignored.
+func (v *Validator) shadowed(c *contract.Contract) []Finding {
+	if c.SourcePath == "" {
+		return nil
+	}
+	var out []Finding
+	for _, other := range loader.Shadowed(c.SourcePath) {
+		out = append(out, Finding{Warning, c.ID(), "shadowed-contract",
+			fmt.Sprintf("folder also holds %s; a folder holds one template and only the first of %s is loaded, so the other is ignored",
+				filepath.Base(other), strings.Join(loader.ContractNames, ", "))})
 	}
 	return out
 }
