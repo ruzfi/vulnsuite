@@ -65,6 +65,15 @@ func flagSet(fs *flag.FlagSet, name string) bool {
 	return set
 }
 
+// buildSummary is `build -json -summary`: the images resolved, the jobs that
+// failed (load, build, pull or push errors) and the ones skipped, each with a
+// reason, so a pipeline can tell the three apart.
+type buildSummary struct {
+	Built   []buildResult  `json:"built"`
+	Failed  []buildResult  `json:"failed"`
+	Skipped []outcomeEntry `json:"skipped"`
+}
+
 type buildResult struct {
 	ID        string   `json:"id"`
 	State     string   `json:"state"`
@@ -80,7 +89,7 @@ type buildResult struct {
 func cmdBuild() *Command {
 	var sel, files multiFlag
 	var flt filters
-	var all, variants, noCache, force, noPull, push, showLog, ignoreRequires bool
+	var all, variants, noCache, force, noPull, push, showLog, ignoreRequires, summary bool
 	var states, registry, platform string
 	var jobs int
 	return &Command{
@@ -112,8 +121,12 @@ VULNSUITE_REGISTRY_USER / VULNSUITE_REGISTRY_TOKEN or ~/.docker/config.json.`,
 			fs.StringVar(&registry, "registry", "", "registry prefix for -push, e.g. ghcr.io/ruzfi/vulnsuite")
 			fs.BoolVar(&showLog, "log", false, "print the full engine output of every build")
 			fs.BoolVar(&ignoreRequires, "ignore-requires", false, "build even when the host does not meet a target's requires")
+			fs.BoolVar(&summary, "summary", false, "with -json, print {built, failed, skipped} instead of the bare array of results")
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
+			if summary && !g.JSON {
+				return usageError{"-summary shapes the -json output; add -json"}
+			}
 			posState, args, err := takeState(args)
 			if err != nil {
 				return err
@@ -149,21 +162,43 @@ VULNSUITE_REGISTRY_USER / VULNSUITE_REGISTRY_TOKEN or ~/.docker/config.json.`,
 				g.errorf("ERROR %v\n", e)
 				loadFailed = append(loadFailed, buildResult{ID: loadErrID(e), Error: e.Error()})
 			}
+			skipped := []outcomeEntry{}
 			var jobsList []builder.Job
 			for _, c := range cs {
+				n := 0
 				for _, s := range want {
 					if c.HasState(s) {
 						jobsList = append(jobsList, builder.Job{Contract: c, State: s})
+						n++
 					}
 				}
+				if n == 0 {
+					skipped = append(skipped, outcomeEntry{ID: c.ID(), Reason: reasonNoState, Detail: "no " + strings.Join(want, " or ") + " state"})
+				}
+			}
+			// emit writes the -json output: the bare result array, or with
+			// -summary the {built, failed, skipped} document.
+			emit := func(results []buildResult) error {
+				if !summary {
+					return g.emitJSON(results)
+				}
+				sum := buildSummary{Built: []buildResult{}, Failed: []buildResult{}, Skipped: skipped}
+				for _, r := range results {
+					if r.Error != "" {
+						sum.Failed = append(sum.Failed, r)
+					} else {
+						sum.Built = append(sum.Built, r)
+					}
+				}
+				return g.emitJSON(sum)
 			}
 			if len(jobsList) == 0 {
-				if len(loadFailed) > 0 {
-					if g.JSON {
-						if err := g.emitJSON(loadFailed); err != nil {
-							return err
-						}
+				if g.JSON && (summary || len(loadFailed) > 0) {
+					if err := emit(append([]buildResult{}, loadFailed...)); err != nil {
+						return err
 					}
+				}
+				if len(loadFailed) > 0 {
 					return fmt.Errorf("%d template(s) failed to load; nothing to build", len(loadFailed))
 				}
 				return fmt.Errorf("nothing to build")
@@ -191,6 +226,7 @@ VULNSUITE_REGISTRY_USER / VULNSUITE_REGISTRY_TOKEN or ~/.docker/config.json.`,
 				d := runner.Preflight(j.Contract.Requires, host)
 				if d.Skip() && !ignoreRequires {
 					g.errorf("skip %s [%s]: %s\n", j.Contract.ID(), j.State, d.Reason)
+					skipped = append(skipped, outcomeEntry{ID: j.Contract.ID(), State: j.State, Reason: reasonRequires, Detail: d.Reason})
 					continue
 				}
 				if d.Action == runner.ActionEmulated && platform == "" {
@@ -204,26 +240,32 @@ VULNSUITE_REGISTRY_USER / VULNSUITE_REGISTRY_TOKEN or ~/.docker/config.json.`,
 			}
 			jobsList = kept
 			if len(jobsList) == 0 {
+				if g.JSON && (summary || len(loadFailed) > 0) {
+					if err := emit(append([]buildResult{}, loadFailed...)); err != nil {
+						return err
+					}
+				}
+				if len(loadFailed) > 0 {
+					return fmt.Errorf("%d template(s) failed to load; nothing else to build (all targets skipped by host requirements; -ignore-requires to override)", len(loadFailed))
+				}
 				return fmt.Errorf("nothing to build (all targets skipped by host requirements; -ignore-requires to override)")
 			}
 			g.printf("building %d image(s) with %d worker(s)...\n", len(jobsList), jobs)
 			started := time.Now()
-			results := make([]buildResult, 0, len(jobsList)+len(loadFailed))
-			results = append(results, loadFailed...)
-			failed := len(loadFailed)
+			// Progress is printed as each job finishes; the results are built
+			// from ResolveAll's outcomes afterwards, so a job an interrupt
+			// stopped before it started is counted too (it never reaches onDone).
+			ran := map[builder.Job]bool{}
 			outcomes := b.ResolveAll(ctx, jobsList, jobs, builder.Options{Pull: !noPull, NoCache: noCache, Force: force, Platform: platform},
 				func(o builder.Outcome) {
-					r := buildResult{ID: o.Job.Contract.ID(), State: o.Job.State}
+					ran[o.Job] = true
+					id := o.Job.Contract.ID()
 					if o.Err != nil {
-						failed++
-						r.Error = o.Err.Error()
-						g.errorf("✗ %s [%s]: %v\n", r.ID, r.State, o.Err)
+						g.errorf("✗ %s [%s]: %v\n", id, o.Job.State, o.Err)
 						if !showLog {
 							g.errorf("%s", indent(lastLines(o.Log, 20), "    "))
 						}
 					} else {
-						r.Ref, r.BuildKind, r.Built, r.Pulled = o.Resolved.Ref, o.Resolved.BuildKind, o.Resolved.Built, o.Resolved.Pulled
-						r.Elapsed = o.Resolved.Elapsed.Round(100 * time.Millisecond).String()
 						verb := "reused"
 						switch {
 						case o.Resolved.Built:
@@ -231,25 +273,44 @@ VULNSUITE_REGISTRY_USER / VULNSUITE_REGISTRY_TOKEN or ~/.docker/config.json.`,
 						case o.Resolved.Pulled:
 							verb = "pulled"
 						}
-						g.printf("✔ %s [%s] %s (%s) %s  %s\n", r.ID, r.State, verb, r.BuildKind, r.Elapsed, r.Ref)
+						g.printf("✔ %s [%s] %s (%s) %s  %s\n", id, o.Job.State, verb, o.Resolved.BuildKind, o.Resolved.Elapsed.Round(100*time.Millisecond), o.Resolved.Ref)
 					}
 					if showLog && o.Log != "" {
 						g.printf("%s", indent(o.Log, "    "))
 					}
-					results = append(results, r)
 				})
-			_ = outcomes
+			results := make([]buildResult, 0, len(outcomes)+len(loadFailed))
+			results = append(results, loadFailed...)
+			var cancelled []buildResult
+			for _, o := range outcomes {
+				r := buildResult{ID: o.Job.Contract.ID(), State: o.Job.State}
+				switch {
+				case !ran[o.Job]:
+					r.Error = "cancelled before it started"
+					cancelled = append(cancelled, r)
+					skipped = append(skipped, outcomeEntry{ID: r.ID, State: r.State, Reason: reasonCancelled, Detail: r.Error})
+					continue
+				case o.Err != nil:
+					r.Error = o.Err.Error()
+				default:
+					r.Ref, r.BuildKind, r.Built, r.Pulled = o.Resolved.Ref, o.Resolved.BuildKind, o.Resolved.Built, o.Resolved.Pulled
+					r.Elapsed = o.Resolved.Elapsed.Round(100 * time.Millisecond).String()
+				}
+				results = append(results, r)
+			}
 			if push {
 				for i := range results {
 					r := &results[i]
 					if r.Error != "" {
 						continue
 					}
+					if ctx.Err() != nil {
+						break // interrupted: push nothing more
+					}
 					c := findContract(cs, r.ID)
 					pushed, err := b.Publish(ctx, c, r.State, registry, nil)
 					r.Pushed = pushed
 					if err != nil {
-						failed++
 						r.Error = err.Error()
 						g.errorf("✗ push %s [%s]: %v\n", r.ID, r.State, err)
 						continue
@@ -257,25 +318,54 @@ VULNSUITE_REGISTRY_USER / VULNSUITE_REGISTRY_TOKEN or ~/.docker/config.json.`,
 					g.printf("⇧ %s [%s] pushed %s\n", r.ID, r.State, strings.Join(pushed, ", "))
 				}
 			}
+			failed := 0
+			for _, r := range results {
+				if r.Error != "" {
+					failed++
+				}
+			}
+			if !summary {
+				// The bare array lists every job, a cancelled one with its error.
+				results = append(results, cancelled...)
+			}
 			sort.Slice(results, func(i, j int) bool {
 				if results[i].ID != results[j].ID {
 					return results[i].ID < results[j].ID
 				}
 				return results[i].State < results[j].State
 			})
+			sortOutcomes(skipped)
 			if g.JSON {
-				if err := g.emitJSON(results); err != nil {
+				if err := emit(results); err != nil {
 					return err
 				}
 			} else {
-				g.printf("\n%d ok, %d failed in %s\n", len(results)-failed, failed, time.Since(started).Round(time.Second))
+				ok := len(results) - failed - len(cancelled)
+				line := fmt.Sprintf("\n%d ok, %d failed", ok, failed)
+				if len(cancelled) > 0 {
+					line += fmt.Sprintf(", %d cancelled before starting", len(cancelled))
+				}
+				g.printf("%s in %s\n", line, time.Since(started).Round(time.Second))
 			}
-			if failed > 0 {
+			switch {
+			case len(cancelled) > 0 || ctx.Err() != nil:
+				return fmt.Errorf("%w: %d build(s) failed, %d cancelled before starting", errInterrupted, failed, len(cancelled))
+			case failed > 0:
 				return fmt.Errorf("%d build(s) failed", failed)
 			}
 			return nil
 		},
 	}
+}
+
+// sortOutcomes orders skipped/failed entries by id, then state.
+func sortOutcomes(es []outcomeEntry) {
+	sort.SliceStable(es, func(i, j int) bool {
+		if es[i].ID != es[j].ID {
+			return es[i].ID < es[j].ID
+		}
+		return es[i].State < es[j].State
+	})
 }
 
 // loadErrID names the template behind a load error: its id when the file can
