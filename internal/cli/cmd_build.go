@@ -33,6 +33,38 @@ func parseStates(s string) ([]string, error) {
 	return out, nil
 }
 
+// takeState pulls a state token (vulnerable or patched) out of a command's
+// positionals, wherever it appears (`run grafana patched`, `build patched -t
+// x`), and returns it with the remaining positionals, the selectors. A
+// positional spelled like a state is always the state: no template in the
+// community set has an id, group or category named vulnerable or patched, and
+// one that did can still be selected with -t. Naming two different states is a
+// usage error.
+func takeState(args []string) (state string, rest []string, err error) {
+	for _, a := range args {
+		if !has(contract.StateNames, a) {
+			rest = append(rest, a)
+			continue
+		}
+		if state != "" && state != a {
+			return "", nil, usageError{fmt.Sprintf("two states given (%s and %s); run one state at a time", state, a)}
+		}
+		state = a
+	}
+	return state, rest, nil
+}
+
+// flagSet reports whether the named flag was given on the command line.
+func flagSet(fs *flag.FlagSet, name string) bool {
+	set := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
+}
+
 type buildResult struct {
 	ID        string   `json:"id"`
 	State     string   `json:"state"`
@@ -54,10 +86,12 @@ func cmdBuild() *Command {
 	return &Command{
 		Name:  "build",
 		Short: "build (or pull) the images for templates, content-addressed, in parallel",
-		Usage: "-t SEL... | -f FILE | <filter> | -all [-variants] [-state vulnerable|patched|all] [-j N] [-push -registry REG]",
+		Usage: "[vulnerable|patched] -t SEL... | -f FILE | <filter> | -all [-variants] [-state vulnerable|patched|all] [-j N] [-push -registry REG]",
 		Long: `Every state's image is tagged ` + contract.ImageRepoPrefix + `/<id>:<state>-<hash> where the hash
 covers the base, patches, overlays and environment. Identical inputs are never
-rebuilt. Prebuilt (image-kind) states are pulled, not built.
+rebuilt. Prebuilt (image-kind) states are pulled, not built. A state
+positional (vulnerable or patched), anywhere among the arguments, is shorthand
+for -state: ` + "`build patched -t grafana`" + `.
 
 With -push, each image is also tagged <registry>/<id>:<state> and
 <registry>/<id>:<state>-<hash> and pushed. Credentials come from
@@ -80,10 +114,22 @@ VULNSUITE_REGISTRY_USER / VULNSUITE_REGISTRY_TOKEN or ~/.docker/config.json.`,
 			fs.BoolVar(&ignoreRequires, "ignore-requires", false, "build even when the host does not meet a target's requires")
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
+			posState, args, err := takeState(args)
+			if err != nil {
+				return err
+			}
 			sel = append(sel, args...)
 			want, err := parseStates(states)
 			if err != nil {
 				return err
+			}
+			if posState != "" {
+				// `build patched ...` is -state patched; an explicit -state
+				// that says otherwise is a contradiction, not a preference.
+				if flagSet(fs, "state") && (len(want) != 1 || want[0] != posState) {
+					return usageError{fmt.Sprintf("state %q contradicts -state %s", posState, states)}
+				}
+				want = []string{posState}
 			}
 			if push && registry == "" {
 				return usageError{"-push needs -registry"}

@@ -189,7 +189,7 @@ schema for editors and CI is [schemas/contract.schema.json](schemas/contract.sch
 vulnsuite list [selector] [-group H] [-variants] [-ref ID]... [-class C]... [-category P] [-cve] [-kev] [-year Y]  filter templates
 vulnsuite search ...                                alias for list
 vulnsuite validate [-t SEL]... [-strict]            structure + semantic lint
-vulnsuite build -t SEL... | -f FILE | <filter> | -all [-variants] [-j N] [-push -registry REG]
+vulnsuite build [vulnerable|patched] -t SEL... | -f FILE | <filter> | -all [-variants] [-j N] [-push -registry REG]
 vulnsuite run [vulnerable|patched] -t SEL... | -f FILE | <filter> | -all [-variants] [-expose MODE] [-detach]
 vulnsuite ps                                        running targets (id, state, ip)
 vulnsuite targets [-file FILE] [-by auto|ip|alias|host]  scannable URLs, right port per template
@@ -203,6 +203,13 @@ vulnsuite update-templates [-ref REF] [-force]      fetch / update the community
 SDK by default, or the built-in API client.
 A selector is a folder (`web-servers`), a contract file, or a template id (a
 unique substring works: `-t grafana`).
+
+`run` and `build` take a state, `vulnerable` or `patched`, anywhere among their
+arguments, and flags may follow selectors: `vulnsuite run grafana patched
+-detach` and `vulnsuite build patched -t grafana` both work (for `build` it is
+shorthand for `-state`). A bare argument spelled like a state is always the
+state; a template literally named `vulnerable` or `patched` is still reachable
+with `-t`. After `--`, nothing is parsed as a flag.
 
 ### Variant groups and `-variants`
 
