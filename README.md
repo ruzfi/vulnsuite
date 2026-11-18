@@ -1,12 +1,10 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/logo-on-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset=".github/assets/logo-on-light.svg">
-    <img src=".github/assets/logo-on-light.svg" alt="vulnsuite logo" width="160">
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/wordmark-on-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset=".github/assets/wordmark-on-light.svg">
+    <img src=".github/assets/wordmark-on-light.svg" alt="vulnsuite" width="420">
   </picture>
 </p>
-
-# vulnsuite
 
 **Build vulnerable systems on purpose.** Point vulnsuite at a
 template and it builds a reproducible, content-addressed Docker image of a
