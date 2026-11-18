@@ -409,20 +409,43 @@ func (b *Builder) applyPatch(ctx context.Context, dir, patch string) error {
 	if err := patchStaysInTree(patch); err != nil {
 		return fmt.Errorf("apply %s: %w", filepath.Base(patch), err)
 	}
-	// No --unsafe-paths: git apply then refuses paths outside the working tree.
-	if out, err := b.git(ctx, dir, 2*time.Minute, "apply", "--directory", dir, "--", patch); err == nil {
+	// git apply resolves the patch's paths against the repository containing
+	// the working directory. cmd.Dir is already dir; capping repository
+	// discovery at dir keeps a copied build context (which is not itself a
+	// repository) from being read as part of an enclosing one, such as a
+	// TMPDIR inside a checkout. Without --unsafe-paths, git apply refuses
+	// absolute paths, ".." and writes beyond a symlink.
+	// core.autocrlf=false: the context is built into a Linux image, so a
+	// Windows host's git must not write the patched lines with CRLF.
+	ceiling := "GIT_CEILING_DIRECTORIES=" + filepath.Dir(dir)
+	out, err := b.gitEnv(ctx, dir, 2*time.Minute, []string{ceiling}, "-c", "core.autocrlf=false", "apply", "--", patch)
+	if err == nil {
 		return nil
-	} else if _, perr := exec.LookPath("patch"); perr != nil {
-		return fmt.Errorf("apply %s: %s", filepath.Base(patch), tail(out))
 	}
-	// Fallback: GNU patch, refusing absolute targets and never creating files
-	// outside dir (the patchStaysInTree check above already bars "..").
-	cmd := exec.CommandContext(ctx, "patch", "-p1", "--no-absolute-filenames", "--forward", "-d", dir, "-i", patch)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("apply %s: %s", filepath.Base(patch), tail(string(out)))
+	gitErr := fmt.Errorf("apply %s: %s", filepath.Base(patch), tail(out))
+	// Fallback for patches git apply will not take (it allows no fuzz): GNU
+	// patch only, because the safety flags below are GNU options. Any other
+	// patch (BSD patch on macOS) fails closed with git's error.
+	if !isGNUPatch(ctx) {
+		return gitErr
+	}
+	cmd := exec.CommandContext(ctx, "patch", "-p1", "--no-absolute-filenames", "--forward", "--batch", "-d", dir, "-i", patch)
+	pout, perr := cmd.CombinedOutput()
+	if perr != nil {
+		return fmt.Errorf("%w; patch fallback: %s", gitErr, tail(string(pout)))
 	}
 	return nil
+}
+
+// isGNUPatch reports whether the patch on PATH is GNU patch.
+func isGNUPatch(ctx context.Context) bool {
+	if _, err := exec.LookPath("patch"); err != nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "patch", "--version").CombinedOutput()
+	return err == nil && strings.Contains(string(out), "GNU patch")
 }
 
 // patchStaysInTree rejects a unified diff whose target paths are absolute or
@@ -457,6 +480,10 @@ func patchStaysInTree(patch string) error {
 }
 
 func (b *Builder) git(ctx context.Context, dir string, timeout time.Duration, args ...string) (string, error) {
+	return b.gitEnv(ctx, dir, timeout, nil, args...)
+}
+
+func (b *Builder) gitEnv(ctx context.Context, dir string, timeout time.Duration, env []string, args ...string) (string, error) {
 	git := b.Git
 	if git == "" {
 		git = "git"
@@ -478,6 +505,7 @@ func (b *Builder) git(ctx context.Context, dir string, timeout time.Duration, ar
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_PROTOCOL_FROM_USER=0",
 	)
+	cmd.Env = append(cmd.Env, env...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
