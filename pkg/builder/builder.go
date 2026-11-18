@@ -415,8 +415,10 @@ func (b *Builder) applyPatch(ctx context.Context, dir, patch string) error {
 	// repository) from being read as part of an enclosing one, such as a
 	// TMPDIR inside a checkout. Without --unsafe-paths, git apply refuses
 	// absolute paths, ".." and writes beyond a symlink.
+	// core.autocrlf=false: the context is built into a Linux image, so a
+	// Windows host's git must not write the patched lines with CRLF.
 	ceiling := "GIT_CEILING_DIRECTORIES=" + filepath.Dir(dir)
-	out, err := b.gitEnv(ctx, dir, 2*time.Minute, []string{ceiling}, "apply", "--", patch)
+	out, err := b.gitEnv(ctx, dir, 2*time.Minute, []string{ceiling}, "-c", "core.autocrlf=false", "apply", "--", patch)
 	if err == nil {
 		return nil
 	}
