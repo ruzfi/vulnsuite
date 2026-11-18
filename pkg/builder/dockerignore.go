@@ -51,13 +51,22 @@ func parseDockerignore(data []byte) (*dockerignore, error) {
 	d := &dockerignore{}
 	sc := bufio.NewScanner(bytes.NewReader(bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))))
 	for n := 1; sc.Scan(); n++ {
+		// As in Docker, only a line starting with "#" is a comment: the
+		// check comes before trimming, so "  # x" is a pattern.
+		if strings.HasPrefix(sc.Text(), "#") {
+			continue
+		}
 		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
+		if line == "" {
 			continue
 		}
 		exception := strings.HasPrefix(line, "!")
 		if exception {
 			line = strings.TrimSpace(line[1:])
+			if line == "" {
+				// Docker refuses it rather than reading it as "everything".
+				return nil, fmt.Errorf(`.dockerignore line %d: illegal exclusion pattern: "!"`, n)
+			}
 		}
 		line = path.Clean(filepath.ToSlash(line))
 		line = strings.TrimPrefix(line, "/")
