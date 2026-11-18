@@ -8,7 +8,8 @@
 //   - the templates checkout's data/cisa-kev.txt (the source of truth, a
 //     CVE-id snapshot kept fresh by the templates repo's cisa-kev-sync Action),
 //     unless the local cache holds a newer catalog;
-//   - a local cache (~/.cache/vulnsuite/cisa-kev.json), when the templates file
+//   - a local cache (vulnsuite/cisa-kev.json under os.UserCacheDir: ~/.cache
+//     on Linux, ~/Library/Caches on macOS), when the templates file
 //     is absent or older than the cache;
 //   - empty, offline, when neither exists — the caller warns and --kev matches
 //     nothing.
@@ -154,7 +155,8 @@ type Options struct {
 	TemplatesDir string
 	// Refresh forces a network fetch and rewrites the cache (Option B).
 	Refresh bool
-	// CacheDir overrides the default ~/.cache/vulnsuite cache location.
+	// CacheDir overrides the default cache location, vulnsuite under
+	// os.UserCacheDir.
 	CacheDir string
 	// Client overrides the HTTP client used for a fetch (tests).
 	Client *http.Client

@@ -440,6 +440,9 @@ Exposure modes:
 					return err
 				}
 			default:
+				// The URLs are the command's output: -q drops the header and
+				// the hints, never the list (as with `vulnsuite -q targets`).
+				out := func(format string, a ...any) { fmt.Fprintf(g.Stdout, format, a...) }
 				g.printf("\nScan these with your probe:\n")
 				for _, h := range handles {
 					extra := ""
@@ -448,7 +451,7 @@ Exposure modes:
 					}
 					pts := h.PortTargets()
 					if len(pts) == 0 {
-						g.printf("  %-52s %s%s\n", fmt.Sprintf("%s [%s]", h.ID, h.State), h.ScannerTarget(), extra)
+						out("  %-52s %s%s\n", fmt.Sprintf("%s [%s]", h.ID, h.State), h.ScannerTarget(), extra)
 						continue
 					}
 					for _, pt := range pts {
@@ -457,7 +460,7 @@ Exposure modes:
 						if len(pts) > 1 {
 							note = fmt.Sprintf("  (container port %d)%s", pt.ContainerPort, extra)
 						}
-						g.printf("  %-52s %s%s\n", tag, pt.URL, note)
+						out("  %-52s %s%s\n", tag, pt.URL, note)
 					}
 				}
 				if handles[0].Exposure.Mode == runner.ModeInternal {
