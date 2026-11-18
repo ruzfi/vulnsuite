@@ -33,9 +33,16 @@ type ExecFunc func(ctx context.Context, container, command string, timeout time.
 
 // Target is where probes are sent.
 type Target struct {
-	Host      string
-	Port      int
-	Scheme    string // http | https; anything else is treated as http for http probes
+	Host   string
+	Port   int
+	Scheme string // http | https; anything else is treated as http for http probes
+	// Schemes, when non-nil, is the scheme of each declared container port
+	// ("http", "https", or "" for raw TCP). A probe that names a port speaks
+	// that port's scheme, not the primary port's: an https primary must not
+	// make a probe of a plain-HTTP or SMTP port handshake TLS, nor a plain
+	// primary send cleartext to a TLS port. A probe on the default port, or on
+	// a port missing from Schemes, uses Scheme.
+	Schemes   map[int]string
 	Container string
 	Exec      ExecFunc
 	// PortMap, when non-nil, translates a container port named by a probe
@@ -59,6 +66,16 @@ func (t Target) dialPort(p int) (int, error) {
 		return hp, nil
 	}
 	return 0, fmt.Errorf("container port %d is not published to the host, so it cannot be probed from here", p)
+}
+
+// portScheme is the scheme of the port a probe names (0 = the default port).
+func (t Target) portScheme(p int) string {
+	if p != 0 && t.Schemes != nil {
+		if s, ok := t.Schemes[p]; ok {
+			return s
+		}
+	}
+	return t.Scheme
 }
 
 // Result is the outcome of one probe.
@@ -383,7 +400,7 @@ func runHTTP(ctx context.Context, s *contract.HTTPProbe, t Target) (bool, string
 	if err != nil {
 		return false, "", fmt.Errorf("%s -> %v", path, err)
 	}
-	resp, err := RawHTTP(ctx, t.Host, port, s.Method, path, s.Headers, s.Body, secs(s.Timeout, 10*time.Second), t.Scheme == "https")
+	resp, err := RawHTTP(ctx, t.Host, port, s.Method, path, s.Headers, s.Body, secs(s.Timeout, 10*time.Second), t.portScheme(s.Port) == "https")
 	if err != nil {
 		return false, "", &connError{fmt.Errorf("%s -> %v", path, err)}
 	}
@@ -505,7 +522,9 @@ func runNet(ctx context.Context, s *contract.NetProbe, t Target) (bool, string, 
 	defer conn.Close()
 	// Set before the handshake so a stalled TLS peer is bounded by the timeout.
 	_ = conn.SetDeadline(time.Now().Add(timeout))
-	if s.TLS || t.Scheme == "https" {
+	// tls: true forces TLS; otherwise the probed port's own scheme decides, so a
+	// dialogue with a plain port (SMTP, FTP) of an https target stays plain.
+	if s.TLS || t.portScheme(s.Port) == "https" {
 		tc := tls.Client(conn, &tls.Config{InsecureSkipVerify: true, ServerName: t.Host}) //nolint:gosec // knowingly-vulnerable targets
 		if err := tc.HandshakeContext(ctx); err != nil {
 			return false, "", fmt.Errorf("net %d tls -> %v", port, err)

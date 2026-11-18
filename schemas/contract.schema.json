@@ -685,7 +685,8 @@
               "maximum": 65535
             },
             "tls": {
-              "type": "boolean"
+              "type": "boolean",
+              "description": "force TLS; without it the connection is TLS only when the probed port is declared protocol: https (the primary port when port is unset)"
             },
             "timeout": {
               "type": "number",

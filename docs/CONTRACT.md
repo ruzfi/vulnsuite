@@ -203,12 +203,15 @@ demonstrate the *impact* from the advisory, not a matcher.
     stdout_matches: "root:"
 ```
 
-The `net` probe runs an ordered send/expect dialogue over a single TCP connection (optionally TLS), for multi-step protocols -- FTP SITE commands, SMTP, line protocols -- that a one-shot `tcp` probe cannot express. Each step optionally sends bytes, then reads the response and asserts `expect` (regex must match) and/or `expect_absent`.
+The `net` probe runs an ordered send/expect dialogue over a single TCP connection (optionally TLS), for multi-step protocols -- FTP SITE commands, SMTP, line protocols -- that a one-shot `tcp` probe cannot express. Each step optionally sends bytes, then reads the response and asserts `expect` (regex must match) and/or `expect_absent`. The connection is TLS when `tls: true` is set or when the probed port is declared `protocol: https` (the primary port when `port` is left out); a dialogue with any other port, e.g. SMTP on 25 of an https target, stays plain.
 
 HTTP probes are sent over a raw socket so the request line is exactly what the
-template says. Chunked responses are decoded. `https` ports skip certificate
-verification. A `status`-only assertion on the vulnerable state is a
-`weak-verify` warning: assert the body or a header.
+template says. Chunked responses are decoded. A probe speaks the scheme of the
+port it targets: TLS on a port declared `protocol: https`, plain HTTP on any
+other (a probe `port` not declared in `service.ports` uses the primary port's
+scheme). `https` ports skip certificate verification. A `status`-only
+assertion on the vulnerable state is a `weak-verify` warning: assert the body
+or a header.
 
 ### Paths
 
