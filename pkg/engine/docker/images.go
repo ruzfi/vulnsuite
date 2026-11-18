@@ -59,7 +59,7 @@ func (c *Client) ImagePull(ctx context.Context, ref, platform string, out io.Wri
 		q.Set("platform", platform)
 	}
 	headers := map[string]string{}
-	if auth := registryauth.For(ref); auth != "" {
+	if auth := registryauth.ForContext(ctx, ref); auth != "" {
 		headers["X-Registry-Auth"] = auth
 	}
 	resp, err := c.do(ctx, http.MethodPost, "/images/create", q, nil, headers)
@@ -105,7 +105,7 @@ func (c *Client) ImageBuild(ctx context.Context, opts engine.BuildOptions, out i
 	q.Set("rm", "1")
 	q.Set("forcerm", "1")
 	headers := map[string]string{"Content-Type": "application/x-tar"}
-	if cfg := registryauth.ConfigsHeader(); cfg != "" {
+	if cfg := registryauth.ConfigsHeaderContext(ctx); cfg != "" {
 		headers["X-Registry-Config"] = cfg
 	}
 	resp, err := c.do(ctx, http.MethodPost, "/build", q, opts.Context, headers)
@@ -133,7 +133,7 @@ func (c *Client) ImagePush(ctx context.Context, ref string, out io.Writer) error
 	if tag != "" {
 		q.Set("tag", tag)
 	}
-	auth := registryauth.ForPush(ref)
+	auth := registryauth.ForPushContext(ctx, ref)
 	if auth == "" {
 		auth = registryauth.Empty()
 	}
