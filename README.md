@@ -260,7 +260,10 @@ is web-apps **and** exposure); separate selectors and filter lines union with OR
 A filter selects every template that matches, variant-group members included —
 it does not collapse groups the way `-all` does — and `list <filter>` shows
 exactly the set that `run <filter>` / `build <filter>` will stand up. A
-template that fails to load fails the `run` or `build` rather than being skipped.
+template that fails to load fails the `run` or `build` rather than being skipped;
+`list` shows it as unloadable (in every listing, since it cannot be filtered)
+and exits 1, and `stop -t` still stops its target by the id its contract
+declares.
 Filter values are checked up front, on `list`, `run` and `build` alike: `-fidelity`
 must be `real` or `simulated`, `-year` a four-digit year and `-since` a
 `YYYY-MM-DD` date, so a typo is a usage error (exit 2) rather than a filter
