@@ -42,7 +42,9 @@ func (m *buildContext) add(name string, data []byte, mode int64) {
 }
 
 // readFile returns a context file's content: a generated entry, or a regular
-// file of the tree (never through a symlink, which may point anywhere).
+// file of the tree. A symlink on the way is followed only while it resolves
+// inside the context (as the daemon does); one that leads out of it, which
+// may point anywhere on the host, is refused.
 func (m *buildContext) readFile(name string) (memFile, bool, error) {
 	name = filepath.ToSlash(filepath.Clean(name))
 	if f, ok := m.files[name]; ok {
@@ -51,19 +53,12 @@ func (m *buildContext) readFile(name string) (memFile, bool, error) {
 	if m.root == "" || name == ".." || strings.HasPrefix(name, "../") || path.IsAbs(name) {
 		return memFile{}, false, nil
 	}
-	p := m.root
-	for _, part := range strings.Split(name, "/") {
-		p = filepath.Join(p, part)
-		info, err := os.Lstat(p)
-		if errors.Is(err, fs.ErrNotExist) {
-			return memFile{}, false, nil
-		}
-		if err != nil {
-			return memFile{}, false, err
-		}
-		if info.Mode()&fs.ModeSymlink != 0 {
-			return memFile{}, false, fmt.Errorf("%s: is a symlink", name)
-		}
+	p, err := contract.ConfinedPath(m.root, name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return memFile{}, false, nil
+	}
+	if err != nil {
+		return memFile{}, false, err
 	}
 	info, err := os.Stat(p)
 	if err != nil {

@@ -137,8 +137,14 @@ func TestBakeEnvRefusesSymlinkedDockerfile(t *testing.T) {
 	write(t, outside, "Dockerfile", "FROM scratch\n")
 	symlink(t, filepath.Join(outside, "Dockerfile"), filepath.Join(root, "Dockerfile"))
 	err := bakeEnv(newBuildContext(root), "Dockerfile", map[string]string{"A": "b"})
-	if err == nil || !strings.Contains(err.Error(), "symlink") {
-		t.Fatalf("a symlinked Dockerfile must not be read through: %v", err)
+	if !errors.Is(err, contract.ErrPathEscapes) {
+		t.Fatalf("a Dockerfile symlinked out of the context must not be read through: %v", err)
+	}
+	// Nor through a symlinked parent directory.
+	symlink(t, outside, filepath.Join(root, "out"))
+	err = bakeEnv(newBuildContext(root), "out/Dockerfile", map[string]string{"A": "b"})
+	if !errors.Is(err, contract.ErrPathEscapes) {
+		t.Fatalf("a Dockerfile under a directory symlinked out of the context must not be read: %v", err)
 	}
 	write(t, root, "sub/Dockerfile", "FROM scratch\n")
 	bc := newBuildContext(root)
@@ -147,6 +153,29 @@ func TestBakeEnvRefusesSymlinkedDockerfile(t *testing.T) {
 	}
 	if df := string(bc.files["sub/Dockerfile"].data); df != "FROM scratch\nENV A=b\n" {
 		t.Fatalf("baked: %q", df)
+	}
+}
+
+// A Dockerfile symlinked to another file inside the context is accepted by
+// validate and by the daemon, so baking environment into it must work too
+// (it used to fail with "is a symlink" as soon as a state set environment).
+func TestBakeEnvFollowsInContextSymlink(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "docker/Dockerfile.prod", "FROM scratch\n")
+	symlink(t, "docker/Dockerfile.prod", filepath.Join(root, "Dockerfile"))
+	write(t, root, "real/Dockerfile", "FROM busybox\n")
+	symlink(t, "real", filepath.Join(root, "alias"))
+	for name, want := range map[string]string{
+		"Dockerfile":       "FROM scratch\nENV A=b\n",
+		"alias/Dockerfile": "FROM busybox\nENV A=b\n",
+	} {
+		bc := newBuildContext(root)
+		if err := bakeEnv(bc, name, map[string]string{"A": "b"}); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if df := string(bc.files[name].data); df != want {
+			t.Fatalf("%s baked: %q", name, df)
+		}
 	}
 }
 
