@@ -348,3 +348,59 @@ func TestNetProbe(t *testing.T) {
 		t.Fatalf("expect_absent should pass on patched: %s", r.Detail)
 	}
 }
+
+// A regex that does not compile must fail its probe. matchDotAll treats it as
+// "no match", so an *_absent check used to pass, and a patched state verified
+// OK against a target that was still vulnerable.
+func TestInvalidRegexFailsProbe(t *testing.T) {
+	host, port, _ := rawServer(t)
+	tgt := Target{Host: host, Port: port, Container: "c",
+		Exec: func(ctx context.Context, container, command string, timeout time.Duration) (int, string, error) {
+			return 0, "uid=0(root)", nil
+		}}
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			io.WriteString(c, "220 banner\r\n")
+			c.Close()
+		}
+	}()
+	tcpPort := l.Addr().(*net.TCPAddr).Port
+	bad := "root:x:0:0(" // unbalanced paren
+	cases := map[string]contract.Probe{
+		"http body_absent":   {HTTP: &contract.HTTPProbe{Path: "/etc/passwd", BodyAbsent: bad}},
+		"http body_matches":  {HTTP: &contract.HTTPProbe{Path: "/etc/passwd", BodyMatches: bad}},
+		"http header":        {HTTP: &contract.HTTPProbe{Path: "/etc/passwd", HeaderMatches: map[string]string{"X-Served": "("}}},
+		"exec stdout":        {Exec: &contract.ExecProbe{Run: "id", StdoutMatches: "("}},
+		"tcp banner":         {TCP: &contract.TCPProbe{Port: tcpPort, BannerMatches: "("}},
+		"net expect_absent":  {Net: &contract.NetProbe{Port: tcpPort, Steps: []contract.NetStep{{ExpectAbsent: bad}}}},
+		"net expect (later)": {Net: &contract.NetProbe{Port: tcpPort, Steps: []contract.NetStep{{Expect: "220"}, {Expect: "["}}}},
+	}
+	for name, p := range cases {
+		t.Run(name, func(t *testing.T) {
+			tt := tgt
+			if p.TCP != nil || p.Net != nil {
+				tt.Port = tcpPort
+			}
+			r := Run(context.Background(), p, tt)
+			if r.OK {
+				t.Fatalf("probe with an invalid regex passed: %s", r.Detail)
+			}
+			if !strings.Contains(r.Detail, "invalid regex") || r.Transport {
+				t.Fatalf("want a non-transport invalid regex failure, got transport=%v %q", r.Transport, r.Detail)
+			}
+		})
+	}
+	// Valid patterns still pass.
+	if r := Run(context.Background(), contract.Probe{HTTP: &contract.HTTPProbe{Path: "/etc/passwd", BodyMatches: `root:x:0:0`, BodyAbsent: `nobody\(`}}, tgt); !r.OK {
+		t.Fatalf("valid patterns: %s", r.Detail)
+	}
+}
