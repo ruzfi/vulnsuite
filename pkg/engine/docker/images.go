@@ -99,7 +99,11 @@ func (c *Client) ImageBuild(ctx context.Context, opts engine.BuildOptions, out i
 	if opts.Platform != "" {
 		q.Set("platform", opts.Platform)
 	}
+	// Remove intermediate containers, also when a step fails (forcerm), as
+	// the SDK engine does with ForceRemove; otherwise every failed RUN step
+	// of the legacy builder leaves a stopped container behind.
 	q.Set("rm", "1")
+	q.Set("forcerm", "1")
 	headers := map[string]string{"Content-Type": "application/x-tar"}
 	if cfg := registryauth.ConfigsHeader(); cfg != "" {
 		headers["X-Registry-Config"] = cfg

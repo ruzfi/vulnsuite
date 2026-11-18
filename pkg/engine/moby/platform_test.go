@@ -88,3 +88,43 @@ func TestImageExistsOldDaemon(t *testing.T) {
 		t.Fatalf("old daemon: %v %v", ok, err)
 	}
 }
+
+// Only "not found" on the platform-specific inspect means "pull it"; any other
+// failure (here a daemon error, and a cancelled context) is returned rather
+// than read as a missing image.
+func TestImageExistsPlatformInspectErrors(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("API-Version", "1.51")
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/_ping"):
+			fmt.Fprint(w, "OK")
+		case r.URL.Query().Get("platform") == "":
+			fmt.Fprint(w, `{"Id":"sha256:1","Os":"linux","Architecture":"arm64"}`)
+		case strings.Contains(r.URL.Path, "/images/gone/"):
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"message":"image gone was found but does not provide the specified platform"}`)
+		case strings.Contains(r.URL.Path, "/images/cancel/"):
+			cancel()
+			<-r.Context().Done()
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprint(w, `{"message":"store is broken"}`)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	e, err := New("tcp://" + strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := e.ImageExists(context.Background(), "gone", "linux/amd64"); ok || err != nil {
+		t.Errorf("not found: %v, %v; want false, nil", ok, err)
+	}
+	if ok, err := e.ImageExists(context.Background(), "broken", "linux/amd64"); ok || err == nil {
+		t.Errorf("daemon error: %v, %v; want the error", ok, err)
+	}
+	if ok, err := e.ImageExists(ctx, "cancel", "linux/amd64"); ok || err == nil {
+		t.Errorf("cancelled: %v, %v; want an error", ok, err)
+	}
+}

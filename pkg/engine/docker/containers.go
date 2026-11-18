@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -312,9 +313,17 @@ func (c *Client) ContainerLogs(ctx context.Context, id string, tail int) (string
 func (c *Client) ContainerWait(ctx context.Context, id string) (int, error) {
 	var out struct {
 		StatusCode int `json:"StatusCode"`
+		Error      *struct {
+			Message string `json:"Message"`
+		} `json:"Error"`
 	}
 	if err := c.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(id)+"/wait", nil, nil, &out); err != nil {
 		return -1, err
+	}
+	// The daemon reports a failure while waiting (e.g. removing the
+	// container) in Error, next to the status code; the SDK engine returns it.
+	if out.Error != nil {
+		return out.StatusCode, errors.New(out.Error.Message)
 	}
 	return out.StatusCode, nil
 }
