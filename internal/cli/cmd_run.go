@@ -15,6 +15,7 @@ import (
 
 	"github.com/ruzfi/vulnsuite/pkg/builder"
 	"github.com/ruzfi/vulnsuite/pkg/contract"
+	"github.com/ruzfi/vulnsuite/pkg/loader"
 	"github.com/ruzfi/vulnsuite/pkg/runner"
 	"github.com/ruzfi/vulnsuite/pkg/scanners"
 )
@@ -618,23 +619,43 @@ func cmdStop() *Command {
 			}
 			r := runner.New(eng)
 			var ids []string
+			var stopErrs []error
 			if len(sel) > 0 {
 				store, err := g.Store()
 				if err != nil {
 					return err
 				}
-				cs, _, err := gather(store, sel, false, variantsStop)
+				cs, loadErrs, err := gather(store, sel, false, variantsStop)
 				if err != nil {
 					return err
 				}
 				for _, c := range cs {
 					ids = append(ids, c.ID())
 				}
+				// A template that no longer loads (broken after an update,
+				// say) may still have a target running: stop it by the id
+				// its contract declares. Only when even that is unreadable
+				// is it an error, never a silent "nothing to stop".
+				for _, le := range loadErrs {
+					var e *loader.Error
+					id := ""
+					if errors.As(le, &e) {
+						id = loader.PeekID(e.Path)
+					}
+					if id == "" {
+						stopErrs = append(stopErrs, le)
+						continue
+					}
+					g.errorf("warning: %v; stopping %s by its declared id\n", le, id)
+					ids = append(ids, id)
+				}
+				if len(ids) == 0 {
+					return errors.Join(stopErrs...)
+				}
 			} else {
 				ids = []string{""}
 			}
 			removed := []string{} // -json prints [] (not null) when nothing ran
-			var stopErrs []error
 			for _, id := range ids {
 				names, err := r.StopAll(ctx, id)
 				removed = append(removed, names...)

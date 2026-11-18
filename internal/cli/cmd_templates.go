@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -32,6 +33,20 @@ func gather(store *loader.Store, selectors []string, all, variants bool) ([]*con
 	}
 	cs, errs := store.LoadMany(paths)
 	return cs, errs, nil
+}
+
+// fallbackID names a template that failed to load: its metadata.id when
+// that much can be read, else its folder (or file) name.
+func fallbackID(path string) string {
+	if id := loader.PeekID(path); id != "" {
+		return id
+	}
+	for _, n := range loader.ContractNames {
+		if filepath.Base(path) == n {
+			return filepath.Base(filepath.Dir(path))
+		}
+	}
+	return filepath.Base(path)
 }
 
 // -- list ---------------------------------------------------------------------
@@ -212,10 +227,18 @@ gets a warning. Offline with neither present, KEV is shown as "?" and
 				return err
 			}
 			rows := []listRow{} // -json prints [] (not null) when nothing matches
+			unloadable := 0
 			for _, p := range paths {
 				c, err := store.Load(p)
 				if err != nil {
-					rows = append(rows, listRow{ID: loader.PeekID(p), Path: p, Error: err.Error()})
+					// An unloadable template cannot be filtered, so it is
+					// always shown, and the command fails after printing, as
+					// validate does. Its row keeps the documented shape: an
+					// id (the folder name when even that cannot be read) and
+					// arrays, not null.
+					unloadable++
+					rows = append(rows, listRow{ID: fallbackID(p), Path: p, Error: err.Error(),
+						States: []string{}, VulnRefs: []string{}})
 					continue
 				}
 				if !f.match(store, c, p, kevSet, kevKnown) {
@@ -240,8 +263,17 @@ gets a warning. Offline with neither present, KEV is shown as "?" and
 				}
 				rows = append(rows, row)
 			}
+			loadErr := func() error {
+				if unloadable == 0 {
+					return nil
+				}
+				return fmt.Errorf("%d template(s) failed to load; see `vulnsuite validate`", unloadable)
+			}
 			if g.JSON {
-				return g.emitJSON(rows)
+				if err := g.emitJSON(rows); err != nil {
+					return err
+				}
+				return loadErr()
 			}
 			if len(rows) == 0 {
 				g.printf("no templates found in %s\n", store.Root)
@@ -277,7 +309,7 @@ gets a warning. Offline with neither present, KEV is shown as "?" and
 			if anyHostAccess(rows) {
 				g.printf("* needs host access (device/elevated capability); run with -allow-host-access, and only for templates you trust.\n")
 			}
-			return nil
+			return loadErr()
 		},
 	}
 }
