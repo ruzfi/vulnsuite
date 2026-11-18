@@ -474,10 +474,9 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 			spec.Ports = append(spec.Ports, engine.PortBinding{HostIP: exp.Bind, HostPort: hp, ContainerPort: pp.Container, Protocol: "tcp"})
 			h.PublishedPorts = append(h.PublishedPorts, PublishedPort{ContainerPort: pp.Container, HostIP: exp.Bind, HostPort: hp, Scheme: pp.Scheme()})
 			if i == 0 {
-				h.EndpointHost, h.EndpointPort = exp.Bind, hp
-				if exp.Bind == "0.0.0.0" {
-					h.EndpointHost = "127.0.0.1"
-				}
+				// A wildcard bind (0.0.0.0 or ::) is dialled via loopback, as
+				// every other published port is (portAddress).
+				h.EndpointHost, h.EndpointPort = normalizeHostIP(exp.Bind), hp
 			}
 		}
 		primaryNet = "bridge"
@@ -766,8 +765,8 @@ func isLoopbackHost(host string) bool {
 
 // probeFromHereFutile reports that no probe run on this machine can reach the
 // target: host mode on a remote daemon that published the port on the daemon
-// host's loopback (default -bind 127.0.0.1, or -bind 0.0.0.0 which we dial as
-// 127.0.0.1). The port lives on the daemon's host, not here.
+// host's loopback (default -bind 127.0.0.1, or a wildcard -bind 0.0.0.0 / ::
+// which we dial as 127.0.0.1). The port lives on the daemon's host, not here.
 func probeFromHereFutile(h *Handle) bool {
 	return h.Exposure.Mode == ModeHost && h.DaemonRemote && isLoopbackHost(h.EndpointHost)
 }
@@ -1011,7 +1010,7 @@ func (r *Runner) runProbes(ctx context.Context, c *contract.Contract, st *contra
 		scheme = "http"
 	}
 	ok, results := probes.RunAll(ctx, st.Verify, probes.Target{
-		Host: host, Port: port, Scheme: scheme, Container: h.Container, PortMap: hostPortMap(h),
+		Host: host, Port: port, Scheme: scheme, Schemes: portSchemes(c), Container: h.Container, PortMap: hostPortMap(h),
 		Exec: func(ctx context.Context, container, command string, timeout time.Duration) (int, string, error) {
 			return r.Engine.ContainerExec(ctx, container, command, timeout)
 		},
@@ -1027,6 +1026,16 @@ func (r *Runner) runProbes(ctx context.Context, c *contract.Contract, st *contra
 	h.VerifyOK = &ok
 	h.Probes = results
 	h.VerifyDetail = probes.FormatResults(results)
+}
+
+// portSchemes is the scheme of every declared container port ("" for raw TCP),
+// so a probe naming a port speaks that port's protocol.
+func portSchemes(c *contract.Contract) map[int]string {
+	m := make(map[int]string, len(c.Service.Ports))
+	for _, p := range c.Service.Ports {
+		m[p.Container] = p.Scheme()
+	}
+	return m
 }
 
 // hostPortMap is container port -> host port for every published port in host
@@ -1262,11 +1271,7 @@ func assignedHostPorts(h *Handle, det *engine.ContainerDetail) error {
 }
 
 func assertPortFree(bind string, port int) error {
-	host := bind
-	if host == "0.0.0.0" || host == "" {
-		host = "127.0.0.1"
-	}
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), time.Second)
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(normalizeHostIP(bind), strconv.Itoa(port)), time.Second)
 	if err == nil {
 		conn.Close()
 		return fmt.Errorf("port %d is already in use on %s; pick another with --host-port, or use --expose internal (one host port serves one target)", port, bind)

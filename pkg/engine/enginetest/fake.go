@@ -257,10 +257,10 @@ func (f *Fake) ContainerCreate(ctx context.Context, spec engine.ContainerSpec) (
 	return c.ID, nil
 }
 
-// freeHostPort returns a currently free TCP port on host (127.0.0.1 for "" or
-// 0.0.0.0).
+// freeHostPort returns a currently free TCP port on host (127.0.0.1 for "",
+// 0.0.0.0 or ::, so a host without IPv6 can still run the tests).
 func freeHostPort(host string) (int, error) {
-	if host == "" || host == "0.0.0.0" {
+	if host == "" || host == "0.0.0.0" || host == "::" {
 		host = "127.0.0.1"
 	}
 	l, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
