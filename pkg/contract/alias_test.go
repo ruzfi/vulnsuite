@@ -19,7 +19,8 @@ func withStates(t *testing.T, extra, states string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := string(data)
+	// Windows checkouts (text=auto) carry CRLF line endings.
+	s := strings.ReplaceAll(string(data), "\r\n", "\n")
 	i := strings.Index(s, "states:\n")
 	if i < 0 {
 		t.Fatal("no states in the base contract")
