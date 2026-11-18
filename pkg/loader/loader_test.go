@@ -332,3 +332,86 @@ func TestShadowed(t *testing.T) {
 		t.Fatalf("discovery must still load one contract per folder: %v %v", found, err)
 	}
 }
+
+// A bare selector is a template id/group/category, never a file or folder in
+// the working directory; path-shaped selectors still reach the filesystem.
+func TestFindBareSelectorIgnoresWorkingDirectory(t *testing.T) {
+	s := testStore(t)
+	cwd := t.TempDir()
+	t.Chdir(cwd)
+	// A stray file and a stray folder named like a template and a category.
+	if err := os.WriteFile(filepath.Join(cwd, "grafana"), []byte("not a contract"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(cwd, "iot"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p, err := s.Find("grafana")
+	if err != nil || len(p) != 1 || peekID(p[0]) != "grafana-8.3.0-cve-2021-43798" {
+		t.Fatalf("grafana with ./grafana present: %v %v", err, p)
+	}
+	if p, err := s.Find("iot"); err != nil || len(p) != 1 || peekID(p[0]) != "iot-camera-auth-bypass" {
+		t.Fatalf("iot with ./iot present: %v %v", err, p)
+	}
+
+	// Path-shaped selectors still resolve against the working directory.
+	src := filepath.Join(s.Root, "exposures", "exposed-dotenv-file", "contract.yaml")
+	doc, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := filepath.Join(cwd, "local")
+	if err := os.Mkdir(local, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(local, "contract.yaml"), doc, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "mine.yaml"), doc, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	want := func(sel, path string) {
+		t.Helper()
+		p, err := s.Find(sel)
+		if err != nil || len(p) != 1 {
+			t.Fatalf("%s: %v %v", sel, err, p)
+		}
+		if got, _ := filepath.EvalSymlinks(p[0]); got != mustEval(t, path) {
+			t.Fatalf("%s: got %s, want %s", sel, p[0], path)
+		}
+	}
+	want("./local", filepath.Join(local, "contract.yaml"))
+	want(filepath.Join("local", "contract.yaml"), filepath.Join(local, "contract.yaml"))
+	want("local/contract.yaml", filepath.Join(local, "contract.yaml"))
+	want("mine.yaml", filepath.Join(cwd, "mine.yaml"))
+	want(filepath.Join(cwd, "local"), filepath.Join(local, "contract.yaml"))
+	// ./grafana is explicitly the stray file.
+	if p, err := s.Find("./grafana"); err != nil || len(p) != 1 || filepath.Base(p[0]) != "grafana" {
+		t.Fatalf("./grafana: %v %v", err, p)
+	}
+	// Root-relative paths keep working.
+	if p, err := s.Find(filepath.Join("exposures", "exposed-dotenv-file")); err != nil || len(p) != 1 {
+		t.Fatalf("root-relative: %v %v", err, p)
+	}
+}
+
+func mustEval(t *testing.T, p string) string {
+	t.Helper()
+	r, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+func TestIsPathSelector(t *testing.T) {
+	for sel, want := range map[string]bool{
+		"grafana": false, "web-servers": false, "CVE-2021-41773": false, "php2shell": false,
+		"./grafana": true, ".": true, "~/t": true, "a/b": true, "contract.yaml": true, "x.YML": true,
+		filepath.Join("a", "b"): true,
+	} {
+		if got := IsPathSelector(sel); got != want {
+			t.Errorf("IsPathSelector(%q) = %v, want %v", sel, got, want)
+		}
+	}
+}
