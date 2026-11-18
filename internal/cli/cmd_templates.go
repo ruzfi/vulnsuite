@@ -480,6 +480,7 @@ update-templates before; pass -force to replace any other directory.`,
 			fs.StringVar(&ref, "ref", "", "branch, tag or commit (default: pull a checkout's branch, or "+templates.DefaultBranch+")")
 			fs.BoolVar(&force, "force", false, "replace a non-empty directory update-templates did not install")
 		},
+		NoArgs: true,
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
 			dir, err := templates.Resolve(g.TemplatesDir)
 			if err != nil {
@@ -510,6 +511,7 @@ update-templates before; pass -force to replace any other directory.`,
 func cmdVersion() *Command {
 	return &Command{
 		Name: "version", Short: "print version information", Usage: "",
+		NoArgs: true,
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
 			dir, _ := templates.Resolve(g.TemplatesDir)
 			if g.JSON {

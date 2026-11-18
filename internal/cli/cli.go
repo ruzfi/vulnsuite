@@ -48,7 +48,11 @@ type Command struct {
 	Usage   string // one-line synopsis after the command name
 	Long    string
 	Flags   func(fs *flag.FlagSet)
-	Run     func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error
+	// NoArgs commands take flags only: a stray positional is a usage error,
+	// never silently ignored (`images -rm grafana` must not remove every
+	// image).
+	NoArgs bool
+	Run    func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error
 }
 
 // Global holds the flags every command accepts.
@@ -179,10 +183,14 @@ func mainWithEngine(ctx context.Context, eng engine.Engine, args []string, stdou
 	name := rest[0]
 	if name == "help" {
 		if len(rest) > 1 {
-			if c := find(rest[1]); c != nil {
-				printCommandHelp(stdout, c)
-				return ExitOK
+			c := find(rest[1])
+			if c == nil {
+				fmt.Fprintf(stderr, "vulnsuite help: unknown command %q\n\n", rest[1])
+				printRootHelp(stderr)
+				return ExitUsage
 			}
+			printCommandHelp(stdout, c)
+			return ExitOK
 		}
 		printRootHelp(stdout)
 		return ExitOK
@@ -206,6 +214,11 @@ func mainWithEngine(ctx context.Context, eng engine.Engine, args []string, stdou
 			return ExitOK
 		}
 		fmt.Fprintf(stderr, "vulnsuite %s: %v\n", cmd.Name, err)
+		return ExitUsage
+	}
+	if cmd.NoArgs && len(argv) > 0 {
+		fmt.Fprintf(stderr, "vulnsuite %s: unexpected argument(s) %q; it takes flags only\n", cmd.Name, argv)
+		fmt.Fprintf(stderr, "usage: vulnsuite %s %s\n", cmd.Name, cmd.Usage)
 		return ExitUsage
 	}
 	if err := cmd.Run(ctx, g, fs, argv); err != nil {

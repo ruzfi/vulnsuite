@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 	"text/tabwriter"
+	"time"
 
 	"github.com/ruzfi/vulnsuite/pkg/builder"
 	"github.com/ruzfi/vulnsuite/pkg/contract"
@@ -191,6 +192,14 @@ Exposure modes:
 			if pinned && exp.Mode != runner.ModeHost {
 				return usageError{"-host-port / -host-port-map need -expose host"}
 			}
+			var readyTimeoutD time.Duration
+			if readyTimeout != "" {
+				d, err := contract.ParseDuration(readyTimeout, 0)
+				if err != nil {
+					return usageError{"-ready-timeout: " + err.Error()}
+				}
+				readyTimeoutD = d
+			}
 			state, args, err := takeState(args)
 			if err != nil {
 				return err
@@ -318,13 +327,7 @@ Exposure modes:
 			}
 
 			opts := runner.Options{Verify: !noVerify, AllowHostAccess: allowHostAccess, Build: builder.Options{Pull: !noPull, NoCache: noCache, Force: force, Platform: platform}}
-			if readyTimeout != "" {
-				d, err := contract.ParseDuration(readyTimeout, 0)
-				if err != nil {
-					return usageError{err.Error()}
-				}
-				opts.ReadyTimeout = d
-			}
+			opts.ReadyTimeout = readyTimeoutD
 			if !g.JSON && !g.Quiet {
 				opts.Build.Output = g.Stdout
 			}
@@ -683,6 +686,7 @@ func cmdPS() *Command {
 		Flags: func(fs *flag.FlagSet) {
 			fs.StringVar(&network, "network", runner.DefaultNetwork, "internal network name")
 		},
+		NoArgs: true,
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
 			eng, err := g.Engine(ctx)
 			if err != nil {
@@ -734,6 +738,7 @@ the subnet. Non-HTTP targets come out as host:port for network templates.`,
 			fs.StringVar(&by, "by", "auto", "address targets by: auto (published host binding if any, else container ip), ip, alias, or host")
 			fs.StringVar(&network, "network", runner.DefaultNetwork, "internal network name")
 		},
+		NoArgs: true,
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
 			switch by {
 			case "auto", "ip", "alias", "host":

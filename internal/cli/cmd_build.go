@@ -434,6 +434,7 @@ func cmdImages() *Command {
 		Flags: func(fs *flag.FlagSet) {
 			fs.BoolVar(&rm, "rm", false, "remove every vulnsuite-built image")
 		},
+		NoArgs: true,
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
 			eng, err := g.Engine(ctx)
 			if err != nil {
