@@ -42,6 +42,9 @@ type Container struct {
 	IP       string
 	// Networks are further networks attached with NetworkConnect.
 	Networks []engine.NetworkAttachment
+	// started is set by the first ContainerStart: a container that never ran
+	// lists as "created", one that ran and stopped as "exited".
+	started bool
 }
 
 // Fake is an in-memory engine.
@@ -101,11 +104,27 @@ func New() *Fake {
 		HostInfo: engine.HostInfo{OS: "linux", Arch: "amd64"}}
 }
 
-func (f *Fake) Ping(context.Context) (string, error) { return "fake", nil }
+// Ping reports the fake's version. Like the real engines, it and every other
+// call fail once their context is done, so a cancelled run never reads as
+// "image missing" or "network absent".
+func (f *Fake) Ping(ctx context.Context) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return "fake", nil
+}
 
-func (f *Fake) Info(context.Context) (engine.HostInfo, error) { return f.HostInfo, nil }
+func (f *Fake) Info(ctx context.Context) (engine.HostInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return engine.HostInfo{}, err
+	}
+	return f.HostInfo, nil
+}
 
-func (f *Fake) ImageExists(_ context.Context, ref, platform string) (bool, error) {
+func (f *Fake) ImageExists(ctx context.Context, ref, platform string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.Images[ref] && f.platformOK(ref, platform), nil
@@ -132,7 +151,10 @@ func (f *Fake) setPlatform(ref, platform string) {
 	}
 }
 
-func (f *Fake) ImagePull(_ context.Context, ref, platform string, out io.Writer) error {
+func (f *Fake) ImagePull(ctx context.Context, ref, platform string, out io.Writer) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if f.PullFn != nil {
 		if err := f.PullFn(ref); err != nil {
 			return err
@@ -152,7 +174,10 @@ func (f *Fake) ImagePull(_ context.Context, ref, platform string, out io.Writer)
 	return nil
 }
 
-func (f *Fake) ImageBuild(_ context.Context, opts engine.BuildOptions, out io.Writer) error {
+func (f *Fake) ImageBuild(ctx context.Context, opts engine.BuildOptions, out io.Writer) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	files := map[string]string{}
 	modes := map[string]int64{}
 	links := map[string]string{}
@@ -188,7 +213,10 @@ func (f *Fake) ImageBuild(_ context.Context, opts engine.BuildOptions, out io.Wr
 	return nil
 }
 
-func (f *Fake) ImageTag(_ context.Context, source, target string) error {
+func (f *Fake) ImageTag(ctx context.Context, source, target string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if !f.Images[source] {
@@ -200,7 +228,10 @@ func (f *Fake) ImageTag(_ context.Context, source, target string) error {
 	return nil
 }
 
-func (f *Fake) ImagePush(_ context.Context, ref string, out io.Writer) error {
+func (f *Fake) ImagePush(ctx context.Context, ref string, out io.Writer) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if !f.Images[ref] {
@@ -210,7 +241,10 @@ func (f *Fake) ImagePush(_ context.Context, ref string, out io.Writer) error {
 	return nil
 }
 
-func (f *Fake) ImageRemove(_ context.Context, ref string, _ bool) error {
+func (f *Fake) ImageRemove(ctx context.Context, ref string, _ bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if f.ImageRemoveFn != nil {
 		if err := f.ImageRemoveFn(ref); err != nil {
 			return err
@@ -222,7 +256,10 @@ func (f *Fake) ImageRemove(_ context.Context, ref string, _ bool) error {
 	return nil
 }
 
-func (f *Fake) ImageList(_ context.Context, prefix string) ([]string, error) {
+func (f *Fake) ImageList(ctx context.Context, prefix string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []string
@@ -249,6 +286,11 @@ func (f *Fake) ContainerCreate(ctx context.Context, spec engine.ContainerSpec) (
 	}
 	if _, dup := f.Containers[spec.Name]; dup {
 		return "", fmt.Errorf("conflict: name %s already in use", spec.Name)
+	}
+	if spec.Network != nil && !predefinedNetwork(spec.Network.Name) {
+		if _, ok := f.Networks[spec.Network.Name]; !ok {
+			return "", fmt.Errorf("network %s not found", spec.Network.Name)
+		}
 	}
 	f.nextID++
 	f.nextIP++
@@ -293,7 +335,7 @@ func (f *Fake) ContainerStart(ctx context.Context, id string) error {
 		f.mu.Unlock()
 		return fmt.Errorf("no such container %s", id)
 	}
-	c.Running = true
+	c.Running, c.started = true, true
 	// Like the daemon, assign a free host port to every binding that asks
 	// for host port 0 (a real free port, so a StartFn can listen on it).
 	if !f.NoAssignPorts {
@@ -354,9 +396,12 @@ func (f *Fake) ContainerList(ctx context.Context, all bool, prefix string) ([]en
 		if !strings.HasPrefix(name, prefix) || (!all && !c.Running) {
 			continue
 		}
-		st := "exited"
-		if c.Running {
+		st := "created"
+		switch {
+		case c.Running:
 			st = "running"
+		case c.started:
+			st = "exited"
 		}
 		out = append(out, engine.ContainerInfo{ID: c.ID, Name: name, Image: c.Spec.Image, State: st, Status: "Up", Labels: c.Spec.Labels})
 	}
@@ -364,7 +409,10 @@ func (f *Fake) ContainerList(ctx context.Context, all bool, prefix string) ([]en
 	return out, nil
 }
 
-func (f *Fake) ContainerInspect(_ context.Context, id string) (*engine.ContainerDetail, error) {
+func (f *Fake) ContainerInspect(ctx context.Context, id string) (*engine.ContainerDetail, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	c := f.byIDOrName(id)
@@ -379,13 +427,28 @@ func (f *Fake) ContainerInspect(_ context.Context, id string) (*engine.Container
 		d.IPs[n.Name] = fmt.Sprintf("10.99.%d.%d", i, f.nextIP)
 	}
 	for _, p := range c.Spec.Ports {
-		d.Ports[fmt.Sprintf("%d/tcp", p.ContainerPort)] = engine.HostBinding{IP: p.HostIP, Port: p.HostPort}
+		proto := p.Protocol
+		if proto == "" {
+			proto = "tcp"
+		}
+		d.Ports[fmt.Sprintf("%d/%s", p.ContainerPort, proto)] = engine.HostBinding{IP: p.HostIP, Port: p.HostPort}
 	}
 	return d, nil
 }
 
-func (f *Fake) ContainerExec(_ context.Context, id, command string, _ time.Duration) (int, string, error) {
+func (f *Fake) ContainerExec(ctx context.Context, id, command string, _ time.Duration) (int, string, error) {
+	if err := ctx.Err(); err != nil {
+		return -1, "", err
+	}
 	f.mu.Lock()
+	// Like the daemon, exec needs an existing, running container.
+	if c := f.byIDOrName(id); c == nil || !c.Running {
+		f.mu.Unlock()
+		if c == nil {
+			return -1, "", fmt.Errorf("no such container %s", id)
+		}
+		return -1, "", fmt.Errorf("container %s is not running", id)
+	}
 	f.Execs = append(f.Execs, id+": "+command)
 	fn := f.ExecFn
 	f.mu.Unlock()
@@ -405,7 +468,10 @@ func (f *Fake) Exit(idOrName string, code int) {
 	}
 }
 
-func (f *Fake) ContainerLogs(_ context.Context, id string, _ int) (string, error) {
+func (f *Fake) ContainerLogs(ctx context.Context, id string, _ int) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	f.mu.Lock()
 	c := f.byIDOrName(id)
 	fn := f.LogsFn
@@ -418,7 +484,31 @@ func (f *Fake) ContainerLogs(_ context.Context, id string, _ int) (string, error
 	}
 	return "", nil
 }
-func (f *Fake) ContainerWait(context.Context, string) (int, error) { return 0, nil }
+
+// ContainerWait blocks until the container is no longer running (see Exit)
+// and returns its exit code, like the daemon's wait.
+func (f *Fake) ContainerWait(ctx context.Context, id string) (int, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return -1, err
+		}
+		f.mu.Lock()
+		c := f.byIDOrName(id)
+		if c == nil {
+			f.mu.Unlock()
+			return -1, fmt.Errorf("no such container %s", id)
+		}
+		running, code := c.Running, c.ExitCode
+		f.mu.Unlock()
+		if !running {
+			return code, nil
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
 
 func (f *Fake) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (string, error) {
 	if err := ctx.Err(); err != nil {
@@ -430,7 +520,10 @@ func (f *Fake) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (stri
 	return "net-" + spec.Name, nil
 }
 
-func (f *Fake) NetworkExists(_ context.Context, name string) (bool, error) {
+func (f *Fake) NetworkExists(ctx context.Context, name string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	_, ok := f.Networks[name]
@@ -471,6 +564,16 @@ func (f *Fake) NetworkConnect(ctx context.Context, network, container string, al
 	}
 	c.Networks = append(c.Networks, engine.NetworkAttachment{Name: network, Aliases: aliases})
 	return nil
+}
+
+// predefinedNetwork reports whether name is one of the networks a daemon
+// always has.
+func predefinedNetwork(name string) bool {
+	switch name {
+	case "", "default", "bridge", "host", "none":
+		return true
+	}
+	return false
 }
 
 func attachedTo(c *Container, network string) bool {

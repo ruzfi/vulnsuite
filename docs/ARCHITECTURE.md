@@ -75,6 +75,11 @@ mirror of it.
   against the fixtures in `testdata/templates`; `pkg/probes` against raw TCP
   listeners; `pkg/builder`, `pkg/runner`, `internal/cli` against
   `enginetest.Fake`.
+- `pkg/engine/conformance` runs one table of behaviour cases against all
+  three engines (`engine/moby` and `engine/docker` against a shared httptest
+  Engine API stub, the fake directly), so the fake the other tests rely on
+  cannot drift from the real clients. A case one engine is known to fail is
+  skipped for it with a message naming the pull request that fixes it.
 - `internal/e2e` (`VULNSUITE_E2E=1 go test ./internal/e2e/`) compiles a static
   Go HTTP server, builds it `FROM scratch` through the real engine, runs both
   states in host and internal exposure, verifies them, builds an overlay on

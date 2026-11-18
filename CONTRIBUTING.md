@@ -35,7 +35,8 @@ pkg/builder        content-addressed image builds (overlay / source / build) and
 pkg/runner         exposure modes, readiness, verification, fleet management
 pkg/probes         raw-socket HTTP / TCP / exec verify probes
 pkg/engine         the container engine interface; moby/ (official SDK, default) and docker/ (built-in API client)
-                   implementations; engines/ picks one; registryauth/ credentials; enginetest/ fake
+                   implementations; engines/ picks one; registryauth/ credentials; enginetest/ fake;
+                   conformance/ the behaviour suite all three must pass
 pkg/templates      templates directory resolution and update-templates
 pkg/scanners       links targets to scanner templates (detected_by), nuclei-templates index
 schemas/           JSON schema of the contract (kept in sync with pkg/contract)
