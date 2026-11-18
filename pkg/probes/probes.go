@@ -12,8 +12,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -347,6 +349,12 @@ func secs(f float64, def time.Duration) time.Duration {
 // Run executes one probe against the target.
 func Run(ctx context.Context, p contract.Probe, t Target) Result {
 	started := time.Now()
+	// A pattern that does not compile must fail the probe: an *_absent check
+	// would otherwise "not match" and pass, verifying a state that may be
+	// wrong.
+	if err := checkPatterns(p); err != nil {
+		return Result{Kind: p.Kind(), Detail: err.Error(), Elapsed: time.Since(started)}
+	}
 	var ok bool
 	var detail string
 	var err error
@@ -666,6 +674,39 @@ func pause(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+// checkPatterns compiles every regex a probe uses, as matchDotAll will.
+func checkPatterns(p contract.Probe) error {
+	type field struct{ name, pat string }
+	var fs []field
+	switch {
+	case p.HTTP != nil:
+		fs = append(fs, field{"body_matches", p.HTTP.BodyMatches}, field{"body_absent", p.HTTP.BodyAbsent})
+		for _, name := range slices.Sorted(maps.Keys(p.HTTP.HeaderMatches)) {
+			fs = append(fs, field{"header_matches." + name, p.HTTP.HeaderMatches[name]})
+		}
+	case p.Exec != nil:
+		fs = append(fs, field{"stdout_matches", p.Exec.StdoutMatches})
+	case p.TCP != nil:
+		fs = append(fs, field{"banner_matches", p.TCP.BannerMatches})
+	case p.Net != nil:
+		for i, st := range p.Net.Steps {
+			fs = append(fs, field{fmt.Sprintf("steps[%d].expect", i), st.Expect},
+				field{fmt.Sprintf("steps[%d].expect_absent", i), st.ExpectAbsent})
+		}
+	}
+	for _, f := range fs {
+		if f.pat == "" {
+			continue
+		}
+		if _, err := regexp.Compile("(?s)" + f.pat); err != nil {
+			return fmt.Errorf("invalid regex in %s probe %s: %v", p.Kind(), f.name, err)
+		}
+	}
+	return nil
+}
+
+// matchDotAll matches pat in dot-all mode. Run rejects patterns that do not
+// compile before any probe runs, so the error branch is unreachable there.
 func matchDotAll(pat, text string) bool {
 	re, err := regexp.Compile("(?s)" + pat)
 	if err != nil {
