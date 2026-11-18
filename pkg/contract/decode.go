@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"github.com/goccy/go-yaml"
+	"github.com/goccy/go-yaml/ast"
+	"github.com/goccy/go-yaml/parser"
 )
 
 // Command accepts either a YAML string or a list of strings.
@@ -110,11 +112,24 @@ var (
 // Parse decodes and structurally validates a contract document. Semantic lint
 // (is the template *wrong* rather than malformed?) lives in package validator.
 func Parse(data []byte) (*Contract, error) {
+	// Aliases are checked before decoding: goccy expands them (and merge
+	// keys) without a limit, so an alias bomb must be stopped first.
+	file, perr := parser.ParseBytes(data, 0)
+	var anchors map[string]ast.Node
+	if perr == nil {
+		var err error
+		if anchors, err = checkAliases(file); err != nil {
+			return nil, err
+		}
+	}
 	var raw rawContract
 	if err := yaml.UnmarshalWithOptions(data, &raw, yaml.Strict()); err != nil {
 		return nil, fmt.Errorf("invalid YAML: %s", strings.TrimSpace(yaml.FormatError(err, false, false)))
 	}
-	if err := checkDocument(data); err != nil {
+	if perr != nil { // the decoder reports syntax errors itself; a backstop
+		return nil, fmt.Errorf("invalid YAML: %w", perr)
+	}
+	if err := checkDocument(file, anchors); err != nil {
 		return nil, err
 	}
 	c := &Contract{

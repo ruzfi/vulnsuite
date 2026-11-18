@@ -16,7 +16,11 @@ Unknown fields are rejected, and so is a value of the wrong type: a quoted
 number where an integer is expected (`container: "80"`), a number or `null`
 where a string is expected (`summary: 123`, an `environment` value of `1`,
 `true` or `null` -- quote it: `FOO: "1"`). A file must hold a single YAML
-document. The machine-readable form of this document is
+document. YAML anchors, aliases and merge keys (`<<: *base`) may be used; a
+value reached through one must have the type required where it is used, and a
+merged key must be a field of the mapping it is merged into. Each anchor name
+may be defined once, before any alias to it, and the document with every alias
+expanded may hold at most 100,000 nodes. The machine-readable form of this document is
 [`schemas/contract.schema.json`](../schemas/contract.schema.json); the loader
 enforces the same rules.
 
