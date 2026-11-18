@@ -422,6 +422,81 @@ func TestUpdateGitPullAndRef(t *testing.T) {
 	}
 }
 
+// A plain update after -ref (which leaves HEAD detached) returns to origin's
+// default branch instead of failing in `git pull`, without losing work.
+func TestUpdateGitAfterRefReturnsToDefaultBranch(t *testing.T) {
+	origin, clone, git := gitRepo(t)
+	ctx := context.Background()
+	branchOf := func() string {
+		t.Helper()
+		out, err := exec.Command("git", "-C", clone, "symbolic-ref", "-q", "--short", "HEAD").Output()
+		if err != nil {
+			return "(detached)"
+		}
+		return strings.TrimSpace(string(out))
+	}
+	commit := func(content string) string {
+		t.Helper()
+		_ = os.WriteFile(filepath.Join(origin, "a.yaml"), []byte(content), 0o644)
+		git(origin, "commit", "-q", "-am", content)
+		return git(origin, "rev-parse", "--short", "HEAD")
+	}
+
+	if _, _, err := Update(ctx, UpdateOptions{Dir: clone, Ref: "v1"}); err != nil {
+		t.Fatal(err)
+	}
+	if b := branchOf(); b != "(detached)" {
+		t.Fatalf("-ref should detach, on %s", b)
+	}
+	v2 := commit("v2")
+	_, rev, err := Update(ctx, UpdateOptions{Dir: clone})
+	if err != nil || rev != v2 || branchOf() != "main" {
+		t.Fatalf("after -ref: rev=%s err=%v branch=%s (want %s on main)", rev, err, branchOf(), v2)
+	}
+	// ...and plain pulls keep working from there.
+	v3 := commit("v3")
+	if _, rev, err := Update(ctx, UpdateOptions{Dir: clone}); err != nil || rev != v3 {
+		t.Fatalf("second pull: rev=%s err=%v", rev, err)
+	}
+
+	// Detached with uncommitted changes to tracked files: refused, work kept.
+	if _, _, err := Update(ctx, UpdateOptions{Dir: clone, Ref: "v1"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(clone, "a.yaml"), []byte("wip"), 0o644)
+	if _, _, err := Update(ctx, UpdateOptions{Dir: clone}); err == nil || !strings.Contains(err.Error(), "uncommitted") {
+		t.Fatalf("dirty detached: err = %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(clone, "a.yaml")); string(b) != "wip" || branchOf() != "(detached)" {
+		t.Fatalf("dirty detached: a.yaml=%q branch=%s", b, branchOf())
+	}
+
+	// Commits made on the detached HEAD are not orphaned: refused.
+	git(clone, "commit", "-q", "-am", "local work")
+	local := git(clone, "rev-parse", "--short", "HEAD")
+	if _, _, err := Update(ctx, UpdateOptions{Dir: clone}); err == nil || !strings.Contains(err.Error(), "no branch or tag keeps") {
+		t.Fatalf("orphan commits: err = %v", err)
+	}
+	if got := git(clone, "rev-parse", "--short", "HEAD"); got != local {
+		t.Fatalf("orphan commits: HEAD moved to %s", got)
+	}
+
+	// No local default branch yet, and origin/HEAD names another branch: a
+	// tracking branch is created for it.
+	git(origin, "branch", "trunk", "main")
+	v4 := commit("v4") // on main only
+	git(clone, "checkout", "-q", "--detach", "v1")
+	git(clone, "fetch", "-q", "origin")
+	git(clone, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
+	_, rev, err = Update(ctx, UpdateOptions{Dir: clone})
+	if err != nil || branchOf() != "trunk" || rev != v3 {
+		t.Fatalf("origin/HEAD=trunk: rev=%s err=%v branch=%s (want %s on trunk, not %s)", rev, err, branchOf(), v3, v4)
+	}
+	if up := git(clone, "rev-parse", "--abbrev-ref", "trunk@{upstream}"); up != "origin/trunk" {
+		t.Fatalf("trunk upstream = %s", up)
+	}
+}
+
 func TestUnzipSkipsSymlinks(t *testing.T) {
 	dst := filepath.Join(t.TempDir(), "out")
 	data := makeZip(t,

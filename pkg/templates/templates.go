@@ -149,7 +149,8 @@ type UpdateOptions struct {
 }
 
 // Update fetches the templates repository into Dir. A git checkout is pulled
-// (or, with Ref, fetched and checked out detached); otherwise Dir is replaced
+// (or, with Ref, fetched and checked out detached; without Ref, a detached
+// checkout returns to origin's default branch); otherwise Dir is replaced
 // by the GitHub archive of Ref, but only when Dir is missing, empty or was
 // installed by Update before, unless Force is set. It returns the directory
 // and the version string recorded.
@@ -213,8 +214,12 @@ func updateGit(ctx context.Context, o UpdateOptions) (string, string, error) {
 		return o.Dir, "", fmt.Errorf("%s is a git checkout: -repo is not used for checkouts; change its remote with `git remote set-url origin`", o.Dir)
 	}
 	if o.Ref == "" {
-		fmt.Fprintf(o.Output, "git pull in %s\n", o.Dir)
-		if _, err := git(o.GitTimeout, "pull", "--ff-only"); err != nil {
+		if _, err := git(o.GitTimeout, "symbolic-ref", "-q", "HEAD"); err == nil {
+			fmt.Fprintf(o.Output, "git pull in %s\n", o.Dir)
+			if _, err := git(o.GitTimeout, "pull", "--ff-only"); err != nil {
+				return o.Dir, "", err
+			}
+		} else if err := returnToDefaultBranch(o, git); err != nil {
 			return o.Dir, "", err
 		}
 	} else {
@@ -241,6 +246,57 @@ func updateGit(ctx context.Context, o UpdateOptions) (string, string, error) {
 		return o.Dir, "", err
 	}
 	return o.Dir, strings.TrimSpace(rev), nil
+}
+
+// returnToDefaultBranch handles a plain update of a checkout whose HEAD is
+// detached (typically by an earlier -ref): it fetches origin and switches to
+// the remote's default branch (origin/HEAD, else DefaultBranch), fast-forwarding
+// it. It refuses, leaving the checkout untouched, when tracked files have
+// uncommitted changes or when HEAD holds commits no branch or tag keeps.
+func returnToDefaultBranch(o UpdateOptions, git func(time.Duration, ...string) (string, error)) error {
+	status, err := git(o.GitTimeout, "status", "--porcelain", "--untracked-files=no")
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(status) != "" {
+		return fmt.Errorf("%s is not on a branch (HEAD is detached, e.g. by -ref) and has uncommitted changes; commit or stash them, then rerun update-templates, or pass -ref to pick a ref", o.Dir)
+	}
+	fmt.Fprintf(o.Output, "git fetch origin in %s\n", o.Dir)
+	if _, err := git(o.GitTimeout, "fetch", "origin"); err != nil {
+		return err
+	}
+	branch := DefaultBranch
+	if out, err := git(o.GitTimeout, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"); err == nil {
+		if b, ok := strings.CutPrefix(strings.TrimSpace(out), "origin/"); ok && b != "" {
+			branch = b
+		}
+	}
+	if strings.HasPrefix(branch, "-") {
+		return fmt.Errorf("invalid default branch %q", branch)
+	}
+	remote := "refs/remotes/origin/" + branch
+	if _, err := git(o.GitTimeout, "rev-parse", "--verify", "-q", remote); err != nil {
+		return fmt.Errorf("%s is not on a branch (HEAD is detached) and origin has no %s branch; check out a branch yourself (git switch <branch>) or pass -ref", o.Dir, branch)
+	}
+	// Commits made on the detached HEAD would become unreachable: refuse.
+	if out, err := git(o.GitTimeout, "for-each-ref", "--count=1", "--contains", "HEAD", "refs/heads", "refs/remotes", "refs/tags"); err != nil {
+		return err
+	} else if strings.TrimSpace(out) == "" {
+		return fmt.Errorf("%s is not on a branch and HEAD has commits that no branch or tag keeps; save them on a branch (git switch -c <name>) before updating", o.Dir)
+	}
+	fmt.Fprintf(o.Output, "HEAD is detached; switching %s to %s (origin/%s)\n", o.Dir, branch, branch)
+	if _, err := git(o.GitTimeout, "rev-parse", "--verify", "-q", "refs/heads/"+branch); err == nil {
+		// An existing local branch is only fast-forwarded, never reset.
+		if _, err := git(o.GitTimeout, "checkout", "-q", branch, "--"); err != nil {
+			return err
+		}
+		if _, err := git(o.GitTimeout, "merge", "--ff-only", "-q", remote); err != nil {
+			return fmt.Errorf("%w (local branch %s has diverged from origin/%s; reconcile it yourself)", err, branch, branch)
+		}
+		return nil
+	}
+	_, err = git(o.GitTimeout, "checkout", "-q", "--track", "-b", branch, "origin/"+branch, "--")
+	return err
 }
 
 // checkReplaceable refuses to replace a directory update-templates did not
