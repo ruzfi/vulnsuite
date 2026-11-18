@@ -258,6 +258,10 @@ primary) plus every ungrouped target; `-all -variants` is the full matrix. This
 keeps `build -all` / `run -all` lean while `-all -variants` gives you everything.
 `validate` always checks every member, with or without `-variants`, so a family's
 rules (exactly one primary, unique variants) are enforced whole.
+`run` and `build` apply the same per-template error checks (a probe regex that
+does not compile, a missing referenced file, no ports...) before touching the
+engine, and treat a template that fails them like one that fails to load; an
+unpinned base is allowed there, as while authoring.
 
 ### Standing up a set: filters and suites as selectors
 
