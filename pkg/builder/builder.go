@@ -540,6 +540,9 @@ func modeOf(mode string) (int64, error) {
 
 // copyTree copies a build context so a patch can be applied to it. Symlinks
 // are copied as symlinks (never followed: they may point outside the folder).
+// Permission bits are kept (the context's tar headers carry them) rather than
+// left to the umask; only owner rwx is added to directories, so the patch can
+// still be applied and the copy removed.
 func copyTree(src, dst string) error {
 	return filepath.Walk(src, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -548,7 +551,10 @@ func copyTree(src, dst string) error {
 		rel, _ := filepath.Rel(src, p)
 		target := filepath.Join(dst, rel)
 		if info.IsDir() {
-			return os.MkdirAll(target, 0o755)
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+			return os.Chmod(target, info.Mode().Perm()|0o700)
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
 			link, err := os.Readlink(p)
@@ -564,7 +570,10 @@ func copyTree(src, dst string) error {
 		if err != nil {
 			return err
 		}
-		return os.WriteFile(target, data, info.Mode().Perm())
+		if err := os.WriteFile(target, data, info.Mode().Perm()); err != nil {
+			return err
+		}
+		return os.Chmod(target, info.Mode().Perm())
 	})
 }
 
