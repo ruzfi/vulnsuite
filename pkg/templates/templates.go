@@ -4,7 +4,6 @@ package templates
 
 import (
 	"archive/zip"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -352,6 +351,19 @@ func checkReplaceable(dir string, force bool) error {
 	return fmt.Errorf("refusing to replace %s: it is not empty and was not installed by update-templates (no %s marker); point -templates at another directory, or pass -force to replace it", dir, versionFile)
 }
 
+// Archive limits. A templates archive is a few MiB; the caps leave ample
+// headroom while keeping a broken mirror or a zip bomb from exhausting memory
+// or disk. A variable so tests can lower them.
+var archiveLimits = struct {
+	download int64 // compressed bytes downloaded
+	extract  int64 // uncompressed bytes written, counted as they are written
+	entries  int   // zip entries (files, directories, skipped symlinks)
+}{
+	download: 256 << 20,
+	extract:  512 << 20,
+	entries:  50_000,
+}
+
 func updateArchive(ctx context.Context, o UpdateOptions) (string, string, error) {
 	base := strings.TrimRight(o.ArchiveBaseURL, "/")
 	if base == "" {
@@ -377,22 +389,37 @@ func updateArchive(ctx context.Context, o UpdateOptions) (string, string, error)
 	if resp.StatusCode != http.StatusOK {
 		return o.Dir, "", fmt.Errorf("download %s: HTTP %d", url, resp.StatusCode)
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 2<<30))
-	if err != nil {
-		return o.Dir, "", err
-	}
 
 	parent, name := filepath.Dir(o.Dir), filepath.Base(o.Dir)
 	if err := os.MkdirAll(parent, 0o755); err != nil {
 		return o.Dir, "", err
 	}
+	// Stream the archive to disk next to the destination rather than into
+	// memory, and give up once it exceeds the cap.
+	zf, err := os.CreateTemp(parent, "."+name+".zip-")
+	if err != nil {
+		return o.Dir, "", err
+	}
+	defer func() {
+		zf.Close()
+		os.Remove(zf.Name())
+	}()
+	size, err := download(resp, zf, archiveLimits.download)
+	if err != nil {
+		return o.Dir, "", fmt.Errorf("download %s: %w; %s left unchanged", url, err, o.Dir)
+	}
+
 	tmp, err := os.MkdirTemp(parent, "."+name+".new-")
 	if err != nil {
 		return o.Dir, "", err
 	}
-	if err := unzipStripTop(data, tmp); err != nil {
+	if err := unzipStripTop(zf, size, tmp); err != nil {
 		os.RemoveAll(tmp)
-		return o.Dir, "", err
+		return o.Dir, "", fmt.Errorf("extract %s@%s: %w; %s left unchanged", o.Repo, o.Ref, err, o.Dir)
+	}
+	if !HasTemplates(tmp) {
+		os.RemoveAll(tmp)
+		return o.Dir, "", fmt.Errorf("the archive of %s@%s contains no vulnsuite templates (no contract file); check -repo and -ref; %s left unchanged", o.Repo, o.Ref, o.Dir)
 	}
 	version := o.Repo + "@" + o.Ref + " " + time.Now().UTC().Format(time.RFC3339)
 	if err := os.WriteFile(filepath.Join(tmp, versionFile), []byte(version+"\n"), 0o644); err != nil {
@@ -404,6 +431,22 @@ func updateArchive(ctx context.Context, o UpdateOptions) (string, string, error)
 		return o.Dir, "", err
 	}
 	return o.Dir, version, nil
+}
+
+// download copies the response body to f, failing once it exceeds limit
+// bytes, and returns the number of bytes written.
+func download(resp *http.Response, f *os.File, limit int64) (int64, error) {
+	if resp.ContentLength > limit {
+		return 0, fmt.Errorf("archive is %d bytes, over the %d byte limit", resp.ContentLength, limit)
+	}
+	n, err := io.Copy(f, io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return n, err
+	}
+	if n > limit {
+		return n, fmt.Errorf("archive is over the %d byte limit", limit)
+	}
+	return n, nil
 }
 
 // swapDir moves newDir into place at dir. The previous dir is kept under a
@@ -450,18 +493,27 @@ func Version(dir string) string {
 	return strings.TrimSpace(string(b))
 }
 
+// errExtractLimit is returned once the extracted bytes exceed the cap.
+var errExtractLimit = errors.New("archive expands beyond the size limit")
+
 // unzipStripTop extracts a GitHub archive (single top-level folder) into dst.
 // Only directories and regular files are extracted: symlinks (and any other
-// special entries) are skipped, and entries escaping dst are rejected.
-func unzipStripTop(data []byte, dst string) error {
-	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+// special entries) are skipped, and entries escaping dst are rejected. The
+// number of entries and the total bytes written are capped by archiveLimits;
+// bytes are counted as written, whatever sizes the entry headers declare.
+func unzipStripTop(r io.ReaderAt, size int64, dst string) error {
+	zr, err := zip.NewReader(r, size)
 	if err != nil {
 		return err
+	}
+	if n := len(zr.File); n > archiveLimits.entries {
+		return fmt.Errorf("archive has %d entries, over the %d entry limit", n, archiveLimits.entries)
 	}
 	if err := os.MkdirAll(dst, 0o755); err != nil {
 		return err
 	}
 	root := filepath.Clean(dst) + string(os.PathSeparator)
+	budget := archiveLimits.extract
 	for _, f := range zr.File {
 		name := f.Name
 		if i := strings.Index(name, "/"); i >= 0 {
@@ -489,31 +541,41 @@ func unzipStripTop(data []byte, dst string) error {
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
 		}
-		if err := extractFile(f, target); err != nil {
+		n, err := extractFile(f, target, budget)
+		if err != nil {
+			if errors.Is(err, errExtractLimit) {
+				return fmt.Errorf("%w of %d bytes (at %s)", err, archiveLimits.extract, f.Name)
+			}
 			return err
 		}
+		budget -= n
 	}
 	return nil
 }
 
-func extractFile(f *zip.File, target string) error {
+// extractFile writes f to target, at most budget bytes; one byte more fails
+// with errExtractLimit. It returns the bytes written.
+func extractFile(f *zip.File, target string, budget int64) (int64, error) {
 	perm := os.FileMode(0o644)
 	if f.Mode()&0o111 != 0 {
 		perm = 0o755
 	}
 	rc, err := f.Open()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer rc.Close()
 	// O_EXCL: never follow or overwrite something already at target.
 	out, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, perm)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	_, err = io.Copy(out, rc)
+	n, err := io.Copy(out, io.LimitReader(rc, budget+1))
 	if cerr := out.Close(); err == nil {
 		err = cerr
 	}
-	return err
+	if err == nil && n > budget {
+		err = errExtractLimit
+	}
+	return n, err
 }

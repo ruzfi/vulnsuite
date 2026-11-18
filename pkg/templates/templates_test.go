@@ -506,7 +506,7 @@ func TestUnzipSkipsSymlinks(t *testing.T) {
 		zipEntry{name: "top/link", body: "real.yaml", mode: os.ModeSymlink | 0o777},
 		zipEntry{name: "top/escape", body: "/etc/passwd", mode: os.ModeSymlink | 0o777},
 	)
-	if err := unzipStripTop(data, dst); err != nil {
+	if err := unzipBytes(data, dst); err != nil {
 		t.Fatal(err)
 	}
 	for _, n := range []string{"link", "escape"} {
@@ -533,7 +533,7 @@ func TestUnzipRejectsEscapingPaths(t *testing.T) {
 	dst := filepath.Join(parent, "out")
 	for _, name := range []string{"top/../../evil.yaml", "top/a/../../../evil.yaml"} {
 		data := makeZip(t, zipEntry{name: name, body: "x"})
-		if err := unzipStripTop(data, dst); err == nil || !strings.Contains(err.Error(), "unsafe path") {
+		if err := unzipBytes(data, dst); err == nil || !strings.Contains(err.Error(), "unsafe path") {
 			t.Fatalf("%s: err = %v", name, err)
 		}
 	}

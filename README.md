@@ -153,8 +153,10 @@ templates repository you are standing in, or `~/vulnsuite-templates`.
 - anything else is replaced by the GitHub archive of `-ref` (default `main`),
   but only when the directory is missing, empty, or was installed by
   `update-templates` (it has a `.vulnsuite-templates-version` marker). Any other
-  non-empty directory is refused unless you pass `-force`. The old directory is
-  removed only once the new one is in place.
+  non-empty directory is refused unless you pass `-force`. The archive is
+  refused, and the old directory kept, when it is over 256 MiB, expands past
+  512 MiB or 50,000 entries, or holds no templates (a wrong `-repo`). The old
+  directory is removed only once the new one is in place.
 
 A template:
 
