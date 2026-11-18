@@ -144,7 +144,11 @@ templates repository you are standing in, or `~/vulnsuite-templates`.
 
 - a git checkout is pulled (`--ff-only`); `-ref BRANCH|TAG|COMMIT` fetches the
   ref from `origin` and checks it out detached (refused while tracked files have
-  uncommitted changes). A checkout is never replaced, so the update fails if
+  uncommitted changes). A later plain `update-templates` on such a detached
+  checkout fetches `origin` and switches back to its default branch
+  (`origin/HEAD`, else `main`), fast-forwarding it; it refuses instead while
+  tracked files have uncommitted changes or the detached HEAD has commits no
+  branch or tag keeps. A checkout is never replaced, so the update fails if
   `git` is not on `PATH`;
 - anything else is replaced by the GitHub archive of `-ref` (default `main`),
   but only when the directory is missing, empty, or was installed by
