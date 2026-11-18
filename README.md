@@ -1,3 +1,11 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/logo-on-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset=".github/assets/logo-on-light.svg">
+    <img src=".github/assets/logo-on-light.svg" alt="vulnsuite logo" width="160">
+  </picture>
+</p>
+
 # vulnsuite
 
 **Build vulnerable systems on purpose.** Point vulnsuite at a
