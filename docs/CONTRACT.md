@@ -153,8 +153,10 @@ How a state's image is produced (`vulnsuite list` shows it as KIND):
 | `build` | anything | `build` | `vulnsuite/<id>:<state>-<hash>` |
 
 `<hash>` covers the base identity, the state's `image`/`digest` override
-(what an overlay build starts `FROM`), the build context tree (a symlink by
-its link text), the patch,
+(what an overlay build starts `FROM`), the build context tree (every
+directory, file and whether it is executable, a symlink by its link text;
+`.git` excluded; other mode bits follow the umask and are left out so a
+checkout gets the same tag on every machine), the patch,
 every overlay's content, destination and `mode`, the environment and build
 args. Identical inputs produce an identical tag and are never rebuilt. The
 state image and `mode` enter the hash only when set, so templates that use

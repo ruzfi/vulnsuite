@@ -18,6 +18,7 @@ package contract
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -692,7 +693,7 @@ func (c *Contract) ContentHash(stateName string) string {
 		parts = append(parts, "state-image:"+st.EffectiveImage(c.Base))
 	}
 	if c.Base.Kind == BaseBuild && c.Base.Context != "" {
-		parts = append(parts, "context:"+hashTree(c.hashPath(c.Base.Context)))
+		parts = append(parts, "context/v2:"+hashTree(c.hashPath(c.Base.Context)))
 	}
 	if st.Patch != "" {
 		parts = append(parts, fmt.Sprintf("patch:%s:%s", st.Patch, hashFile(c.hashPath(st.Patch))))
@@ -789,7 +790,18 @@ func hashFile(path string) string {
 	return hex.EncodeToString(sum[:])[:16]
 }
 
-// hashTree hashes a directory tree's relative paths and contents.
+// hashTree hashes a build context the way it travels to the daemon: every
+// directory, regular file (with whether it is executable) and symlink (by its
+// link text: it is never followed, and may point outside the folder), as an
+// unambiguous sequence of records. .git is skipped, as the build context
+// leaves it out. Only the executable bit is hashed, the one mode bit git
+// records: the rest follow the umask of whoever checked the template out, and
+// must not give one template different tags on different machines.
+//
+// Format v2. v1 hashed paths and contents only, run together with no
+// separator, so a chmod did not change the tag (a stale image was reused)
+// and {a: "bc"} hashed like {ab: "c"}. The version is part of the
+// ContentHash part, so a future format change is explicit.
 func hashTree(root string) string {
 	if root == "" {
 		return "missing"
@@ -798,27 +810,67 @@ func hashTree(root string) string {
 	if err != nil || !info.IsDir() {
 		return "missing"
 	}
-	var files []string
+	type entry struct {
+		rel  string
+		path string
+		info fs.FileInfo
+	}
+	var entries []entry
 	filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err == nil && (d.Type().IsRegular() || d.Type()&fs.ModeSymlink != 0) {
-			files = append(files, p)
+		if err != nil || p == root {
+			return nil
 		}
+		if d.IsDir() && d.Name() == ".git" {
+			return filepath.SkipDir
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		t := info.Mode().Type()
+		if t != 0 && t != fs.ModeDir && t != fs.ModeSymlink {
+			return nil // devices, sockets, pipes are not carried
+		}
+		rel, _ := filepath.Rel(root, p)
+		entries = append(entries, entry{filepath.ToSlash(rel), p, info})
 		return nil
 	})
-	sort.Strings(files)
+	sort.Slice(entries, func(i, j int) bool { return entries[i].rel < entries[j].rel })
 	h := sha256.New()
-	for _, p := range files {
-		rel, _ := filepath.Rel(root, p)
-		h.Write([]byte(filepath.ToSlash(rel)))
-		// A symlink travels in the build context as a link (never followed:
-		// it may point outside the folder), so its target text is what counts.
-		if target, err := os.Readlink(p); err == nil {
-			h.Write([]byte("\x00symlink\x00" + filepath.ToSlash(target)))
-			continue
-		}
-		b, err := os.ReadFile(p)
-		if err == nil {
-			h.Write(b)
+	// field writes a length-prefixed field, so no two record sequences can
+	// produce the same byte stream.
+	field := func(b []byte) {
+		var n [8]byte
+		binary.BigEndian.PutUint64(n[:], uint64(len(b)))
+		h.Write(n[:])
+		h.Write(b)
+	}
+	for _, e := range entries {
+		mode := e.info.Mode()
+		switch {
+		case mode.IsDir():
+			field([]byte("dir"))
+			field([]byte(e.rel))
+		case mode&fs.ModeSymlink != 0:
+			target, err := os.Readlink(e.path)
+			if err != nil {
+				continue
+			}
+			field([]byte("symlink"))
+			field([]byte(e.rel))
+			field([]byte(filepath.ToSlash(target)))
+		default:
+			b, err := os.ReadFile(e.path)
+			if err != nil {
+				continue
+			}
+			kind := "file"
+			if mode.Perm()&0o111 != 0 {
+				kind = "exec"
+			}
+			field([]byte(kind))
+			field([]byte(e.rel))
+			field(b)
 		}
 	}
 	return hex.EncodeToString(h.Sum(nil))[:16]
