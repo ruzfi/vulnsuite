@@ -51,7 +51,7 @@ func makeZip(t *testing.T, entries ...zipEntry) []byte {
 func templatesZip(t *testing.T) []byte {
 	return makeZip(t,
 		zipEntry{name: "vulnsuite-templates-main/", mode: os.ModeDir | 0o755},
-		zipEntry{name: "vulnsuite-templates-main/web/x/contract.yaml", body: "id: x\n"},
+		zipEntry{name: "vulnsuite-templates-main/web/x/contract.yaml", body: "apiVersion: vulnsuite/v1\nkind: Target\n"},
 	)
 }
 
@@ -464,5 +464,66 @@ func TestUnzipRejectsEscapingPaths(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(parent, "evil.yaml")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("entry escaped the destination")
+	}
+}
+
+// Only files declaring a vulnsuite apiVersion count: template.yaml is also
+// the AWS SAM / CloudFormation file name.
+func TestHasTemplatesNeedsVulnsuiteContract(t *testing.T) {
+	write := func(dir, name, body string) {
+		t.Helper()
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sam := t.TempDir()
+	write(sam, "template.yaml", "AWSTemplateFormatVersion: '2010-09-09'\nTransform: AWS::Serverless-2016-10-31\n")
+	write(filepath.Join(sam, "infra"), "contract.yaml", "apiVersion: v1\nkind: Contract\n")
+	if HasTemplates(sam) {
+		t.Error("a SAM project counts as a templates directory")
+	}
+	for _, v := range []string{"apiVersion: vulnsuite/v1", `apiVersion: "vulnsuite/v1"`, "apiVersion: 'vulnsuite/v1' # pinned"} {
+		dir := t.TempDir()
+		write(filepath.Join(dir, "web", "x"), "template.yaml", "# a target\n"+v+"\nkind: Target\n")
+		if !HasTemplates(dir) {
+			t.Errorf("%q not recognised", v)
+		}
+	}
+}
+
+// Running from inside an unrelated git repository that happens to hold a
+// template.yaml must not resolve to that repository: update-templates would
+// then git pull, or with -ref check out a detached commit, in the user's own
+// project.
+func TestResolveIgnoresUnrelatedRepo(t *testing.T) {
+	t.Setenv(EnvDir, "")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(repo, "template.yaml"), []byte("AWSTemplateFormatVersion: '2010-09-09'\n"), 0o644)
+	src := filepath.Join(repo, "src")
+	os.Mkdir(src, 0o755)
+	t.Chdir(src)
+	got, err := Resolve("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != DefaultDir() {
+		t.Fatalf("Resolve = %q, want the default %q", got, DefaultDir())
+	}
+	// A real templates checkout is still found from a subfolder.
+	os.WriteFile(filepath.Join(repo, "template.yaml"), []byte("apiVersion: vulnsuite/v1\nkind: Target\n"), 0o644)
+	got, err = Resolve("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want, _ := filepath.EvalSymlinks(repo); got != repo && got != want {
+		t.Fatalf("Resolve = %q, want %q", got, repo)
 	}
 }
