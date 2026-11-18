@@ -151,8 +151,9 @@ from contract metadata (taxonomy v2) and shown as columns:
 
 KEV membership is derived by cross-referencing a target's CVEs against the CISA
 KEV catalog. The catalog is read from the templates checkout's data/cisa-kev.txt
-(kept fresh upstream); -refresh-kev fetches the live CISA feed and caches it at
-` + "`~/.cache/vulnsuite/cisa-kev.json`" + `, and that cache is used instead
+(kept fresh upstream); -refresh-kev fetches the live CISA feed and caches it as
+vulnsuite/cisa-kev.json in the user cache directory (~/.cache on Linux,
+~/Library/Caches on macOS, %LocalAppData% on Windows), and that cache is used instead
 whenever it holds a newer catalog than the checkout. The status line (and
 kev_source in -json) gives the source and its age; data more than 30 days old
 gets a warning. Offline with neither present, KEV is shown as "?" and

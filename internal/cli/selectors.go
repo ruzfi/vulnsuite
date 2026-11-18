@@ -137,8 +137,12 @@ func parseSelectorFile(path string) ([]selectorLine, error) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if i := strings.Index(line, " #"); i >= 0 {
-			line = strings.TrimSpace(line[:i])
+		// A comment starts at a "#" preceded by any whitespace (a tab too).
+		for j := 1; j < len(line); j++ {
+			if line[j] == '#' && (line[j-1] == ' ' || line[j-1] == '\t') {
+				line = strings.TrimSpace(line[:j])
+				break
+			}
 		}
 		if line == "" {
 			continue
