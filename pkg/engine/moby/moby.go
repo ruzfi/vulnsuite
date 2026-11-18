@@ -10,7 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/netip"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +30,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/ruzfi/vulnsuite/pkg/engine"
+	"github.com/ruzfi/vulnsuite/pkg/engine/docker"
 	"github.com/ruzfi/vulnsuite/pkg/engine/registryauth"
 )
 
@@ -36,18 +40,59 @@ type Engine struct {
 	host string
 }
 
-// New connects to host (empty = DOCKER_HOST / the local socket), negotiating
-// the API version with the daemon.
+// New connects to host, negotiating the API version with the daemon. An
+// empty host resolves like the docker CLI and the built-in api engine:
+// DOCKER_HOST (with DOCKER_TLS_VERIFY / DOCKER_CERT_PATH), then the context
+// named by DOCKER_CONTEXT or currentContext, then the local socket defaults
+// (including the Docker Desktop, OrbStack and Colima per-user sockets).
 func New(host string) (*Engine, error) {
 	opts := []client.Opt{client.FromEnv, client.WithAPIVersionNegotiation()}
-	if host != "" {
+	switch {
+	case host != "":
 		opts = append(opts, client.WithHost(host))
+	case os.Getenv("DOCKER_HOST") == "":
+		// FromEnv has nothing to go on: resolve the context / socket the
+		// way the docker CLI does.
+		ep, err := docker.ResolveEndpoint()
+		if err != nil {
+			return nil, err
+		}
+		epOpts, err := endpointOpts(ep)
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts, epOpts...)
 	}
 	cli, err := client.New(opts...)
 	if err != nil {
 		return nil, err
 	}
 	return &Engine{cli: cli, host: cli.DaemonHost()}, nil
+}
+
+// endpointOpts turns a resolved endpoint into SDK options. Its TLS settings
+// apply to a tcp:// host only, as in the api engine; a socket ignores them.
+func endpointOpts(ep docker.Endpoint) ([]client.Opt, error) {
+	u, err := url.Parse(ep.Host)
+	if err != nil {
+		return nil, fmt.Errorf("docker endpoint %q: %w", ep.Host, err)
+	}
+	files := ep.TLS
+	if files == nil || u.Scheme != "tcp" {
+		return []client.Opt{client.WithHost(ep.Host)}, nil
+	}
+	cfg, err := files.TLSConfig(u.Hostname())
+	if err != nil {
+		return nil, fmt.Errorf("TLS for %s: %w", ep.Host, err)
+	}
+	// WithHost configures the dialer on the transport WithHTTPClient sets,
+	// so it must come second.
+	hc := &http.Client{Transport: &http.Transport{
+		TLSClientConfig: cfg,
+		MaxIdleConns:    6,
+		IdleConnTimeout: 30 * time.Second,
+	}, CheckRedirect: client.CheckRedirect}
+	return []client.Opt{client.WithHTTPClient(hc), client.WithHost(ep.Host)}, nil
 }
 
 // Client exposes the underlying SDK client.
