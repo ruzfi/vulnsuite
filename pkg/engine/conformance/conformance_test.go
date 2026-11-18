@@ -14,13 +14,6 @@ import (
 	"github.com/ruzfi/vulnsuite/pkg/engine"
 )
 
-// Pull requests that fix a divergence this suite pins down. Remove the skip
-// that names one once it has merged.
-const (
-	pr73 = "fixed by #73 (built-in ContainerWait error, built-in forcerm, SDK ImageExists errors)"
-	pr81 = "fixed by #81 (the fake's NetworkEnsure keeps an existing network)"
-)
-
 const (
 	img     = "registry.example/vs/app:1"
 	imgB    = "registry.example/vs/other:2"
@@ -159,7 +152,6 @@ var cases = []conformanceCase{
 	}},
 	{"image_exists_platform_inspect_error_is_error", func(t *testing.T, h *harness) {
 		h.divergence(t, map[string]string{
-			sdk: pr73,
 			api: "not applicable: the built-in client speaks API <= 1.47 and never inspects per platform",
 		})
 		h.seedImage(img, "linux/amd64")
@@ -249,7 +241,6 @@ var cases = []conformanceCase{
 	}},
 	{"image_build_removes_intermediate_containers", func(t *testing.T, h *harness) {
 		h.needsDaemon(t)
-		h.divergence(t, map[string]string{api: pr73})
 		if err := h.eng.ImageBuild(bg(t), engine.BuildOptions{Context: tarOf(t, nil), Tags: []string{img}}, nil); err != nil {
 			t.Fatal(err)
 		}
@@ -498,7 +489,6 @@ var cases = []conformanceCase{
 	}},
 	{"container_wait_daemon_error", func(t *testing.T, h *harness) {
 		h.needsDaemon(t)
-		h.divergence(t, map[string]string{api: pr73})
 		run(t, h, engine.ContainerSpec{Name: "vs-a"})
 		h.d.mu.Lock()
 		h.d.waitErr["vs-a"] = "removal of container vs-a failed"
@@ -526,7 +516,6 @@ var cases = []conformanceCase{
 		}
 	}},
 	{"network_ensure_keeps_existing", func(t *testing.T, h *harness) {
-		h.divergence(t, map[string]string{fake: pr81})
 		id := h.seedNetwork(engine.NetworkSpec{Name: "vs-net", Internal: true})
 		got, err := h.eng.NetworkEnsure(bg(t), engine.NetworkSpec{Name: "vs-net", Internal: false})
 		if err != nil || got != id {
