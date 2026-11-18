@@ -210,3 +210,46 @@ func TestDockerignorePatterns(t *testing.T) {
 		}
 	}
 }
+
+// A Dockerfile inside a directory .dockerignore excludes is still sent, as
+// the Docker CLI does by adding "!<dockerfile>" to the excludes; the rest of
+// that directory stays out.
+func TestBuildContextKeepsDockerfileInIgnoredDir(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, ".dockerignore", "docker\n")
+	write(t, root, "docker/Dockerfile", "FROM scratch\n")
+	write(t, root, "docker/secret", "s")
+	write(t, root, "docker/sub/x", "x")
+	write(t, root, "app.py", "x")
+	s := newBuildContext(root).stream("docker/Dockerfile")
+	got := readTar(t, s)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for n := range got {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	want := []string{".dockerignore", "app.py", "docker/Dockerfile"}
+	if strings.Join(names, " ") != strings.Join(want, " ") {
+		t.Fatalf("context:\n got  %v\n want %v", names, want)
+	}
+}
+
+// Docker reads "#" as a comment only in the first column and refuses a bare
+// "!" (which used to re-include everything excluded before it).
+func TestDockerignoreDockerParity(t *testing.T) {
+	for _, p := range []string{"*.log\n!\n", "*.log\n!  \n"} {
+		if _, err := parseDockerignore([]byte(p)); err == nil || !strings.Contains(err.Error(), `illegal exclusion pattern: "!"`) {
+			t.Errorf("%q: want the illegal exclusion error, got %v", p, err)
+		}
+	}
+	d, err := parseDockerignore([]byte("  # notes\n# real comment\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.excludes("# notes") || d.excludes("# real comment") {
+		t.Errorf("indented # must be a pattern, column-0 # a comment: rules=%d", len(d.rules))
+	}
+}

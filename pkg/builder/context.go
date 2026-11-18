@@ -169,7 +169,10 @@ func (m *buildContext) walkTree(tw *tar.Writer, ign *dockerignore, keep map[stri
 			return filepath.SkipDir
 		}
 		if !keep[name] && ign.excludes(name) {
-			if d.IsDir() && !ign.hasExceptions {
+			// An excluded directory is still walked when it holds a kept
+			// file (the Docker CLI adds "!<dockerfile>" to the excludes, so
+			// "docker" in .dockerignore does not drop docker/Dockerfile).
+			if d.IsDir() && !ign.hasExceptions && !holdsKept(name, keep) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -211,6 +214,16 @@ func (m *buildContext) walkTree(tw *tar.Writer, ign *dockerignore, keep map[stri
 		_, err = io.CopyN(tw, f, hdr.Size)
 		return err
 	})
+}
+
+// holdsKept reports whether dir is a parent directory of a kept path.
+func holdsKept(dir string, keep map[string]bool) bool {
+	for k := range keep {
+		if strings.HasPrefix(k, dir+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // overlayDockerfile generates the tiny Dockerfile that bakes overlay files and
