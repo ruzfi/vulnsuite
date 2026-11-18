@@ -396,6 +396,11 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 			return nil, err
 		}
 	}
+	if scNet != "" {
+		if err := r.clearSidecarNetwork(ctx, scNet); err != nil {
+			return nil, err
+		}
+	}
 
 	spec := engine.ContainerSpec{
 		Name:  name,
@@ -521,11 +526,9 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 		return nil, err
 	}
 	// The sidecar network: target state and its sidecars only. Any stale copy
-	// (its containers were removed above) is replaced so its settings match
-	// this run's exposure.
+	// was removed above, so it is created afresh with this run's settings.
 	var targetExtraNet *engine.NetworkAttachment
 	if scNet != "" {
-		_ = r.Engine.NetworkRemove(ctx, scNet)
 		if _, err := r.Engine.NetworkEnsure(ctx, scSpec); err != nil {
 			return fail(fmt.Errorf("network %s: %w", scNet, err))
 		}
@@ -683,6 +686,33 @@ func (r *Runner) cleanup(ctx context.Context, container string, sidecars []strin
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// clearSidecarNetwork removes the sidecar network an earlier run of this state
+// left behind, so the run creates it afresh with its own settings. NetworkEnsure
+// keeps an existing network as it is, and a stale one may differ from what this
+// run needs: an internal network left by a -no-egress run cannot publish ports
+// in host mode. Every managed container labelled with the network goes first,
+// including sidecars the template no longer declares (renamed or dropped since):
+// they would keep the network attached and impossible to remove. A network that
+// still cannot be removed is an error, not silently reused.
+func (r *Runner) clearSidecarNetwork(ctx context.Context, scNet string) error {
+	rows, err := r.Engine.ContainerList(ctx, true, contract.ContainerNamePrefix)
+	if err != nil {
+		return fmt.Errorf("list containers on network %s: %w", scNet, err)
+	}
+	for _, row := range rows {
+		if row.Labels[LabelManaged] != "true" || row.Labels[LabelSidecarNetwork] != scNet {
+			continue
+		}
+		if err := r.Engine.ContainerRemove(ctx, row.Name); err != nil {
+			return fmt.Errorf("remove %s from stale network %s: %w", row.Name, scNet, err)
+		}
+	}
+	if err := r.Engine.NetworkRemove(ctx, scNet); err != nil {
+		return fmt.Errorf("remove stale network %s (a container vulnsuite did not start may still be attached): %w", scNet, err)
+	}
+	return nil
 }
 
 // startSidecars starts the state's sidecars on the private network scNet,

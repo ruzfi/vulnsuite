@@ -296,7 +296,9 @@ func (f *Fake) ContainerStart(ctx context.Context, id string) error {
 	c.Running = true
 	// Like the daemon, assign a free host port to every binding that asks
 	// for host port 0 (a real free port, so a StartFn can listen on it).
-	if !f.NoAssignPorts {
+	// Nothing is published from an internal network, so inspect then reports
+	// no host port, as the daemon's does.
+	if !f.NoAssignPorts && !f.onInternalNetwork(c) {
 		ports := append([]engine.PortBinding(nil), c.Spec.Ports...)
 		for i := range ports {
 			if ports[i].HostPort == 0 {
@@ -316,6 +318,12 @@ func (f *Fake) ContainerStart(ctx context.Context, id string) error {
 		return fn(spec)
 	}
 	return nil
+}
+
+// onInternalNetwork reports whether c's primary network is an internal one.
+// Called with f.mu held.
+func (f *Fake) onInternalNetwork(c *Container) bool {
+	return c.Spec.Network != nil && f.Networks[c.Spec.Network.Name].Internal
 }
 
 func (f *Fake) ContainerRemove(ctx context.Context, id string) error {
@@ -426,7 +434,11 @@ func (f *Fake) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (stri
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.Networks[spec.Name] = spec
+	// Like the real engines, an existing network is returned as it is: its
+	// settings are not updated to spec.
+	if _, ok := f.Networks[spec.Name]; !ok {
+		f.Networks[spec.Name] = spec
+	}
 	return "net-" + spec.Name, nil
 }
 
