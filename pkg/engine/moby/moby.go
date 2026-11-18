@@ -102,7 +102,7 @@ func (e *Engine) ImageExists(ctx context.Context, ref, platform string) (bool, e
 }
 
 func (e *Engine) ImagePull(ctx context.Context, ref, platform string, out io.Writer) error {
-	po := client.ImagePullOptions{RegistryAuth: registryauth.For(ref)}
+	po := client.ImagePullOptions{RegistryAuth: registryauth.ForContext(ctx, ref)}
 	if platform != "" {
 		p, err := parsePlatform(platform)
 		if err != nil {
@@ -136,7 +136,7 @@ func (e *Engine) ImageBuild(ctx context.Context, opts engine.BuildOptions, out i
 		Remove:      true,
 		ForceRemove: true,
 		Version:     build.BuilderV1,
-		AuthConfigs: authConfigs(),
+		AuthConfigs: authConfigs(ctx),
 	}
 	if opts.Platform != "" {
 		p, err := parsePlatform(opts.Platform)
@@ -159,7 +159,7 @@ func (e *Engine) ImageTag(ctx context.Context, source, target string) error {
 }
 
 func (e *Engine) ImagePush(ctx context.Context, ref string, out io.Writer) error {
-	auth := registryauth.ForPush(ref)
+	auth := registryauth.ForPushContext(ctx, ref)
 	if auth == "" {
 		auth, _ = authconfig.Encode(registry.AuthConfig{})
 	}
@@ -497,9 +497,9 @@ func (e *Engine) NetworkConnect(ctx context.Context, networkName, container stri
 
 // -- helpers --------------------------------------------------------------------
 
-func authConfigs() map[string]registry.AuthConfig {
+func authConfigs(ctx context.Context) map[string]registry.AuthConfig {
 	out := map[string]registry.AuthConfig{}
-	for k, c := range registryauth.Configs() {
+	for k, c := range registryauth.ConfigsContext(ctx) {
 		out[k] = registry.AuthConfig{Username: c.Username, Password: c.Password, ServerAddress: c.ServerAddress, IdentityToken: c.IdentityToken}
 	}
 	return out

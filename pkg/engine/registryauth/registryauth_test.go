@@ -155,8 +155,9 @@ func TestLookupHubRefsUseHubKey(t *testing.T) {
 			t.Errorf("Lookup(%q) = %+v, %v; want the hub credential", ref, a, ok)
 		}
 	}
+	// The helper's answer is cached: it runs once, not once per lookup.
 	b, _ := os.ReadFile(logPath)
-	if want := hubAddress + "\n" + hubAddress + "\n" + hubAddress + "\n"; string(b) != want {
+	if want := hubAddress + "\n"; string(b) != want {
 		t.Errorf("helper asked for %q, want %q", b, want)
 	}
 }
