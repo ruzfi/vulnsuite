@@ -76,6 +76,29 @@ type Builder struct {
 	Engine engine.Engine
 	// Git is the git binary used for source bases (default "git").
 	Git string
+
+	// pullLocks serialises the exists-or-pull step per image and platform,
+	// so parallel jobs sharing a base (ResolveAll) pull it once instead of
+	// each seeing it missing and pulling it again.
+	pullLocks sync.Map // ref + "\x00" + platform -> *sync.Mutex
+}
+
+// pullIfMissing pulls ref for platform unless it is already present,
+// reporting whether it pulled. Concurrent calls for the same image wait for
+// each other, and the later ones find it present.
+func (b *Builder) pullIfMissing(ctx context.Context, ref, platform string, out io.Writer) (bool, error) {
+	l, _ := b.pullLocks.LoadOrStore(ref+"\x00"+platform, &sync.Mutex{})
+	mu := l.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+	exists, err := b.Engine.ImageExists(ctx, ref, platform)
+	if err != nil || exists {
+		return false, err
+	}
+	if err := b.Engine.ImagePull(ctx, ref, platform, out); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // New returns a Builder on eng.
@@ -99,18 +122,20 @@ func (b *Builder) Resolve(ctx context.Context, c *contract.Contract, state strin
 			return nil, fmt.Errorf("%s/%s: cannot resolve an image", c.ID(), state)
 		}
 		res.Ref = ref
+		if opts.Pull {
+			pulled, err := b.pullIfMissing(ctx, ref, opts.Platform, opts.Output)
+			if err != nil {
+				return nil, err
+			}
+			res.Pulled = pulled
+			return res, nil
+		}
 		exists, err := b.Engine.ImageExists(ctx, ref, opts.Platform)
 		if err != nil {
 			return nil, err
 		}
 		if !exists {
-			if !opts.Pull {
-				return nil, fmt.Errorf("%s/%s: image %s%s is not present and pulling is disabled", c.ID(), state, ref, forPlatform(opts.Platform))
-			}
-			if err := b.Engine.ImagePull(ctx, ref, opts.Platform, opts.Output); err != nil {
-				return nil, err
-			}
-			res.Pulled = true
+			return nil, fmt.Errorf("%s/%s: image %s%s is not present and pulling is disabled", c.ID(), state, ref, forPlatform(opts.Platform))
 		}
 		return res, nil
 	}
@@ -212,14 +237,8 @@ func (b *Builder) buildOverlay(ctx context.Context, c *contract.Contract, st *co
 		return errors.New("overlay needs an image base")
 	}
 	if opts.Pull {
-		exists, err := b.Engine.ImageExists(ctx, baseRef, opts.Platform)
-		if err != nil {
+		if _, err := b.pullIfMissing(ctx, baseRef, opts.Platform, opts.Output); err != nil {
 			return err
-		}
-		if !exists {
-			if err := b.Engine.ImagePull(ctx, baseRef, opts.Platform, opts.Output); err != nil {
-				return err
-			}
 		}
 	}
 	mc := newBuildContext("")
