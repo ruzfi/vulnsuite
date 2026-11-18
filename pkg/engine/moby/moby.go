@@ -139,9 +139,15 @@ func (e *Engine) ImageExists(ctx context.Context, ref, platform string) (bool, e
 	if err != nil {
 		return false, err
 	}
+	if !apiAtLeast(e.cli.ClientVersion(), 1, 49) {
+		return false, nil
+	}
 	img, err = e.cli.ImageInspect(ctx, ref, client.ImageInspectWithPlatform(&p))
 	if err != nil {
-		return false, nil
+		if cerrdefs.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
 	}
 	return engine.PlatformMatches(platform, img.Os, img.Architecture, img.Variant), nil
 }
@@ -548,6 +554,22 @@ func authConfigs() map[string]registry.AuthConfig {
 		out[k] = registry.AuthConfig{Username: c.Username, Password: c.Password, ServerAddress: c.ServerAddress, IdentityToken: c.IdentityToken}
 	}
 	return out
+}
+
+// apiAtLeast reports whether the negotiated API version v ("1.51") is at least
+// major.minor. An empty or unparsable version (negotiation not done) counts
+// as recent enough: the SDK then checks the requirement itself.
+func apiAtLeast(v string, major, minor int) bool {
+	a, b, ok := strings.Cut(v, ".")
+	if !ok {
+		return true
+	}
+	ma, err1 := strconv.Atoi(a)
+	mi, err2 := strconv.Atoi(b)
+	if err1 != nil || err2 != nil {
+		return true
+	}
+	return ma > major || (ma == major && mi >= minor)
 }
 
 func parsePlatform(s string) (ocispec.Platform, error) {
