@@ -206,7 +206,11 @@ docker CLI's context (`DOCKER_CONTEXT`, else `currentContext` in
 `tcp://` daemon with `DOCKER_TLS_VERIFY` / `DOCKER_CERT_PATH` (`ca.pem`,
 `cert.pem`, `key.pem`).
 A selector is a folder (`web-servers`), a contract file, or a template id (a
-unique substring works: `-t grafana`).
+unique substring works: `-t grafana`). A bare name is always looked up in the
+templates directory, so a file or folder called `grafana` in your working
+directory never shadows it; to point at something on disk, write it as a path —
+anything containing `/`, starting with `.` or `~`, or ending in `.yaml`/`.yml`
+(`-t ./grafana`, `-t path/to/contract.yaml`).
 
 `run` and `build` take a state, `vulnerable` or `patched`, anywhere among their
 arguments, and flags may follow selectors: `vulnsuite run grafana patched
