@@ -86,7 +86,11 @@ func isRepoRoot(dir string) bool {
 	return err == nil
 }
 
-// HasTemplates reports whether dir contains at least one contract within three levels.
+// HasTemplates reports whether dir contains at least one vulnsuite contract
+// within three levels. A file only counts when it declares a vulnsuite
+// apiVersion: template.yaml is also the AWS SAM / CloudFormation file name,
+// and an unrelated project must not be taken for a templates checkout (and
+// then pulled or checked out by update-templates).
 func HasTemplates(dir string) bool {
 	found := false
 	var walk func(string, int)
@@ -110,7 +114,7 @@ func HasTemplates(dir string) bool {
 				continue
 			}
 			for _, n := range loader.ContractNames {
-				if e.Name() == n {
+				if e.Name() == n && isContract(filepath.Join(d, n)) {
 					found = true
 					return
 				}
@@ -119,6 +123,29 @@ func HasTemplates(dir string) bool {
 	}
 	walk(dir, 0)
 	return found
+}
+
+// isContract reports whether the file at p declares a top-level
+// `apiVersion: vulnsuite/...`, looking only at its first 64 KiB.
+func isContract(p string) bool {
+	f, err := os.Open(p)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	head, _ := io.ReadAll(io.LimitReader(f, 64<<10))
+	for _, line := range strings.Split(string(head), "\n") {
+		v, ok := strings.CutPrefix(line, "apiVersion:")
+		if !ok {
+			continue
+		}
+		if i := strings.Index(v, "#"); i >= 0 {
+			v = v[:i]
+		}
+		v = strings.Trim(strings.TrimSpace(v), `"'`)
+		return strings.HasPrefix(v, "vulnsuite/")
+	}
+	return false
 }
 
 // DefaultArchiveBaseURL serves GitHub repository archives as
