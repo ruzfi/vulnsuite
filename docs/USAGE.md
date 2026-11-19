@@ -301,6 +301,15 @@ target's ports are published from it), and has no egress in `macvlan` mode so
 the target's traffic keeps leaving through its LAN address. `vulnsuite stop`
 removes the sidecars and their network along with the target.
 
+**The shared network is created once.** `vulnsuite-net` (or `-network NAME`)
+is created by the first run and reused by later ones, with the settings it was
+created with. A run whose flags don't match it fails instead of joining it: a
+`-no-egress` run refuses a network that has egress, and a run without
+`-no-egress` refuses an internal one. Stop the targets on it and remove it with
+`vulnsuite stop -prune-net` (add `-network NAME` for another network), then run
+again. The same goes for the macvlan network `vulnsuite-macvlan-<parent>`
+when `-subnet` or `-gateway` differs from the existing one.
+
 `vulnsuite ps`, `targets` and `stop` find containers by their
 `dev.vulnsuite.*` labels: `stop -t foo` stops exactly template `foo` (never
 `foo-bar`), and containers vulnsuite did not start are left alone.

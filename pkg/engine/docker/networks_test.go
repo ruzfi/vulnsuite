@@ -31,7 +31,7 @@ func TestNetworkEnsureConflictReinspects(t *testing.T) {
 				fmt.Fprint(w, `{"message":"network vulnsuite-net not found"}`)
 				return
 			}
-			fmt.Fprint(w, `{"Id":"net-other-run"}`)
+			fmt.Fprint(w, `{"Id":"net-other-run","Driver":"bridge","Internal":true}`)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 			fmt.Fprint(w, `{"message":"unexpected"}`)
@@ -42,8 +42,8 @@ func TestNetworkEnsureConflictReinspects(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	id, err := c.NetworkEnsure(context.Background(), engine.NetworkSpec{Name: "vulnsuite-net"})
-	if err != nil || id != "net-other-run" {
-		t.Fatalf("NetworkEnsure = %q, %v; want the concurrently created network", id, err)
+	n, err := c.NetworkEnsure(context.Background(), engine.NetworkSpec{Name: "vulnsuite-net"})
+	if err != nil || n.ID != "net-other-run" || !n.Internal {
+		t.Fatalf("NetworkEnsure = %+v, %v; want the concurrently created network, as it is (internal)", n, err)
 	}
 }

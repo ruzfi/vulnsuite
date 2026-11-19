@@ -5,6 +5,9 @@ vulnsuite stands up **knowingly vulnerable** targets. Two trust boundaries matte
 1. **The target is hostile by design.** It runs in a container, by default on an
    internal Docker network with no route off the host (`run -no-egress`), and
    should be scanned from a container on that network or via `-expose host`.
+   `-no-egress` is checked against the network the target actually joins: if
+   `vulnsuite-net` already exists with egress (created by a run without the
+   flag), the run fails rather than attach the target to it.
    Never run targets on a machine you care about or on a shared network.
 
 2. **Templates are untrusted input.** Anyone can contribute to

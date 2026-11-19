@@ -113,6 +113,17 @@ type NetworkSpec struct {
 	Internal bool
 }
 
+// Network is a network as the daemon reports it.
+type Network struct {
+	ID       string
+	Driver   string
+	Internal bool
+	Options  map[string]string
+	// Subnet and Gateway are the first IPAM config ("" when there is none).
+	Subnet  string
+	Gateway string
+}
+
 // HostInfo describes the daemon's platform.
 type HostInfo struct {
 	OS   string // linux, windows
@@ -157,8 +168,10 @@ type Engine interface {
 	// ContainerWait blocks until the container exits and returns its exit code.
 	ContainerWait(ctx context.Context, idOrName string) (int, error)
 
-	// NetworkEnsure creates the network if it does not exist and returns its id.
-	NetworkEnsure(ctx context.Context, spec NetworkSpec) (string, error)
+	// NetworkEnsure creates the network if it does not exist and returns it
+	// as the daemon reports it. An existing network is returned unchanged,
+	// with its own settings (which may differ from spec): the caller compares.
+	NetworkEnsure(ctx context.Context, spec NetworkSpec) (Network, error)
 	NetworkExists(ctx context.Context, name string) (bool, error)
 	// NetworkRemove deletes a network; a missing network is not an error.
 	NetworkRemove(ctx context.Context, name string) error

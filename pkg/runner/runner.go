@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
@@ -454,8 +455,13 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 	primaryNet := ""
 	switch exp.Mode {
 	case ModeInternal:
-		if _, err := r.Engine.NetworkEnsure(ctx, engine.NetworkSpec{Name: exp.Network, Internal: exp.Internal}); err != nil {
-			return nil, fmt.Errorf("network %s: %w", exp.Network, err)
+		stop := "vulnsuite stop -prune-net"
+		if exp.Network != DefaultNetwork {
+			stop = "vulnsuite stop -network " + exp.Network + " -prune-net"
+		}
+		if err := r.ensureNetwork(ctx, engine.NetworkSpec{Name: exp.Network, Internal: exp.Internal},
+			fmt.Sprintf("stop the targets on it and remove it with %q (or \"docker network rm %s\"), or pick another network with -network", stop, exp.Network)); err != nil {
+			return nil, err
 		}
 		primaryNet = exp.Network
 		spec.Network = &engine.NetworkAttachment{Name: exp.Network, Aliases: []string{alias}}
@@ -493,10 +499,10 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 			return nil, errors.New("macvlan exposure needs --parent <host interface>")
 		}
 		netName := "vulnsuite-macvlan-" + exp.Parent
-		if _, err := r.Engine.NetworkEnsure(ctx, engine.NetworkSpec{
+		if err := r.ensureNetwork(ctx, engine.NetworkSpec{
 			Name: netName, Driver: "macvlan", Options: map[string]string{"parent": exp.Parent},
 			Subnet: exp.Subnet, Gateway: exp.Gateway,
-		}); err != nil {
+		}, fmt.Sprintf("stop the targets on it and remove it with \"vulnsuite stop -network %s -prune-net\" (or \"docker network rm %s\"), or run with its -subnet and -gateway", netName, netName)); err != nil {
 			return nil, fmt.Errorf("macvlan network: %w", err)
 		}
 		primaryNet = netName
@@ -528,8 +534,8 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 	// was removed above, so it is created afresh with this run's settings.
 	var targetExtraNet *engine.NetworkAttachment
 	if scNet != "" {
-		if _, err := r.Engine.NetworkEnsure(ctx, scSpec); err != nil {
-			return fail(fmt.Errorf("network %s: %w", scNet, err))
+		if err := r.ensureNetwork(ctx, scSpec, "another run of this target state may have recreated it; stop it and run again"); err != nil {
+			return fail(err)
 		}
 		att := engine.NetworkAttachment{Name: scNet, Aliases: []string{c.ID(), alias}}
 		if spec.Network == nil {
@@ -685,6 +691,77 @@ func (r *Runner) cleanup(ctx context.Context, container string, sidecars []strin
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// ensureNetwork creates the network spec names, or checks that the existing one
+// has the settings spec asks for. NetworkEnsure keeps an existing network as it
+// is, so without this check a -no-egress run would join a network with egress
+// (created by an earlier run without the flag) and the target could reach the
+// internet. A mismatch is an error naming what differs and remedy, the way out.
+func (r *Runner) ensureNetwork(ctx context.Context, spec engine.NetworkSpec, remedy string) error {
+	n, err := r.Engine.NetworkEnsure(ctx, spec)
+	if err != nil {
+		return fmt.Errorf("network %s: %w", spec.Name, err)
+	}
+	if diffs := networkMismatch(spec, n); len(diffs) > 0 {
+		return fmt.Errorf("network %s already exists with other settings than this run needs: %s; %s",
+			spec.Name, strings.Join(diffs, "; "), remedy)
+	}
+	return nil
+}
+
+// networkMismatch lists how the network n differs from spec. Subnet and gateway
+// are compared only when spec sets them (the daemon picks them otherwise).
+func networkMismatch(spec engine.NetworkSpec, n engine.Network) []string {
+	var diffs []string
+	want := spec.Driver
+	if want == "" {
+		want = "bridge"
+	}
+	if n.Driver != want {
+		diffs = append(diffs, fmt.Sprintf("its driver is %q, not %q", n.Driver, want))
+	}
+	switch {
+	case spec.Internal && !n.Internal:
+		diffs = append(diffs, "it has egress (a route off the host), but -no-egress needs an internal network")
+	case !spec.Internal && n.Internal:
+		diffs = append(diffs, "it is internal (no egress, created with -no-egress), but this run asks for egress")
+	}
+	keys := make([]string, 0, len(spec.Options))
+	for k := range spec.Options {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if got := n.Options[k]; got != spec.Options[k] {
+			diffs = append(diffs, fmt.Sprintf("its %s is %q, not %q", k, got, spec.Options[k]))
+		}
+	}
+	if spec.Subnet != "" && !samePrefix(spec.Subnet, n.Subnet) {
+		diffs = append(diffs, fmt.Sprintf("its subnet is %q, not %q", n.Subnet, spec.Subnet))
+	}
+	if spec.Gateway != "" && !sameAddr(spec.Gateway, n.Gateway) {
+		diffs = append(diffs, fmt.Sprintf("its gateway is %q, not %q", n.Gateway, spec.Gateway))
+	}
+	return diffs
+}
+
+func samePrefix(a, b string) bool {
+	pa, errA := netip.ParsePrefix(a)
+	pb, errB := netip.ParsePrefix(b)
+	if errA != nil || errB != nil {
+		return a == b
+	}
+	return pa.Masked() == pb.Masked()
+}
+
+func sameAddr(a, b string) bool {
+	aa, errA := netip.ParseAddr(a)
+	ab, errB := netip.ParseAddr(b)
+	if errA != nil || errB != nil {
+		return a == b
+	}
+	return aa == ab
 }
 
 // clearSidecarNetwork removes the sidecar network an earlier run of this state
