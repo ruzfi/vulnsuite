@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/goccy/go-yaml"
 	"github.com/goccy/go-yaml/ast"
@@ -83,13 +84,19 @@ func (e *SchemaError) Error() string { return fmt.Sprintf("schema: %s: %s", e.Lo
 var (
 	// idRe is a valid Docker repository path component (no leading, trailing
 	// or doubled separators); idMinLen/idMaxLen bound it as the schema does.
-	idRe      = regexp.MustCompile(`^[a-z0-9]+([.-][a-z0-9]+)*$`)
-	vulnRefRe = regexp.MustCompile(`^(CVE-\d{4}-\d{4,7}|GHSA-[a-z0-9-]+|[A-Z]{2,8}-[A-Z0-9-]+)$`)
+	idRe = regexp.MustCompile(`^[a-z0-9]+([.-][a-z0-9]+)*$`)
+	// vulnRefRe is a CVE id, a GHSA id, or a generic PREFIX-ID whose prefix
+	// is 2-8 upper-case letters other than CVE and GHSA, so a malformed
+	// CVE-21-41773 is rejected instead of passing as a generic ref (and then
+	// not being treated as a CVE). The prefix alternatives spell out "not CVE,
+	// not GHSA" without a lookahead, so the schema can use the same pattern.
+	vulnRefRe = regexp.MustCompile(`^(CVE-\d{4}-\d{4,7}|GHSA-[a-z0-9-]+|` +
+		`([A-Z]{2}|[A-BD-Z][A-Z]{2}|C[A-UW-Z][A-Z]|CV[A-DF-Z]|[A-FH-Z][A-Z]{3}|G[A-GI-Z][A-Z]{2}|GH[A-RT-Z][A-Z]|GHS[B-Z]|[A-Z]{5,8})` +
+		`-[A-Z0-9-]+)$`)
 	// refShapeRe is vulnRefRe case-insensitively, for recognising a ref-shaped
 	// selector or filter value (CVE-, GHSA-, GO-, VS-... in any case).
-	refShapeRe  = regexp.MustCompile(`(?i)^(CVE-\d{4}-\d{4,7}|GHSA-[a-z0-9-]+|[A-Z]{2,8}-[A-Z0-9-]+)$`)
-	cweRe       = regexp.MustCompile(`^CWE-\d+$`)
-	disclosedRe = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
+	refShapeRe = regexp.MustCompile(`(?i)^(CVE-\d{4}-\d{4,7}|GHSA-[a-z0-9-]+|[A-Z]{2,8}-[A-Z0-9-]+)$`)
+	cweRe      = regexp.MustCompile(`^CWE-\d+$`)
 	// handleRe is the pattern for a group handle and a variant discriminator:
 	// lower-case alphanumerics in dash-separated segments.
 	handleRe   = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
@@ -169,7 +176,15 @@ func Parse(data []byte) (*Contract, error) {
 			Verify:      rs.Verify,
 		}
 	}
-	if err := c.checkStructure(); err != nil {
+	// Which base keys are present, even with an empty value: the schema
+	// rejects `context: ""` on an image base like any other foreign key.
+	var keys struct {
+		Base map[string]any `yaml:"base"`
+	}
+	if err := yaml.Unmarshal(data, &keys); err != nil {
+		return nil, fmt.Errorf("invalid YAML: %s", strings.TrimSpace(yaml.FormatError(err, false, false)))
+	}
+	if err := c.checkStructure(keys.Base); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -179,8 +194,16 @@ func se(loc, format string, args ...any) error {
 	return &SchemaError{Loc: loc, Message: fmt.Sprintf(format, args...)}
 }
 
+// baseKeys are the keys each base kind allows, besides kind itself.
+var baseKeys = map[string]map[string]bool{
+	BaseImage:  {"image": true, "digest": true},
+	BaseSource: {"repo": true, "commit": true, "dockerfile": true, "build_args": true},
+	BaseBuild:  {"context": true, "dockerfile": true, "build_args": true},
+}
+
 // checkStructure enforces the same rules as schemas/contract.schema.json.
-func (c *Contract) checkStructure() error {
+// present holds the keys written under base, empty values included.
+func (c *Contract) checkStructure(present map[string]any) error {
 	if c.APIVersion != APIVersion {
 		return se("apiVersion", "must be %q (got %q)", APIVersion, c.APIVersion)
 	}
@@ -223,8 +246,10 @@ func (c *Contract) checkStructure() error {
 		}
 		seenClass[cl] = true
 	}
-	if m.Disclosed != "" && !disclosedRe.MatchString(m.Disclosed) {
-		return se("metadata/disclosed", "%q must be an ISO date (YYYY-MM-DD)", m.Disclosed)
+	if m.Disclosed != "" {
+		if _, err := time.Parse(time.DateOnly, m.Disclosed); err != nil {
+			return se("metadata/disclosed", "%q must be an ISO date (YYYY-MM-DD)", m.Disclosed)
+		}
 	}
 	if m.Group != "" && !handleRe.MatchString(m.Group) {
 		return se("metadata/group", "%q must match %s", m.Group, handleRe)
@@ -237,27 +262,32 @@ func (c *Contract) checkStructure() error {
 	}
 
 	b := c.Base
+	if allowed, ok := baseKeys[b.Kind]; ok {
+		for _, k := range sortedKeys(present) {
+			if k != "kind" && !allowed[k] {
+				switch b.Kind {
+				case BaseImage:
+					return se("base", "kind: image allows only image and digest")
+				case BaseSource:
+					return se("base", "kind: source allows only repo, commit, dockerfile, build_args")
+				default:
+					return se("base", "kind: build allows only context, dockerfile, build_args")
+				}
+			}
+		}
+	}
 	switch b.Kind {
 	case BaseImage:
 		if b.Image == "" {
 			return se("base/image", "is required for kind: image")
 		}
-		if b.Repo != "" || b.Commit != "" || b.Context != "" || b.Dockerfile != "" || len(b.BuildArgs) > 0 {
-			return se("base", "kind: image allows only image and digest")
-		}
 	case BaseSource:
 		if b.Repo == "" || b.Commit == "" {
 			return se("base", "kind: source requires repo and commit")
 		}
-		if b.Image != "" || b.Digest != "" || b.Context != "" {
-			return se("base", "kind: source allows only repo, commit, dockerfile, build_args")
-		}
 	case BaseBuild:
 		if b.Context == "" {
 			return se("base/context", "is required for kind: build")
-		}
-		if b.Image != "" || b.Digest != "" || b.Repo != "" || b.Commit != "" {
-			return se("base", "kind: build allows only context, dockerfile, build_args")
 		}
 		if err := checkLocalPath(b.Context); err != nil {
 			return se("base/context", "%q %v", b.Context, err)
@@ -479,7 +509,7 @@ func dangerousDevice(d string) bool {
 	return false
 }
 
-func sortedKeys(m map[string]string) []string {
+func sortedKeys[V any](m map[string]V) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)

@@ -46,6 +46,8 @@ var decoderOnly = map[string]string{
 	"port-float.yaml": "80.0 is an integer to JSON Schema (draft 2020-12 ignores a zero fraction), " +
 		"but the decoder requires a YAML integer, as `container: 80.0` is almost certainly a mistake",
 	"sidecar-duplicate.yaml": "uniqueItems compares whole objects; sidecar names being unique cannot be expressed",
+	"disclosed-feb-30.yaml": "the pattern bounds month 01-12 and day 01-31, but whether a day exists in its month " +
+		"(Feb 30, Apr 31, Feb 29 outside a leap year) needs a calendar; the decoder parses the date",
 }
 
 func loadSchema(t *testing.T) map[string]any {

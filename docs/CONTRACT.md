@@ -20,7 +20,11 @@ document. YAML anchors, aliases and merge keys (`<<: *base`) may be used; a
 value reached through one must have the type required where it is used, and a
 merged key must be a field of the mapping it is merged into. Each anchor name
 may be defined once, before any alias to it, and the document with every alias
-expanded may hold at most 100,000 nodes. The machine-readable form of this document is
+expanded may hold at most 100,000 nodes. A required string may not be empty
+(`summary` may not be blank either): `base.image`, `base.repo`, `base.commit`,
+a sidecar's `name` and `image`, a per-state sidecar `image`, and the `run` of a
+`seed` step or an `exec` probe. A base key the base kind does not allow is
+rejected even with an empty value (`context: ""` on an image base). The machine-readable form of this document is
 [`schemas/contract.schema.json`](../schemas/contract.schema.json); the loader
 enforces the same rules.
 
@@ -48,11 +52,11 @@ directories once.
 | --- | --- | --- |
 | `id` | yes | `^[a-z0-9]+([.-][a-z0-9]+)*$`, 3-80 characters (a valid Docker repository name: no leading, trailing or doubled `.`/`-`); unique; `<product>-<version>-<cve>` by convention. The running container's network alias is `<id>-<state>` (one per state). |
 | `summary` | yes | one line: what and how |
-| `vuln_refs` | | `CVE-YYYY-NNNN`, `GHSA-...`, or `PREFIX-ID` for flaws without a CVE (community templates use `VS-...`) |
+| `vuln_refs` | | `CVE-YYYY-NNNN` (4-7 digit sequence), `GHSA-...` (lower case), or `PREFIX-ID` for flaws without a CVE (community templates use `VS-...`). The prefix of a `PREFIX-ID` is 2-8 upper-case letters other than `CVE` and `GHSA`, so a malformed `CVE-21-41773` or `GHSA-ABCD-...` is an error, not a generic ref. |
 | `cwe` | | `CWE-NN` |
 | `severity` | | `info`, `low`, `medium`, `high`, `critical` |
 | `class` | | non-empty list of finding class(es) (taxonomy v2), orthogonal to the product surface (the top directory level): `vuln` (a tracked software vulnerability, usually a CVE), `misconfig` (an insecure configuration), `exposure` (data/interface reachable that should not be), `default-login` (default/weak credentials), `weak-crypto`. One or more, unique. `vulnsuite list --class` filters on it. |
-| `disclosed` | | optional public-disclosure date (`YYYY-MM-DD`); drives `list --year`/`--since` and a timeline view, falling back to the CVE-id year when unset. |
+| `disclosed` | | optional public-disclosure date (`YYYY-MM-DD`, a real calendar date: `2021-13-45` and `2021-02-30` are rejected); drives `list --year`/`--since` and a timeline view, falling back to the CVE-id year when unset. |
 | `group` | | variant-family handle (`^[a-z0-9]+(-[a-z0-9]+)*$`). Targets that share a `group` are variants of one vulnerability: `-t <group>` resolves to the group's **primary**, and `-variants` expands to every member. A lone target that sets a `group` is simply a nickname for its id (no `primary`/`variant` needed). A handle must not equal any target `id`. |
 | `primary` | | `true` marks the canonical member of a group. Exactly one member of a multi-member group must set it; a single-member group's lone member is the primary implicitly. Without a `group` it has no effect (`primary-no-group` warning). |
 | `variant` | | discriminator within a group (`^[a-z0-9]+(-[a-z0-9]+)*$`), e.g. `waf-evasion`; unique within the group. Every non-primary member of a multi-member group needs one. Requires `group`. |
