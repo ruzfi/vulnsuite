@@ -171,6 +171,9 @@ gets a warning. Offline with neither present, KEV is shown as "?" and
 			if err != nil {
 				return err
 			}
+			if err := checkCategory(store, f.category); err != nil {
+				return err
+			}
 			// Resolve the KEV set always, to populate the column; -kev/-no-kev
 			// additionally require it to be known.
 			kevSet, kevSrc, err := kev.Resolve(ctx, kev.Options{
@@ -409,6 +412,12 @@ func cmdValidate() *Command {
 			fs.StringVar(&nmapDir, "nmap-scripts", "", "nmap NSE scripts dir to cross-check nmap: detected_by refs against (default: $NMAPDIR or the system nmap scripts dir)")
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
+			if err := checkScannerDir("-nuclei-templates", nucleiDir); err != nil {
+				return err
+			}
+			if err := checkScannerDir("-nmap-scripts", nmapDir); err != nil {
+				return err
+			}
 			store, err := g.Store()
 			if err != nil {
 				return err

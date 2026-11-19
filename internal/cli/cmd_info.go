@@ -2,8 +2,10 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -38,6 +40,9 @@ writing a template and contributing it upstream.`,
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
 			if len(args) != 1 {
 				return usageError{"pass exactly one selector"}
+			}
+			if err := checkScannerDir("-nuclei-templates", nucleiDir); err != nil {
+				return err
 			}
 			store, err := g.Store()
 			if err != nil {
@@ -247,4 +252,25 @@ func loadNucleiIndex(dir string) (*scanners.Index, error) {
 		cache = filepath.Join(base, "vulnsuite")
 	}
 	return scanners.LoadCached(dir, cache)
+}
+
+// checkScannerDir makes an explicit scanner directory flag that is not a
+// directory a usage error. Without it a typo silently fell back to
+// $NUCLEI_TEMPLATES / ~/nuclei-templates (or $NMAPDIR / the system scripts).
+func checkScannerDir(flagName, dir string) error {
+	if dir == "" {
+		return nil
+	}
+	st, err := os.Stat(dir)
+	if err != nil {
+		var pe *fs.PathError
+		if errors.As(err, &pe) {
+			err = pe.Err
+		}
+		return usageError{fmt.Sprintf("%s %s: %v", flagName, dir, err)}
+	}
+	if !st.IsDir() {
+		return usageError{fmt.Sprintf("%s %s: not a directory", flagName, dir)}
+	}
+	return nil
 }

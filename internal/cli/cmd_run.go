@@ -207,6 +207,9 @@ Exposure modes:
 			default:
 				return usageError{fmt.Sprintf("unknown -expose mode %q (internal, host or macvlan)", exp.Mode)}
 			}
+			if err := checkScannerDir("-nuclei-templates", nucleiDir); err != nil {
+				return err
+			}
 			if maxConcurrent < 1 {
 				return usageError{fmt.Sprintf("-max-concurrent must be at least 1, got %d", maxConcurrent)}
 			}
@@ -376,7 +379,9 @@ Exposure modes:
 			// does not print: skip indexing the checkout then.
 			var idx *scanners.Index
 			if dir := scanners.ResolveDir(nucleiDir); dir != "" && !g.Quiet {
-				idx, _ = loadNucleiIndex(dir)
+				if idx, err = loadNucleiIndex(dir); err != nil {
+					return err
+				}
 			}
 			var handles []*runner.Handle
 			var failures []string
