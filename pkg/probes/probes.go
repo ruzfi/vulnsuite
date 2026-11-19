@@ -484,28 +484,45 @@ func runTCP(ctx context.Context, s *contract.TCPProbe, t Target) (bool, string, 
 	timeout := secs(s.Timeout, 10*time.Second)
 	d := net.Dialer{Timeout: timeout}
 	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(t.Host, strconv.Itoa(dport)))
+	if err == nil {
+		defer conn.Close()
+	}
+	// A port proxy accepts for a port nothing listens on, then closes: that
+	// connection does not make the port open.
+	var early []byte
+	listening := err == nil
+	if listening {
+		early, listening = checkListener(conn, min(ListenerGrace, timeout))
+	}
 	if s.Closed {
 		// Asserting the port is NOT open: a dial error (refused/unreachable) is
 		// the expected result; a successful connection is the failure.
 		if err != nil {
 			return true, fmt.Sprintf("tcp %d closed as expected (%v)", port, err), nil
 		}
-		conn.Close()
+		if !listening {
+			return true, fmt.Sprintf("tcp %d closed as expected (%s)", port, errNotListening), nil
+		}
 		return false, fmt.Sprintf("tcp %d is open but was expected to be closed", port), nil
 	}
 	if err != nil {
 		return false, "", &connError{fmt.Errorf("tcp %d -> %v", port, err)}
 	}
-	defer conn.Close()
+	if !listening {
+		return false, "", &connError{fmt.Errorf("tcp %d -> %v", port, errNotListening)}
+	}
 	_ = conn.SetDeadline(time.Now().Add(timeout))
+	banner := string(early)
 	if s.Send != "" {
 		if _, err := io.WriteString(conn, s.Send); err != nil {
 			return false, "", fmt.Errorf("tcp %d send -> %v", port, err)
 		}
 	}
-	buf := make([]byte, 4096)
-	n, _ := conn.Read(buf) // a timeout yields an empty banner, which may be the expected result
-	banner := string(buf[:n])
+	if s.Send != "" || len(early) == 0 {
+		buf := make([]byte, 4096)
+		n, _ := conn.Read(buf) // a timeout yields an empty banner, which may be the expected result
+		banner += string(buf[:n])
+	}
 	if s.BannerMatches != "" && !matchDotAll(s.BannerMatches, banner) {
 		return false, fmt.Sprintf("tcp %d banner %q !~ /%s/", port, trunc(banner, 60), s.BannerMatches), nil
 	}
@@ -613,11 +630,47 @@ const (
 	Unreachable              // timeout / no route: not reachable from here
 )
 
-// Reachability tells whether host:port is open, refused, or unreachable.
+// ListenerGrace is how long a new connection is watched for the immediate close
+// that means nothing is listening behind a port proxy (see checkListener).
+// Docker's proxy closes within a few milliseconds of the backend refusing.
+var ListenerGrace = 300 * time.Millisecond
+
+var errNotListening = errors.New("connection accepted, then closed with no data: nothing is listening yet (the host port is held by a port proxy)")
+
+// checkListener tells whether something listens behind a fresh connection. In
+// host exposure mode the published port is held by Docker's port proxy, which
+// accepts a connection whether or not anything listens in the container and
+// closes it as soon as its own connection to the container is refused. So a
+// connection that ends (EOF or reset) within grace without sending a byte
+// means nothing is listening yet. Data means something listens, and so does
+// silence until grace passes: many servers (HTTP, redis, databases) wait for
+// the client to speak first. The bytes read are returned so a banner is kept.
+// The read deadline is cleared on return.
+func checkListener(conn net.Conn, grace time.Duration) ([]byte, bool) {
+	_ = conn.SetReadDeadline(time.Now().Add(grace))
+	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if n > 0 {
+		return buf[:n], true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return nil, true
+	}
+	return nil, false
+}
+
+// Reachability tells whether host:port is open, refused, or unreachable. A
+// connection a port proxy accepts and then closes at once counts as refused:
+// the address answers, but nothing listens yet.
 func Reachability(host string, port int, timeout time.Duration) Reach {
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), timeout)
 	if err == nil {
-		conn.Close()
+		defer conn.Close()
+		if _, ok := checkListener(conn, min(ListenerGrace, timeout)); !ok {
+			return Refused
+		}
 		return Open
 	}
 	if isConnRefused(err) {
@@ -642,7 +695,9 @@ func isConnRefused(err error) bool {
 	return errors.As(err, &errno) && errno == wsaeConnRefused
 }
 
-// WaitForPort polls until host:port accepts a TCP connection or the deadline passes.
+// WaitForPort polls until something listens on host:port or the deadline
+// passes. A connection that a port proxy accepts and closes at once does not
+// count (see checkListener).
 func WaitForPort(ctx context.Context, host string, port int, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
@@ -653,8 +708,11 @@ func WaitForPort(ctx context.Context, host string, port int, timeout time.Durati
 		d := net.Dialer{Timeout: 2 * time.Second}
 		conn, err := d.DialContext(ctx, "tcp", addr)
 		if err == nil {
+			_, ok := checkListener(conn, ListenerGrace)
 			conn.Close()
-			return true
+			if ok {
+				return true
+			}
 		}
 		if !pause(ctx, 500*time.Millisecond) {
 			return false

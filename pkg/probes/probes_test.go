@@ -148,22 +148,10 @@ func TestHTTPProbePortOverrideAndTCPClosed(t *testing.T) {
 	closedPort := l.Addr().(*net.TCPAddr).Port
 	l.Close()
 
-	// a plain TCP listener that just accepts, for the "open" assertion
-	openL, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer openL.Close()
-	go func() {
-		for {
-			c, err := openL.Accept()
-			if err != nil {
-				return
-			}
-			c.Close()
-		}
-	}()
-	openPort := openL.Addr().(*net.TCPAddr).Port
+	// a plain TCP listener that accepts and waits for the client, for the
+	// "open" assertion (one that closes at once looks like a port proxy with
+	// nothing behind it; see TestPortProxyWithoutListener)
+	openPort := silentServer(t)
 
 	tgt := Target{Host: host, Port: closedPort, Scheme: "http"}
 
