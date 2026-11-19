@@ -144,8 +144,10 @@ func (m *buildContext) writeTar(w io.Writer, dockerfile string) error {
 
 // walkTree writes the tree's directories, regular files and symlinks (as
 // symlinks: the daemon resolves them inside the context, never on the host).
-// .git, names .dockerignore excludes, and names a generated file replaces are
-// left out.
+// Every .git directory (nested ones too, e.g. a vendored checkout), names
+// .dockerignore excludes, and names a generated file replaces are left out.
+// The .git rule must match the content hash (contract.hashTree): anything sent
+// but not hashed could change the image without changing its tag.
 func (m *buildContext) walkTree(tw *tar.Writer, ign *dockerignore, keep map[string]bool) error {
 	root := m.root
 	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
@@ -160,7 +162,7 @@ func (m *buildContext) walkTree(tw *tar.Writer, ign *dockerignore, keep map[stri
 			return err
 		}
 		name := filepath.ToSlash(rel)
-		if d.IsDir() && name == ".git" {
+		if d.IsDir() && d.Name() == ".git" {
 			return filepath.SkipDir
 		}
 		if !keep[name] && ign.excludes(name) {

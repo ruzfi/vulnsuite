@@ -236,7 +236,8 @@ own:
   `validate` as `path-escapes-template`.
 - The build context (`base.context`, or the `source` checkout) is sent as it
   is on disk: symlinks inside it travel as symlinks and are never followed
-  (the daemon resolves them inside the context), `.git` is left out, and a
+  (the daemon resolves them inside the context), every `.git` directory
+  (nested ones too, like the content hash) is left out, and a
   `.dockerignore` at the context root is honoured with Docker's pattern rules.
   The Dockerfile and `.dockerignore` are always sent, as with `docker build`.
 - `overlay[].dest` is a plain path: letters, digits and `. _ @ % + = : , / -`,
