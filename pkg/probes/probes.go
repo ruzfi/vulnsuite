@@ -148,6 +148,7 @@ func RawHTTP(ctx context.Context, host string, port int, method, path string, he
 		return nil, err
 	}
 	defer conn.Close()
+	defer closeOnDone(ctx, conn)()
 	// The deadline covers the TLS handshake too: a peer that accepts and then
 	// stalls must not outlive the probe timeout.
 	_ = conn.SetDeadline(time.Now().Add(timeout))
@@ -162,6 +163,9 @@ func RawHTTP(ctx context.Context, host string, port int, method, path string, he
 		return nil, err
 	}
 	blob := readResponse(conn, method) // a timeout mid-read still yields what arrived
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(blob) == 0 {
 		return nil, fmt.Errorf("empty response")
 	}
@@ -333,11 +337,10 @@ func dechunk(s string) string {
 			out.WriteString(s)
 			break
 		}
-		sizeStr := strings.TrimSpace(s[:nl])
-		if i := strings.Index(sizeStr, ";"); i >= 0 {
-			sizeStr = sizeStr[:i]
-		}
-		size, err := strconv.ParseInt(sizeStr, 16, 64)
+		// Cut a chunk extension first, then trim: RFC 9112 7.1.1 allows
+		// whitespace before the ';' ("5 ;x=y"), as chunkedComplete does.
+		sizeStr, _, _ := strings.Cut(s[:nl], ";")
+		size, err := strconv.ParseInt(strings.TrimSpace(sizeStr), 16, 64)
 		if err != nil {
 			out.WriteString(s)
 			break
@@ -511,17 +514,24 @@ func runTCP(ctx context.Context, s *contract.TCPProbe, t Target) (bool, string, 
 	if !listening {
 		return false, "", &connError{fmt.Errorf("tcp %d -> %v", port, errNotListening)}
 	}
-	_ = conn.SetDeadline(time.Now().Add(timeout))
+	defer closeOnDone(ctx, conn)()
+	deadline := time.Now().Add(timeout)
+	_ = conn.SetDeadline(deadline)
 	banner := string(early)
 	if s.Send != "" {
 		if _, err := io.WriteString(conn, s.Send); err != nil {
 			return false, "", fmt.Errorf("tcp %d send -> %v", port, err)
 		}
 	}
-	if s.Send != "" || len(early) == 0 {
-		buf := make([]byte, 4096)
-		n, _ := conn.Read(buf) // a timeout yields an empty banner, which may be the expected result
-		banner += string(buf[:n])
+	// The listener check may already hold the greeting. Read on when a reply
+	// to send is due, when nothing arrived yet, or when the greeting so far
+	// does not match banner_matches (it may continue in later segments). A
+	// timeout yields an empty banner, which may be the expected result.
+	if s.Send != "" || len(early) == 0 || (s.BannerMatches != "" && !matchDotAll(s.BannerMatches, banner)) {
+		banner = readUntilFrom(conn, early, 4096, s.BannerMatches, deadline)
+	}
+	if err := ctx.Err(); err != nil {
+		return false, "", err
 	}
 	if s.BannerMatches != "" && !matchDotAll(s.BannerMatches, banner) {
 		return false, fmt.Sprintf("tcp %d banner %q !~ /%s/", port, trunc(banner, 60), s.BannerMatches), nil
@@ -545,8 +555,10 @@ func runNet(ctx context.Context, s *contract.NetProbe, t Target) (bool, string, 
 		return false, "", &connError{fmt.Errorf("net %d -> %v", port, err)}
 	}
 	defer conn.Close()
+	defer closeOnDone(ctx, conn)()
 	// Set before the handshake so a stalled TLS peer is bounded by the timeout.
-	_ = conn.SetDeadline(time.Now().Add(timeout))
+	deadline := time.Now().Add(timeout)
+	_ = conn.SetDeadline(deadline)
 	// tls: true forces TLS; otherwise the probed port's own scheme decides, so a
 	// dialogue with a plain port (SMTP, FTP) of an https target stays plain.
 	if s.TLS || t.portScheme(s.Port) == "https" {
@@ -571,9 +583,11 @@ func runNet(ctx context.Context, s *contract.NetProbe, t Target) (bool, string, 
 		if readN <= 0 {
 			readN = 4096
 		}
-		buf := make([]byte, readN)
-		n, _ := conn.Read(buf) // a timeout yields what arrived, which the expect then judges
-		resp := string(buf[:n])
+		// A timeout yields what arrived, which the expect then judges.
+		resp := readUntil(conn, readN, step.Expect, deadline)
+		if err := ctx.Err(); err != nil {
+			return false, "", err
+		}
 		log.WriteString("< " + oneline(resp) + "\n")
 		if step.Expect != "" && !matchDotAll(step.Expect, resp) {
 			return false, fmt.Sprintf("net step %d: %q !~ /%s/\n%s", i+1, trunc(resp, 80), step.Expect, log.String()), nil
@@ -583,6 +597,56 @@ func runNet(ctx context.Context, s *contract.NetProbe, t Target) (bool, string, 
 		}
 	}
 	return true, "net dialogue ok (" + strconv.Itoa(len(s.Steps)) + " steps)", nil
+}
+
+// quietGap is how long readUntil waits for more data once some has arrived. A
+// server that sends its reply in several segments (an FTP "220-" multi-line
+// banner) sends them back to back; a gap this long means the reply is over.
+var quietGap = 500 * time.Millisecond
+
+// readUntil reads from conn until expect (a probe regex, dot matches newline)
+// matches what arrived, max bytes have arrived, the connection ends, or
+// deadline passes. Once something has arrived it also stops after quietGap
+// without more data. Without expect it reads to the same limits, so a reply
+// sent in several segments is judged whole and its tail is not left for the
+// next step's read. The quiet gap never extends past deadline.
+func readUntil(conn net.Conn, max int, expect string, deadline time.Time) string {
+	return readUntilFrom(conn, nil, max, expect, deadline)
+}
+
+// readUntilFrom is readUntil continuing from bytes already read (got), which
+// count toward max and toward matching expect.
+func readUntilFrom(conn net.Conn, got []byte, max int, expect string, deadline time.Time) string {
+	defer func() { _ = conn.SetReadDeadline(deadline) }()
+	_ = conn.SetReadDeadline(deadline)
+	got = append([]byte(nil), got...)
+	buf := make([]byte, max)
+	for len(got) < max {
+		n, err := conn.Read(buf[:max-len(got)])
+		got = append(got, buf[:n]...)
+		if n > 0 && expect != "" && matchDotAll(expect, string(got)) {
+			break
+		}
+		if err != nil {
+			break // EOF, reset, the quiet gap or the deadline
+		}
+		if n > 0 {
+			gap := time.Now().Add(quietGap)
+			if gap.After(deadline) {
+				gap = deadline
+			}
+			_ = conn.SetReadDeadline(gap)
+		}
+	}
+	return string(got)
+}
+
+// closeOnDone closes conn when ctx ends, so a cancelled probe (Ctrl-C) stops at
+// once instead of waiting out its own read deadline. Call the returned
+// function to stop watching.
+func closeOnDone(ctx context.Context, conn net.Conn) func() {
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	return func() { stop() }
 }
 
 func oneline(s string) string {
