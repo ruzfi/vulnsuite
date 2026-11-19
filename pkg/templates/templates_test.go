@@ -528,6 +528,42 @@ func TestUnzipSkipsSymlinks(t *testing.T) {
 	}
 }
 
+// An archive install drops symlinks; it must say so, since a template
+// relying on an in-context symlink works from a git checkout only.
+func TestUpdateArchiveReportsSkippedSymlinks(t *testing.T) {
+	entries := []zipEntry{
+		{name: "vulnsuite-templates-main/", mode: os.ModeDir | 0o755},
+		{name: "vulnsuite-templates-main/web/x/contract.yaml", body: "apiVersion: vulnsuite/v1\nkind: Target\n"},
+	}
+	for _, n := range []string{"a", "b", "c", "d", "e", "f", "g"} {
+		entries = append(entries, zipEntry{name: "vulnsuite-templates-main/web/x/" + n, body: "contract.yaml", mode: os.ModeSymlink | 0o777})
+	}
+	s := serveArchive(t, http.StatusOK, makeZip(t, entries...))
+	var out bytes.Buffer
+	o := opts(filepath.Join(t.TempDir(), "tpl"), s)
+	o.Output = &out
+	if _, _, err := Update(context.Background(), o); err != nil {
+		t.Fatal(err)
+	}
+	if want := "skipped 7 symlink(s) in the archive"; !strings.Contains(out.String(), want) {
+		t.Fatalf("output %q lacks %q", out.String(), want)
+	}
+	if want := "web/x/a, web/x/b, web/x/c, web/x/d, web/x/e and 2 more"; !strings.Contains(out.String(), want) {
+		t.Fatalf("output %q lacks %q", out.String(), want)
+	}
+
+	// No symlinks, no note.
+	out.Reset()
+	o = opts(filepath.Join(t.TempDir(), "tpl"), serveArchive(t, http.StatusOK, templatesZip(t)))
+	o.Output = &out
+	if _, _, err := Update(context.Background(), o); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "symlink") {
+		t.Fatalf("unexpected note: %q", out.String())
+	}
+}
+
 func TestUnzipRejectsEscapingPaths(t *testing.T) {
 	parent := t.TempDir()
 	dst := filepath.Join(parent, "out")

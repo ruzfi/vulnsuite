@@ -18,7 +18,8 @@ const contractBody = "apiVersion: vulnsuite/v1\nkind: Target\n"
 
 // unzipBytes extracts an in-memory archive.
 func unzipBytes(data []byte, dst string) error {
-	return unzipStripTop(bytes.NewReader(data), int64(len(data)), dst)
+	_, err := unzipStripTop(bytes.NewReader(data), int64(len(data)), dst)
+	return err
 }
 
 // setLimits lowers archiveLimits for one test; zero keeps a limit.

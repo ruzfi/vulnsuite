@@ -80,7 +80,10 @@ templates repository you are standing in, or `~/vulnsuite-templates`.
   non-empty directory is refused unless you pass `-force`. The archive is
   refused, and the old directory kept, when it is over 256 MiB, expands past
   512 MiB or 50,000 entries, or holds no templates (a wrong `-repo`). The old
-  directory is removed only once the new one is in place.
+  directory is removed only once the new one is in place. An archive install
+  never creates symlinks: it skips them and prints how many it skipped (and
+  which), so a template that relies on a symlink in its build context works
+  only from a git checkout.
 
 ## Finding the right target
 
