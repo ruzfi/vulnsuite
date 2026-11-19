@@ -422,9 +422,9 @@
           "type": "array",
           "items": {
             "type": "string",
-            "pattern": "^/dev/[a-zA-Z0-9/_-]+$"
+            "pattern": "^/dev/(kvm|net/tun|fuse|vhost-net|vhost-vsock|dri/(card|renderD)[0-9]+)$"
           },
-          "description": "Host device paths to pass through to the container, e.g. ['/dev/kvm'] for KVM/QEMU targets"
+          "description": "Host devices to pass through to the container (consent-gated by run -allow-host-access). Only /dev/kvm, /dev/net/tun, /dev/fuse, /dev/vhost-net, /dev/vhost-vsock and /dev/dri/cardN|renderDN are allowed; raw disk/memory and other host devices are rejected"
         }
       }
     },

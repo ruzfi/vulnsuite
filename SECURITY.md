@@ -76,10 +76,14 @@ vulnsuite stands up **knowingly vulnerable** targets. Two trust boundaries matte
   These are host-access primitives (a raw device or `SYS_ADMIN` can escape the
   container), never needed just to stand up a vulnerable service, so the user
   must opt in per run for a template they trust.
-- **Raw disk/memory devices are rejected outright** at parse time
-  (`/dev/mem`, `/dev/kmem`, `/dev/port`, `/dev/sd*`, `/dev/nvme*`, `/dev/dm-*`,
-  `/dev/loop*`, `/dev/mapper/*`, …) — never legitimate for a target, so no
-  `-allow-host-access` can enable them.
+- **Only allowlisted devices can be requested at all.** `service.devices`
+  accepts exactly `/dev/kvm`, `/dev/net/tun`, `/dev/fuse`, `/dev/vhost-net`,
+  `/dev/vhost-vsock` and `/dev/dri/cardN` / `/dev/dri/renderDN`, spelt
+  canonically (`/dev//kvm` is refused, not cleaned). Every other path, notably
+  raw disk and memory devices (`/dev/mem`, `/dev/sd*`, `/dev/nvme*`, LVM
+  `/dev/<vg>/<lv>`, `/dev/nbd*`, zvols, …), is rejected at parse time, so no
+  `-allow-host-access` can enable it. An allowlist, because a denylist of
+  block devices can never be complete.
 - Containers run with `no-new-privileges` and Docker's default (reduced)
   capability set. vulnsuite does **not** expose `privileged`, `--network host`,
   arbitrary `security_opt`, or host volume binds to templates.

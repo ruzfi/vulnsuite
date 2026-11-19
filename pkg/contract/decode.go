@@ -3,6 +3,7 @@ package contract
 import (
 	"errors"
 	"fmt"
+	"path"
 	"regexp"
 	"sort"
 	"strings"
@@ -344,8 +345,8 @@ func (c *Contract) checkStructure(present map[string]any) error {
 		if !deviceRe.MatchString(d) {
 			return se("service/devices", "%q must be a /dev path", d)
 		}
-		if dangerousDevice(d) {
-			return se("service/devices", "%q gives raw host disk/memory access and is never needed for a target", d)
+		if !allowedDevice(d) {
+			return se("service/devices", "%q is not an allowed device (allowed: /dev/kvm, /dev/net/tun, /dev/fuse, /dev/vhost-net, /dev/vhost-vsock, /dev/dri/cardN, /dev/dri/renderDN); raw disk/memory and other host devices are never needed for a target", d)
 		}
 	}
 	if s.Healthcheck.Timeout != "" && !timeoutRe.MatchString(s.Healthcheck.Timeout) {
@@ -513,21 +514,30 @@ func checkProbeNums(loc string, port int, timeout float64) error {
 	return nil
 }
 
-// dangerousDevice reports whether a /dev path grants raw host disk or memory
-// access (a direct host-compromise primitive, never legitimate for a target).
-// Device access that can be legitimate (e.g. /dev/kvm) is allowed here but
-// still consent-gated at run time.
-func dangerousDevice(d string) bool {
-	d = strings.ToLower(strings.TrimRight(d, "0123456789"))
-	switch d {
-	case "/dev/mem", "/dev/kmem", "/dev/port", "/dev/msr":
-		return true
+// allowedDevices are the host devices a template may pass through (still
+// consent-gated at run time by -allow-host-access). Everything else is
+// rejected at parse time: a denylist of raw disk/memory devices cannot be made
+// complete (LVM /dev/<vg>/<lv>, zvols, nbd, rbd, /dev/root, by-id links, …), and
+// none of those is ever needed to stand up a vulnerable service.
+var allowedDevices = []*regexp.Regexp{
+	regexp.MustCompile(`^/dev/kvm$`),         // KVM/QEMU targets
+	regexp.MustCompile(`^/dev/net/tun$`),     // VPN / tunnelling services
+	regexp.MustCompile(`^/dev/fuse$`),        // FUSE file systems
+	regexp.MustCompile(`^/dev/vhost-net$`),   // virtio networking for QEMU
+	regexp.MustCompile(`^/dev/vhost-vsock$`), // virtio vsock for QEMU
+	regexp.MustCompile(`^/dev/dri/(card|renderD)[0-9]+$`),
+}
+
+// allowedDevice reports whether d is an exact, canonical path on the device
+// allowlist. Non-canonical spellings (/dev//kvm) are refused rather than
+// cleaned: the daemon resolves them, so the string that is checked must be
+// the string that is passed through.
+func allowedDevice(d string) bool {
+	if path.Clean(d) != d {
+		return false
 	}
-	for _, pfx := range []string{
-		"/dev/sd", "/dev/hd", "/dev/vd", "/dev/xvd", "/dev/nvme", "/dev/sg",
-		"/dev/dm-", "/dev/loop", "/dev/md", "/dev/mmcblk", "/dev/disk", "/dev/mapper",
-	} {
-		if strings.HasPrefix(d, pfx) {
+	for _, re := range allowedDevices {
+		if re.MatchString(d) {
 			return true
 		}
 	}

@@ -103,7 +103,7 @@ base: { kind: build, context: src, dockerfile: Dockerfile, build_args: {} }
 | `sidecars` | helper containers `{ name, image, digest, command, environment }` (names unique) started with each target state on a private network shared only with that state's target, reachable there by `name` in every exposure mode; each state gets its own sidecars (`command` sets the container command, e.g. a `server ...` arg list for a clustered node) |
 | `user` | run-as `uid` or `uid:gid` |
 | `cap_add` / `cap_drop` | Linux capabilities, e.g. `cap_drop: [ALL]` then `cap_add: [CAP_NET_BIND_SERVICE]` |
-| `devices` | host devices to pass through, e.g. `/dev/kvm` |
+| `devices` | host devices to pass through; only `/dev/kvm`, `/dev/net/tun`, `/dev/fuse`, `/dev/vhost-net`, `/dev/vhost-vsock`, `/dev/dri/cardN`, `/dev/dri/renderDN` (canonical spelling). `run` needs `-allow-host-access` |
 
 ## `requires`
 
