@@ -638,3 +638,54 @@ func TestResolveIgnoresUnrelatedRepo(t *testing.T) {
 		t.Fatalf("Resolve = %q, want %q", got, repo)
 	}
 }
+
+// #94 item 2: inside an archive install (no .git, only the version marker),
+// a subfolder resolves to the install root, not to itself.
+func TestResolveArchiveInstallFromSubfolder(t *testing.T) {
+	t.Setenv(EnvDir, "")
+	t.Setenv("HOME", t.TempDir())
+	root := filepath.Join(t.TempDir(), "tpl")
+	sub := filepath.Join(root, "web-apps")
+	if err := os.MkdirAll(filepath.Join(sub, "x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(sub, "x", "contract.yaml"), []byte("apiVersion: vulnsuite/v1\nkind: Target\n"), 0o644)
+	os.WriteFile(filepath.Join(root, versionFile), []byte("ruzfi/vulnsuite-templates@main\n"), 0o644)
+	t.Chdir(sub)
+	got, err := Resolve("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want, _ := filepath.EvalSymlinks(root); got != root && got != want {
+		t.Fatalf("Resolve = %q, want the install root %q", got, root)
+	}
+}
+
+// #94 item 2: update-templates never replaces a subfolder of an archive
+// install with the whole archive, even with -force.
+func TestUpdateRefusesSubfolderOfInstall(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "tpl")
+	sub := filepath.Join(root, "web-apps")
+	keep := filepath.Join(sub, "x", "contract.yaml")
+	if err := os.MkdirAll(filepath.Dir(keep), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(keep, []byte("apiVersion: vulnsuite/v1\nkind: Target\n"), 0o644)
+	os.WriteFile(filepath.Join(root, versionFile), []byte("old\n"), 0o644)
+	s := serveArchive(t, http.StatusOK, templatesZip(t))
+	o := opts(sub, s)
+	o.Force = true
+	_, _, err := Update(context.Background(), o)
+	if err == nil || !strings.Contains(err.Error(), "inside the templates installed at "+root) {
+		t.Fatalf("err = %v", err)
+	}
+	mustExist(t, keep)
+	if len(s.requests()) != 0 {
+		t.Fatal("nothing should be downloaded for a refused directory")
+	}
+	// The install root itself still updates.
+	if _, _, err := Update(context.Background(), opts(root, s)); err != nil {
+		t.Fatal(err)
+	}
+	mustExist(t, filepath.Join(root, "web", "x", "contract.yaml"))
+}

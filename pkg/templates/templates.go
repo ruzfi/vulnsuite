@@ -47,8 +47,9 @@ func Resolve(flag string) (string, error) {
 	}
 	if cwd, err := os.Getwd(); err == nil {
 		// The working directory itself, or any parent up to the enclosing git
-		// repository root (so running from a subfolder of a templates checkout
-		// works, without wandering into unrelated parents).
+		// repository root or archive install (so running from a subfolder of
+		// a templates checkout works, without wandering into unrelated
+		// parents).
 		for _, dir := range candidateDirs(cwd) {
 			if HasTemplates(dir) {
 				return dir, nil
@@ -61,10 +62,10 @@ func Resolve(flag string) (string, error) {
 func candidateDirs(cwd string) []string {
 	dirs := []string{cwd}
 	dir := cwd
-	for i := 0; i < 8; i++ {
-		if isRepoRoot(dir) {
-			// Prefer the repository root (the whole templates tree) over a
-			// subfolder of it.
+	for i := 0; i < maxRootDepth; i++ {
+		if isTemplatesRoot(dir) {
+			// Prefer the repository or install root (the whole templates
+			// tree) over a subfolder of it.
 			for i, j := 0, len(dirs)-1; i < j; i, j = i+1, j-1 {
 				dirs[i], dirs[j] = dirs[j], dirs[i]
 			}
@@ -78,6 +79,38 @@ func candidateDirs(cwd string) []string {
 		dirs = append(dirs, dir)
 	}
 	return dirs[:1] // not inside a repository: only cwd counts
+}
+
+// maxRootDepth bounds how many parents are searched for a templates root.
+const maxRootDepth = 8
+
+// isTemplatesRoot reports whether dir is the root of a templates tree: a git
+// checkout, or an archive install carrying the version marker.
+func isTemplatesRoot(dir string) bool {
+	return isRepoRoot(dir) || isArchiveInstall(dir)
+}
+
+// isArchiveInstall reports whether dir was installed by update-templates.
+func isArchiveInstall(dir string) bool {
+	fi, err := os.Stat(filepath.Join(dir, versionFile))
+	return err == nil && fi.Mode().IsRegular()
+}
+
+// enclosingInstall returns the nearest proper ancestor of dir (searching
+// maxRootDepth levels) that is an archive install, or "".
+func enclosingInstall(dir string) string {
+	d := dir
+	for i := 0; i < maxRootDepth; i++ {
+		parent := filepath.Dir(d)
+		if parent == d {
+			return ""
+		}
+		d = parent
+		if isArchiveInstall(d) {
+			return d
+		}
+	}
+	return ""
 }
 
 func isRepoRoot(dir string) bool {
@@ -326,8 +359,13 @@ func returnToDefaultBranch(o UpdateOptions, git func(time.Duration, ...string) (
 }
 
 // checkReplaceable refuses to replace a directory update-templates did not
-// create: it must be missing, empty, or carry the version marker.
+// create: it must be missing, empty, or carry the version marker. A directory
+// inside an archive install is never replaced, even with force: that would
+// put the whole archive in one of its own subfolders.
 func checkReplaceable(dir string, force bool) error {
+	if root := enclosingInstall(dir); root != "" {
+		return fmt.Errorf("refusing to replace %s: it is inside the templates installed at %s; update that directory instead (-templates %s)", dir, root, root)
+	}
 	fi, err := os.Lstat(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
