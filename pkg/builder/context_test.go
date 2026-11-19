@@ -207,13 +207,15 @@ func TestDockerignorePatterns(t *testing.T) {
 		{"a?c", "abc", true},
 		{"a?c", "a/c", false},
 		{"[a-c].txt", "b.txt", true},
-		{"[!a-c].txt", "b.txt", false},
+		{"[!a-c].txt", "b.txt", true}, // "!" is a literal in the class, as in Docker
+		{"[^a-c].txt", "b.txt", false},
 		{"docs/**", "docs/x/y.md", true},
 		{"docs/**", "docsx", false},
 		{"*\n!keep", "keep", false},
 		{"*\n!keep", "other", true},
 		{"!keep\n*", "keep", true}, // the last matching pattern wins
-		{".", "anything", true},
+		{".", "anything", false},   // "." and "/" exclude nothing in Docker
+		{"/", "anything", false},
 	}
 	if runtime.GOOS != "windows" {
 		// "\\" escapes only off Windows; there it is a path separator, as in Docker.
