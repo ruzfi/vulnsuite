@@ -109,7 +109,11 @@ func runHostProbe(ctx context.Context, eng engine.Engine, script string, opts Ho
 	if err := ensureProbeImage(ctx, eng, "", opts); err != nil {
 		return "", err
 	}
-	return runProbeContainer(ctx, eng, engine.ContainerSpec{Image: HostProbeImage, Cmd: []string{"sh", "-c", script}})
+	out, code, err := runProbeContainer(ctx, eng, engine.ContainerSpec{Image: HostProbeImage, Cmd: []string{"sh", "-c", script}}, hostProbeTimeout)
+	if err == nil && code != 0 {
+		err = fmt.Errorf("the host probe exited %d: %s", code, strings.TrimSpace(tail(out, 400)))
+	}
+	return out, err
 }
 
 // ensureProbeImage makes HostProbeImage present for platform ("" = native).
@@ -135,43 +139,40 @@ func ensureProbeImage(ctx context.Context, eng engine.Engine, platform string, o
 
 // runProbeContainer creates, runs and removes a one-shot container from spec
 // (hardened: no network, no capabilities, no-new-privileges) and returns its
-// output. A non-zero exit is an error carrying the output's tail.
-func runProbeContainer(ctx context.Context, eng engine.Engine, spec engine.ContainerSpec) (string, error) {
+// output and exit code. Not exiting within timeout is an error.
+func runProbeContainer(ctx context.Context, eng engine.Engine, spec engine.ContainerSpec, timeout time.Duration) (string, int, error) {
 	var rnd [6]byte
 	if _, err := rand.Read(rnd[:]); err != nil {
-		return "", err
+		return "", -1, err
 	}
 	spec.Name = contract.ContainerNamePrefix + "hostprobe-" + hex.EncodeToString(rnd[:])
 	spec.Labels = map[string]string{LabelHostProbe: "true"}
 	spec.Network = &engine.NetworkAttachment{Name: "none"}
 	spec.CapDrop = []string{"ALL"}
-	spec.SecurityOpt = []string{"no-new-privileges"}
+	spec.SecurityOpt = []string{"no-new-privileges:true"}
 	if _, err := eng.ContainerCreate(ctx, spec); err != nil {
-		return "", fmt.Errorf("create the host probe container: %w", err)
+		return "", -1, fmt.Errorf("create the probe container: %w", err)
 	}
 	defer func() {
 		cctx, cancel := CleanupContext(ctx)
 		defer cancel()
 		_ = eng.ContainerRemove(cctx, spec.Name)
 	}()
-	rctx, cancel := context.WithTimeout(ctx, hostProbeTimeout)
+	rctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	if err := eng.ContainerStart(rctx, spec.Name); err != nil {
-		return "", fmt.Errorf("start the host probe container: %w", err)
+		return "", -1, fmt.Errorf("start the probe container: %w", err)
 	}
 	code, err := eng.ContainerWait(rctx, spec.Name)
 	if err != nil {
 		if errors.Is(rctx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
-			return "", fmt.Errorf("the host probe container did not exit within %s", hostProbeTimeout)
+			return "", -1, fmt.Errorf("the probe container did not exit within %s", timeout)
 		}
-		return "", fmt.Errorf("wait for the host probe container: %w", err)
+		return "", -1, fmt.Errorf("wait for the probe container: %w", err)
 	}
 	out, err := eng.ContainerLogs(rctx, spec.Name, 0)
 	if err != nil {
-		return "", fmt.Errorf("read the host probe output: %w", err)
+		return "", -1, fmt.Errorf("read the probe output: %w", err)
 	}
-	if code != 0 {
-		return out, fmt.Errorf("the host probe exited %d: %s", code, strings.TrimSpace(tail(out, 400)))
-	}
-	return out, nil
+	return out, code, nil
 }

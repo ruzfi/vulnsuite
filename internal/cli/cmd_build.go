@@ -305,6 +305,25 @@ only (pulls and pushes).`,
 				default:
 					r.Ref, r.BuildKind, r.Built, r.Pulled = o.Resolved.Ref, o.Resolved.BuildKind, o.Resolved.Built, o.Resolved.Pulled
 					r.Elapsed = o.Resolved.Elapsed.Round(100 * time.Millisecond).String()
+					// requires.probe needs the image, so it runs on the result:
+					// a non-zero exit skips the job (it is not pushed), not
+					// being able to run it fails the job.
+					if o.Job.Contract.Requires.Probe != nil && !ignoreRequires && ctx.Err() == nil {
+						plat := o.Job.Platform
+						if plat == "" {
+							plat = platform
+						}
+						d, err := runner.RequiresProbe(ctx, eng, o.Job.Contract, o.Job.State, r.Ref, plat)
+						switch {
+						case err != nil:
+							r.Error = err.Error()
+							g.errorf("✗ %s [%s]: %v\n", r.ID, r.State, err)
+						case d.Skip():
+							g.errorf("skip %s [%s]: %s\n", r.ID, r.State, d.Reason)
+							skipped = append(skipped, requiresSkip(r.ID, r.State, d))
+							continue
+						}
+					}
 				}
 				results = append(results, r)
 			}

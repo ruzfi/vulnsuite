@@ -252,7 +252,7 @@ func (e *Engine) ImageList(ctx context.Context, repoPrefix string) ([]string, er
 // -- containers -----------------------------------------------------------------
 
 func (e *Engine) ContainerCreate(ctx context.Context, spec engine.ContainerSpec) (string, error) {
-	cfg := &container.Config{Image: spec.Image, Cmd: spec.Cmd, Env: spec.Env, User: spec.User, Labels: spec.Labels}
+	cfg := &container.Config{Image: spec.Image, Entrypoint: spec.Entrypoint, Cmd: spec.Cmd, Env: spec.Env, User: spec.User, Labels: spec.Labels}
 	hc := &container.HostConfig{
 		CapAdd:      spec.CapAdd,
 		CapDrop:     spec.CapDrop,

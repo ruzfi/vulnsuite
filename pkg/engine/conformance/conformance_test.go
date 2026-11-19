@@ -435,6 +435,19 @@ var cases = []conformanceCase{
 			t.Errorf("an exited container lists as %+v, want state exited", rows)
 		}
 	}},
+	{"container_create_entrypoint", func(t *testing.T, h *harness) {
+		// requires.probe overrides the image's entrypoint (#119); a spec
+		// without one leaves the image's alone.
+		create(t, h, engine.ContainerSpec{Name: "vs-ep", Entrypoint: []string{"/bin/sh", "-c"}, Cmd: []string{"grep -q x /proc/cpuinfo"}})
+		ep, cmd := h.created(t, "vs-ep")
+		if !reflect.DeepEqual(ep, []string{"/bin/sh", "-c"}) || !reflect.DeepEqual(cmd, []string{"grep -q x /proc/cpuinfo"}) {
+			t.Fatalf("created with entrypoint %q cmd %q", ep, cmd)
+		}
+		create(t, h, engine.ContainerSpec{Name: "vs-noep", Cmd: []string{"serve"}})
+		if ep, _ := h.created(t, "vs-noep"); len(ep) != 0 {
+			t.Fatalf("an unset entrypoint was sent as %q", ep)
+		}
+	}},
 	{"container_create_errors", func(t *testing.T, h *harness) {
 		if _, err := h.eng.ContainerCreate(bg(t), engine.ContainerSpec{Name: "vs-x", Image: imgB}); err == nil {
 			t.Error("creating from a missing image must fail")

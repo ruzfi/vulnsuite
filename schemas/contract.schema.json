@@ -489,6 +489,32 @@
             "pattern": "^[a-z0-9_]+$"
           },
           "description": "CPU feature flags the daemon's machine must have, as /proc/cpuinfo names them (x86 `flags`, arm64 `Features`), e.g. [avx512f, avx512bw, avx512vbmi, bmi2]. Read from the daemon (not the CLI host) only when a selected target sets it; a target whose flags are missing, or cannot be read, is skipped. Implies no emulation: qemu does not provide them."
+        },
+        "probe": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "run",
+            "reason"
+          ],
+          "properties": {
+            "run": {
+              "type": "string",
+              "pattern": "\\S",
+              "description": "a /bin/sh -c command run in the target's image (no network, no capabilities) after its image is built or pulled and before anything starts; exit 0 = the host can run the target"
+            },
+            "reason": {
+              "type": "string",
+              "pattern": "\\S",
+              "description": "the skip reason when run exits non-zero, e.g. needs AVX-512 VBMI"
+            },
+            "timeout": {
+              "type": "string",
+              "pattern": "^\\d+[smh]$",
+              "description": "bound on run (default 30s); running out fails the target rather than skipping it"
+            }
+          },
+          "description": "Generic host check for what no dedicated field covers (kernel version, cgroup v2, a sysctl, a device). A non-zero exit skips the target with reason, never fails it; -ignore-requires does not run it."
         }
       }
     }

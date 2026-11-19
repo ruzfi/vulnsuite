@@ -223,6 +223,26 @@ func (h *harness) lastBuild(t *testing.T) buildRecord {
 	return b
 }
 
+// created returns the entrypoint and command container name was created with,
+// as the daemon received them.
+func (h *harness) created(t *testing.T, name string) (entrypoint, cmd []string) {
+	t.Helper()
+	if h.f != nil {
+		c, ok := h.f.Containers[name]
+		if !ok {
+			t.Fatalf("no container %s", name)
+		}
+		return c.Spec.Entrypoint, c.Spec.Cmd
+	}
+	h.d.mu.Lock()
+	defer h.d.mu.Unlock()
+	c := h.d.container(name)
+	if c == nil {
+		t.Fatalf("no container %s", name)
+	}
+	return c.entrypoint, c.cmd
+}
+
 // failRemove makes removing container name fail with msg.
 func (h *harness) failContainerRemove(t *testing.T, name, msg string) {
 	if h.f != nil {

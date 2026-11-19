@@ -281,5 +281,8 @@ func requiresText(r contract.Requires) string {
 	if len(r.CPUFlags) > 0 {
 		parts = append(parts, "cpu_flags "+strings.Join(r.CPUFlags, ","))
 	}
+	if r.Probe != nil {
+		parts = append(parts, fmt.Sprintf("probe (%s)", r.Probe.Reason))
+	}
 	return strings.Join(parts, ", ")
 }

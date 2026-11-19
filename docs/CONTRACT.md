@@ -118,6 +118,10 @@ requires:
   emulation: false     # allow qemu when host arch is not in arch (default true)
   kvm: true            # needs /dev/kvm + nested virt (a linux/amd64 host)
   cpu_flags: [avx512f, avx512bw, avx512vbmi, bmi2]   # CPU features the daemon's machine must have
+  probe:                # generic host check, run in the target's image
+    run: "grep -qw avx512vbmi /proc/cpuinfo"
+    reason: "needs AVX-512 VBMI"
+    timeout: 30s        # optional, default 30s
 ```
 
 Preflight decisions (`vulnsuite run` / `build`):
@@ -132,6 +136,7 @@ Preflight decisions (`vulnsuite run` / `build`):
 | `cpu_flags` set, host arch not in `arch` | skip (reason): `cpu_flags` imply no emulation, since qemu does not provide them |
 | `cpu_flags` set, native, the daemon lacks some | skip, naming them: `needs CPU flags [avx512vbmi]; daemon has avx512f,avx512bw,bmi2` |
 | `cpu_flags` set, native, the daemon's flags cannot be read | skip (reason, with the error) |
+| everything above met, `probe.run` exits non-zero | skip (`probe.reason`, with the exit code and output) |
 
 `cpu_flags` are Linux's names from `/proc/cpuinfo` (the `flags` line on x86,
 `Features` on arm64; lower-case letters, digits and `_`). The daemon's API does
@@ -148,8 +153,22 @@ is skipped with that error as the reason. They are never assumed present.
 `emulation: true` next to `cpu_flags` is ignored (`validate` warns:
 `cpu-flags-with-emulation`).
 
+`probe` is the escape hatch for what no dedicated field covers (a kernel
+version, cgroup v2, a sysctl, a device). It needs the target's image, so it runs
+after the image is built or pulled (for the target's platform, so under
+emulation too) and **before any of the target starts** -- no container,
+sidecar or network. It runs as `/bin/sh -c <run>` with the image's entrypoint
+replaced, the service's `user` and environment, no network, no capabilities and
+none of the service's devices. Exit 0 runs the target; a non-zero exit
+**skips** it with `reason` (never fails it), in `run` and `build` alike (`build`
+then neither counts nor pushes the image). A probe that cannot run at all -- the
+image has no `/bin/sh`, or it outlives `timeout` (`<n>s|m|h`, default 30s) --
+fails the target instead: that is a broken template, not a host that lacks
+something. `run` probes each target as it reaches it; `build` probes each
+state's image once it is built.
+
 A skipped target is reported and the rest of the batch continues;
-`-ignore-requires` runs it anyway. `list -arch <a>` hides targets that cannot
+`-ignore-requires` runs it anyway (and does not run `probe`). `list -arch <a>` hides targets that cannot
 run on that arch. The platform is decided per target, so a `build` of several
 targets emulates only those that need it; an explicit `-platform` applies to
 every target.

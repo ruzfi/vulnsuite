@@ -181,7 +181,7 @@ Exposure modes:
 			fs.StringVar(&platform, "platform", "", "target platform for builds, e.g. linux/amd64")
 			fs.StringVar(&readyTimeout, "ready-timeout", "", "override every template's healthcheck timeout, e.g. 120s")
 			fs.StringVar(&nucleiDir, "nuclei-templates", "", "nuclei-templates checkout used to resolve the scanner templates shown for each target")
-			fs.BoolVar(&ignoreRequires, "ignore-requires", false, "run even when the host does not meet a target's requires (arch/kvm/host_os/cpu_flags)")
+			fs.BoolVar(&ignoreRequires, "ignore-requires", false, "run even when the host does not meet a target's requires (arch/kvm/host_os/cpu_flags; requires.probe is not run)")
 			fs.BoolVar(&allowHostAccess, "allow-host-access", false, "honor a template's host device passthrough and elevated capabilities (host-access primitives; only for templates you trust)")
 			fs.BoolVar(&summary, "summary", false, "with -json, print {targets, failed, skipped} instead of the bare array of started targets")
 		},
@@ -385,7 +385,7 @@ Exposure modes:
 				}
 			}
 
-			opts := runner.Options{Verify: !noVerify, AllowHostAccess: allowHostAccess, Build: builder.Options{Pull: !noPull, NoCache: noCache, Force: force, Platform: platform}}
+			opts := runner.Options{Verify: !noVerify, AllowHostAccess: allowHostAccess, IgnoreRequires: ignoreRequires, Build: builder.Options{Pull: !noPull, NoCache: noCache, Force: force, Platform: platform}}
 			opts.ReadyTimeout = readyTimeoutD
 			if !g.JSON && !g.Quiet {
 				opts.Build.Output = g.Stdout
@@ -429,6 +429,13 @@ Exposure modes:
 						attempted-- // cut short by the interrupt: it never started
 						cancelled = true
 						break
+					}
+					// requires.probe: the host lacks something; a skip, not a failure.
+					if se, ok := runner.AsSkip(err); ok {
+						g.printf("skip %s: %s\n", c.ID(), se.Decision.Reason)
+						skippedReq = append(skippedReq, c.ID())
+						sum.Skipped = append(sum.Skipped, requiresSkip(c.ID(), state, se.Decision))
+						continue
 					}
 					g.errorf("  could not run %s: %v\n", c.ID(), err)
 					failures = append(failures, c.ID())
