@@ -198,6 +198,9 @@ type UpdateOptions struct {
 	// (no .vulnsuite-templates-version marker).
 	Force  bool
 	Output io.Writer
+	// Warn receives warnings about an update that succeeded (default Output),
+	// such as a previous tree that could not be removed.
+	Warn io.Writer
 
 	// ArchiveBaseURL overrides DefaultArchiveBaseURL (tests, mirrors).
 	ArchiveBaseURL string
@@ -223,6 +226,9 @@ func Update(ctx context.Context, o UpdateOptions) (string, string, error) {
 	if o.Output == nil {
 		o.Output = io.Discard
 	}
+	if o.Warn == nil {
+		o.Warn = o.Output
+	}
 	if o.GitTimeout <= 0 {
 		o.GitTimeout = DefaultGitTimeout
 	}
@@ -235,10 +241,42 @@ func Update(ctx context.Context, o UpdateOptions) (string, string, error) {
 	if o.Ref == "" {
 		o.Ref = DefaultBranch
 	}
-	if err := checkReplaceable(o.Dir, o.Force); err != nil {
+	// A symbolic link (~/vulnsuite-templates -> /data/tpl) is kept: the
+	// directory it points to is what gets checked and replaced, swapped next
+	// to itself, so the link resolves to the new tree afterwards.
+	target, err := resolveLink(o.Dir)
+	if err != nil {
 		return o.Dir, "", err
 	}
-	return updateArchive(ctx, o)
+	if target != o.Dir {
+		fmt.Fprintf(o.Output, "%s is a link to %s; updating %s\n", o.Dir, target, target)
+	}
+	if err := checkReplaceable(target, o.Force); err != nil {
+		return o.Dir, "", err
+	}
+	to := o
+	to.Dir = target
+	_, version, err := updateArchive(ctx, to)
+	return o.Dir, version, err
+}
+
+// resolveLink returns dir with symbolic links resolved when dir itself is a
+// link, else dir unchanged. A link to something missing or to a non-directory
+// is refused: replacing it would mean creating a tree at, or replacing, a
+// path the user only named indirectly.
+func resolveLink(dir string) (string, error) {
+	fi, err := os.Lstat(dir)
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		return dir, nil
+	}
+	target, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", fmt.Errorf("%s is a symbolic link that does not resolve (%v); create its target or remove the link", dir, err)
+	}
+	if tfi, err := os.Stat(target); err != nil || !tfi.IsDir() {
+		return "", fmt.Errorf("%s is a symbolic link to %s, which is not a directory", dir, target)
+	}
+	return target, nil
 }
 
 // updateGit updates a git checkout in place. It never falls back to replacing
@@ -468,7 +506,7 @@ func updateArchive(ctx context.Context, o UpdateOptions) (string, string, error)
 		os.RemoveAll(tmp)
 		return o.Dir, "", err
 	}
-	if err := swapDir(tmp, o.Dir); err != nil {
+	if err := swapDir(tmp, o.Dir, o.Warn); err != nil {
 		os.RemoveAll(tmp)
 		return o.Dir, "", err
 	}
@@ -493,8 +531,9 @@ func download(resp *http.Response, f *os.File, limit int64) (int64, error) {
 
 // swapDir moves newDir into place at dir. The previous dir is kept under a
 // unique sibling name until newDir is in place, restored if that fails, and
-// only then removed.
-func swapDir(newDir, dir string) error {
+// only then removed. Once newDir is in place the swap has succeeded: a
+// previous tree that cannot be removed is reported to warn, not returned as an error.
+func swapDir(newDir, dir string, warn io.Writer) error {
 	if _, err := os.Lstat(dir); errors.Is(err, os.ErrNotExist) {
 		return os.Rename(newDir, dir)
 	}
@@ -515,7 +554,10 @@ func swapDir(newDir, dir string) error {
 		}
 		return err
 	}
-	return os.RemoveAll(old)
+	if err := os.RemoveAll(old); err != nil {
+		fmt.Fprintf(warn, "warning: the templates were updated, but the previous copy could not be removed: %v; delete %s yourself\n", err, old)
+	}
+	return nil
 }
 
 // renameDir is os.Rename; a variable so tests can make the swap fail.

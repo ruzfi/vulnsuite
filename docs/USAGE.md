@@ -84,10 +84,15 @@ any subfolder: the git root, or the directory holding the
   archive install is refused even with `-force`. The archive is
   refused, and the old directory kept, when it is over 256 MiB, expands past
   512 MiB or 50,000 entries, or holds no templates (a wrong `-repo`). The old
-  directory is removed only once the new one is in place. An archive install
-  never creates symlinks: it skips them and prints how many it skipped (and
-  which), so a template that relies on a symlink in its build context works
-  only from a git checkout.
+  directory is removed only once the new one is in place; if it cannot be
+  removed (e.g. a read-only file), the update still succeeds and a warning
+  names the leftover `.<name>.old-*` directory to delete. When the templates
+  directory is a symbolic link (`~/vulnsuite-templates -> /data/tpl`), the
+  directory it points to is checked and replaced in place and the link is
+  kept; a link that does not resolve to a directory is refused. An archive
+  install never creates symlinks: it skips them and prints how many it skipped
+  (and which), so a template that relies on a symlink in its build context
+  works only from a git checkout.
 
 ## Finding the right target
 

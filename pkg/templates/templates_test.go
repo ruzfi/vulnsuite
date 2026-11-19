@@ -689,3 +689,97 @@ func TestUpdateRefusesSubfolderOfInstall(t *testing.T) {
 	}
 	mustExist(t, filepath.Join(root, "web", "x", "contract.yaml"))
 }
+
+// #94 item 3: once the new tree is in place the update has succeeded; a
+// previous tree that cannot be removed is a warning naming the leftover.
+func TestUpdateSucceedsWhenOldTreeCannotBeRemoved(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("needs a directory the current user cannot write")
+	}
+	dir := filepath.Join(t.TempDir(), "tpl")
+	ro := filepath.Join(dir, "ro")
+	_ = os.MkdirAll(ro, 0o755)
+	_ = os.WriteFile(filepath.Join(dir, versionFile), []byte("old\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(ro, "stale.yaml"), []byte("old"), 0o644)
+	if err := os.Chmod(ro, 0o555); err != nil { // its file cannot be deleted
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { // let t.TempDir remove the leftover
+		matches, _ := filepath.Glob(filepath.Join(filepath.Dir(dir), ".tpl.old-*", "ro"))
+		for _, m := range append(matches, ro) {
+			_ = os.Chmod(m, 0o755)
+		}
+	})
+
+	s := serveArchive(t, http.StatusOK, templatesZip(t))
+	var warn bytes.Buffer
+	o := opts(dir, s)
+	o.Warn = &warn
+	_, version, err := Update(context.Background(), o)
+	if err != nil {
+		t.Fatalf("the update was applied but reported as failed: %v", err)
+	}
+	mustExist(t, filepath.Join(dir, "web", "x", "contract.yaml"))
+	if Version(dir) != version {
+		t.Fatalf("Version = %q, want %q", Version(dir), version)
+	}
+	sib := siblings(t, dir)
+	if len(sib) != 1 || !strings.HasPrefix(sib[0], ".tpl.old-") {
+		t.Fatalf("want the one leftover .old tree, got %v", sib)
+	}
+	if w := warn.String(); !strings.Contains(w, "warning:") || !strings.Contains(w, sib[0]) {
+		t.Fatalf("warning should name the leftover: %q", w)
+	}
+}
+
+// #94 item 4: a symlinked templates directory is updated through the link:
+// the directory it points to is replaced and the link is kept.
+func TestUpdateThroughSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks need privileges on Windows")
+	}
+	data := t.TempDir()
+	real := filepath.Join(data, "tpl")
+	_ = os.MkdirAll(real, 0o755)
+	_ = os.WriteFile(filepath.Join(real, versionFile), []byte("old\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(real, "stale.yaml"), []byte("old"), 0o644)
+	home := t.TempDir()
+	link := filepath.Join(home, "vulnsuite-templates")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	s := serveArchive(t, http.StatusOK, templatesZip(t))
+	got, _, err := Update(context.Background(), opts(link, s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != link {
+		t.Fatalf("dir = %q, want the link %q", got, link)
+	}
+	if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("the link must be kept: %v %v", fi, err)
+	}
+	if dest, _ := os.Readlink(link); dest != real {
+		t.Fatalf("link points to %q, want %q", dest, real)
+	}
+	mustExist(t, filepath.Join(real, "web", "x", "contract.yaml"))
+	if _, err := os.Stat(filepath.Join(real, "stale.yaml")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("the target should have been replaced")
+	}
+	if sib := siblings(t, real); len(sib) != 0 {
+		t.Fatalf("leftovers next to the target: %v", sib)
+	}
+	if sib := siblings(t, link); len(sib) != 0 {
+		t.Fatalf("leftovers next to the link: %v", sib)
+	}
+
+	// A link that does not resolve is refused, not replaced.
+	dangling := filepath.Join(home, "dangling")
+	_ = os.Symlink(filepath.Join(data, "missing"), dangling)
+	if _, _, err := Update(context.Background(), opts(dangling, s)); err == nil || !strings.Contains(err.Error(), "does not resolve") {
+		t.Fatalf("dangling link: %v", err)
+	}
+	if fi, err := os.Lstat(dangling); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("the dangling link must be left alone")
+	}
+}

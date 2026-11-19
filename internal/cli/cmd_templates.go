@@ -526,7 +526,7 @@ update-templates before; pass -force to replace any other directory.`,
 			if g.Quiet {
 				progress = io.Discard
 			}
-			dir, version, err := templates.Update(ctx, templates.UpdateOptions{Dir: dir, Repo: repo, Ref: ref, Force: force, Output: progress})
+			dir, version, err := templates.Update(ctx, templates.UpdateOptions{Dir: dir, Repo: repo, Ref: ref, Force: force, Output: progress, Warn: g.Stderr})
 			if err != nil {
 				return err
 			}
