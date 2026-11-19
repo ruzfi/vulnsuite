@@ -95,7 +95,7 @@ base: { kind: build, context: src, dockerfile: Dockerfile, build_args: {} }
 | `ports` | required; `{ container: 80, protocol: http }`. Protocols: `http`, `https`, `tcp`, `ssh`, `ftp`, `smtp`, `redis`, `mysql`, `postgres`. The first HTTP port (else the first port) is the **primary** port a scanner is pointed at, always published. Add `publish: true` to a secondary port to publish it too (host mode) and include it in scanner target lists; unmarked secondary ports stay internal. Container ports must be unique. |
 | `command` | string or list; overrides the image command |
 | `environment` | map; merged with the state's environment (state wins) |
-| `healthcheck` | `{ http: { path, status }, timeout: 60s }` or `{ tcp: { port }, timeout }`; `timeout` is `<n>s|m|h` |
+| `healthcheck` | `{ http: { path, status }, timeout: 60s }` or `{ tcp: { port }, timeout }`; `timeout` is `<n>s|m|h`. When the target cannot be reached from the machine running vulnsuite, it is checked from inside the target: the port must be listening, and an `http` check uses `curl` if the image has it |
 | `sidecars` | helper containers `{ name, image, digest, command, environment }` (names unique) started with each target state on a private network shared only with that state's target, reachable there by `name` in every exposure mode; each state gets its own sidecars (`command` sets the container command, e.g. a `server ...` arg list for a clustered node) |
 | `user` | run-as `uid` or `uid:gid` |
 | `cap_add` / `cap_drop` | Linux capabilities, e.g. `cap_drop: [ALL]` then `cap_add: [CAP_NET_BIND_SERVICE]` |
