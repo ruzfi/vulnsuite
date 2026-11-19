@@ -20,10 +20,12 @@ const buildBase = `base:
   dockerfile: Dockerfile
 `
 
+// asBuild swaps doc's base for a build base, dropping the patched state's
+// image override, which only an image base allows.
 func asBuild(doc string) string {
 	i := strings.Index(doc, "base:\n")
 	j := strings.Index(doc, "service:\n")
-	return doc[:i] + buildBase + doc[j:]
+	return doc[:i] + buildBase + strings.Replace(doc[j:], "    image: httpd:2.4.51\n", "", 1)
 }
 
 func TestParseRejectsEscapingPaths(t *testing.T) {

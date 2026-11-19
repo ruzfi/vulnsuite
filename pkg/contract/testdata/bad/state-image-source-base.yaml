@@ -1,0 +1,16 @@
+# want: states/patched/image: a per-state image applies only to kind: image
+apiVersion: vulnsuite/v1
+kind: Target
+metadata:
+  id: demo-target
+  summary: demo
+base:
+  kind: source
+  repo: https://github.com/example/app
+  commit: 0123456789abcdef0123456789abcdef01234567
+service:
+  ports: [ { container: 80, protocol: http } ]
+states:
+  vulnerable: {}
+  patched:
+    image: nginx:1.25

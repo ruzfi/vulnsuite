@@ -138,7 +138,7 @@ scanner's discrimination cannot be checked). Each state:
 
 | Field | Notes |
 | --- | --- |
-| `image` / `digest` | per-state image override — the cheapest "patched": a newer tag |
+| `image` / `digest` | per-state image override — the cheapest "patched": a newer tag. `image` bases only: a `source` or `build` base builds every state from its own checkout or context, so a state `image` (or `digest`) there is a schema error; make the states differ with a `patch` or `overlay` |
 | `patch` | a git patch applied to a `source` or `build` base |
 | `overlay` | `[{ src, dest, mode }]` files from the template baked into the image (`image` base) or written into the build context (`source`/`build` base). `src` is relative to the template folder; `dest` is an absolute path in the image for an `image` base, or a path in the build context for a `source`/`build` base. `mode` (e.g. `"0755"`) is set on the file in the build context and kept by `COPY`, so it also works on a non-root or shell-less base. See **Paths** below. |
 | `environment` | baked into built images and passed at run time. Names must match `^[A-Za-z_][A-Za-z0-9_.-]*$`; values may not contain newlines or other control characters (they become Dockerfile `ENV` lines; `$` is kept literally). |

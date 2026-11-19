@@ -1,0 +1,16 @@
+# want: states/patched/digest: pins a per-state image
+apiVersion: vulnsuite/v1
+kind: Target
+metadata:
+  id: demo-target
+  summary: demo
+base:
+  kind: source
+  repo: https://github.com/example/app
+  commit: 0123456789abcdef0123456789abcdef01234567
+service:
+  ports: [ { container: 80, protocol: http } ]
+states:
+  vulnerable: {}
+  patched:
+    digest: sha256:1111111111111111111111111111111111111111111111111111111111111111
