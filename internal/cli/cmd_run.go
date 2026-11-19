@@ -332,9 +332,11 @@ Exposure modes:
 			if !g.JSON && !g.Quiet {
 				opts.Build.Output = g.Stdout
 			}
+			// The index only feeds the "scanner templates" lines, which -q
+			// does not print: skip indexing the checkout then.
 			var idx *scanners.Index
-			if dir := scanners.ResolveDir(nucleiDir); dir != "" {
-				idx, _ = scanners.Load(dir)
+			if dir := scanners.ResolveDir(nucleiDir); dir != "" && !g.Quiet {
+				idx, _ = loadNucleiIndex(dir)
 			}
 			var handles []*runner.Handle
 			var failures []string

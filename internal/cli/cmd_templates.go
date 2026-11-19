@@ -428,7 +428,7 @@ func cmdValidate() *Command {
 				CategoryOf:    func(c *contract.Contract) string { return store.Category(c.SourcePath) },
 			}
 			if dir := scanners.ResolveDir(nucleiDir); dir != "" {
-				idx, err := scanners.Load(dir)
+				idx, err := loadNucleiIndex(dir)
 				if err != nil {
 					return err
 				}

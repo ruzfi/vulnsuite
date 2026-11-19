@@ -4,6 +4,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 
@@ -52,7 +54,7 @@ writing a template and contributing it upstream.`,
 			}
 			var idx *scanners.Index
 			if dir := scanners.ResolveDir(nucleiDir); dir != "" {
-				if idx, err = scanners.Load(dir); err != nil {
+				if idx, err = loadNucleiIndex(dir); err != nil {
 					return err
 				}
 			}
@@ -234,4 +236,15 @@ func probeSummary(p contract.Probe) string {
 		return fmt.Sprintf("net :%d, %d-step dialogue", p.Net.Port, len(p.Net.Steps))
 	}
 	return p.Kind()
+}
+
+// loadNucleiIndex indexes a nuclei-templates checkout, reusing the index
+// cached under the user cache dir (vulnsuite/nuclei-index-*.json) while the
+// checkout's template files are unchanged.
+func loadNucleiIndex(dir string) (*scanners.Index, error) {
+	cache := ""
+	if base, err := os.UserCacheDir(); err == nil {
+		cache = filepath.Join(base, "vulnsuite")
+	}
+	return scanners.LoadCached(dir, cache)
 }
