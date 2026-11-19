@@ -413,9 +413,13 @@ func updateArchive(ctx context.Context, o UpdateOptions) (string, string, error)
 	if err != nil {
 		return o.Dir, "", err
 	}
-	if err := unzipStripTop(zf, size, tmp); err != nil {
+	links, err := unzipStripTop(zf, size, tmp)
+	if err != nil {
 		os.RemoveAll(tmp)
 		return o.Dir, "", fmt.Errorf("extract %s@%s: %w; %s left unchanged", o.Repo, o.Ref, err, o.Dir)
+	}
+	if len(links) > 0 {
+		fmt.Fprintf(o.Output, "skipped %d symlink(s) in the archive (an archive install never creates symlinks; a template that needs one works only from a git checkout): %s\n", len(links), summarizePaths(links, 5))
 	}
 	if !HasTemplates(tmp) {
 		os.RemoveAll(tmp)
@@ -496,22 +500,32 @@ func Version(dir string) string {
 // errExtractLimit is returned once the extracted bytes exceed the cap.
 var errExtractLimit = errors.New("archive expands beyond the size limit")
 
+// summarizePaths joins up to max paths, noting how many more there are.
+func summarizePaths(paths []string, max int) string {
+	if len(paths) <= max {
+		return strings.Join(paths, ", ")
+	}
+	return fmt.Sprintf("%s and %d more", strings.Join(paths[:max], ", "), len(paths)-max)
+}
+
 // unzipStripTop extracts a GitHub archive (single top-level folder) into dst.
 // Only directories and regular files are extracted: symlinks (and any other
 // special entries) are skipped, and entries escaping dst are rejected. The
 // number of entries and the total bytes written are capped by archiveLimits;
 // bytes are counted as written, whatever sizes the entry headers declare.
-func unzipStripTop(r io.ReaderAt, size int64, dst string) error {
+// It returns the archive paths (top folder stripped) of the skipped symlinks.
+func unzipStripTop(r io.ReaderAt, size int64, dst string) ([]string, error) {
 	zr, err := zip.NewReader(r, size)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if n := len(zr.File); n > archiveLimits.entries {
-		return fmt.Errorf("archive has %d entries, over the %d entry limit", n, archiveLimits.entries)
+		return nil, fmt.Errorf("archive has %d entries, over the %d entry limit", n, archiveLimits.entries)
 	}
 	if err := os.MkdirAll(dst, 0o755); err != nil {
-		return err
+		return nil, err
 	}
+	var links []string
 	root := filepath.Clean(dst) + string(os.PathSeparator)
 	budget := archiveLimits.extract
 	for _, f := range zr.File {
@@ -526,31 +540,35 @@ func unzipStripTop(r io.ReaderAt, size int64, dst string) error {
 		}
 		target := filepath.Join(dst, filepath.FromSlash(name))
 		if !strings.HasPrefix(target, root) {
-			return errors.New("archive contains an unsafe path: " + f.Name)
+			return links, errors.New("archive contains an unsafe path: " + f.Name)
 		}
 		mode := f.Mode()
 		if mode.IsDir() {
 			if err := os.MkdirAll(target, 0o755); err != nil {
-				return err
+				return links, err
 			}
 			continue
 		}
 		if !mode.IsRegular() {
-			continue // symlink, device, ...: never materialise it
+			// symlink, device, ...: never materialise it
+			if mode&os.ModeSymlink != 0 {
+				links = append(links, name)
+			}
+			continue
 		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return err
+			return links, err
 		}
 		n, err := extractFile(f, target, budget)
 		if err != nil {
 			if errors.Is(err, errExtractLimit) {
-				return fmt.Errorf("%w of %d bytes (at %s)", err, archiveLimits.extract, f.Name)
+				return links, fmt.Errorf("%w of %d bytes (at %s)", err, archiveLimits.extract, f.Name)
 			}
-			return err
+			return links, err
 		}
 		budget -= n
 	}
-	return nil
+	return links, nil
 }
 
 // extractFile writes f to target, at most budget bytes; one byte more fails
