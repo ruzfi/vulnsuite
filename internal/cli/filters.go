@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -63,6 +64,11 @@ func (f *filters) active() bool {
 // needsKEV reports whether evaluating the filter requires the KEV catalog.
 func (f *filters) needsKEV() bool { return f.onlyKEV || f.noKEV }
 
+// goarches are the GOARCH values -arch accepts (go tool dist list); any other
+// value is a typo (amd46) that would match only arch-agnostic templates.
+var goarches = []string{"386", "amd64", "arm", "arm64", "loong64", "mips", "mips64", "mips64le", "mipsle",
+	"ppc64", "ppc64le", "riscv64", "s390x", "wasm"}
+
 // yearRe is the shape -year accepts: a four-digit year.
 var yearRe = regexp.MustCompile(`^\d{4}$`)
 
@@ -72,6 +78,9 @@ var yearRe = regexp.MustCompile(`^\d{4}$`)
 func (f *filters) validate() error {
 	if f.fidelity != "" && !has(contract.Fidelities, f.fidelity) {
 		return usageError{fmt.Sprintf("unknown -fidelity %q; want one of %s", f.fidelity, strings.Join(contract.Fidelities, ", "))}
+	}
+	if f.arch != "" && !has(goarches, f.arch) {
+		return usageError{fmt.Sprintf("unknown -arch %q; want a GOARCH name such as amd64 or arm64 (%s)", f.arch, strings.Join(goarches, ", "))}
 	}
 	if f.year != "" && !yearRe.MatchString(f.year) {
 		return usageError{fmt.Sprintf("-year wants a four-digit year (YYYY), got %q", f.year)}
@@ -93,6 +102,35 @@ func (f *filters) validate() error {
 		}
 	}
 	return nil
+}
+
+// checkCategory makes a -category naming no top-level folder of the store
+// that holds a template (web-app for web-apps) a usage error rather than a
+// filter that silently matches nothing.
+func checkCategory(store *loader.Store, category string) error {
+	if category == "" {
+		return nil
+	}
+	paths, err := store.All()
+	if err != nil {
+		return err
+	}
+	seen := map[string]bool{}
+	var cats []string
+	for _, p := range paths {
+		if c := store.Category(p); c != "" && !seen[c] {
+			seen[c] = true
+			cats = append(cats, c)
+		}
+	}
+	if seen[category] {
+		return nil
+	}
+	sort.Strings(cats)
+	if len(cats) == 0 {
+		return usageError{fmt.Sprintf("unknown -category %q: %s has no template folders", category, store.Root)}
+	}
+	return usageError{fmt.Sprintf("unknown -category %q; the templates directory has %s", category, strings.Join(cats, ", "))}
 }
 
 // match reports whether a contract satisfies every set predicate. kevSet/kevKnown

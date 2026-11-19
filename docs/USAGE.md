@@ -192,9 +192,11 @@ template that fails to load fails the `run` or `build` rather than being skipped
 and exits 1, and `stop -t` still stops its target by the id its contract
 declares.
 Filter values are checked up front, on `list`, `run` and `build` alike: `-fidelity`
-must be `real` or `simulated`, `-year` a four-digit year and `-since` a
-`YYYY-MM-DD` date, so a typo is a usage error (exit 2) rather than a filter
-that silently matches nothing.
+must be `real` or `simulated`, `-year` a four-digit year, `-since` a
+`YYYY-MM-DD` date, `-arch` a GOARCH name (`amd64`, `arm64`, ...) and
+`-category` a top-level folder of the templates directory that holds templates,
+so a typo is a usage error (exit 2) rather than a filter that silently matches
+nothing.
 
 A **`-f` file** lists one selector per line — an id, a group handle, a category, a
 `suite:<name>`, or a filter line (begins with `-`). Blank lines and `#` comments
@@ -411,7 +413,9 @@ metadata:
 
 `vulnsuite info <id>` and every `vulnsuite run` print the linked scanner templates. With a
 nuclei-templates checkout on the machine (`$NUCLEI_TEMPLATES`,
-`~/nuclei-templates`, or `-nuclei-templates DIR`) the ids are resolved to
+`~/nuclei-templates`, or `-nuclei-templates DIR`; an explicit `DIR` that is
+not a directory is a usage error, as is such a `validate -nmap-scripts DIR`,
+rather than a silent fallback) the ids are resolved to
 files, templates matching the target's CVEs that nobody declared yet are
 suggested, and `vulnsuite validate` warns about ids that don't exist. The
 checkout's index is cached in the user cache directory

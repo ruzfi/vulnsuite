@@ -109,6 +109,9 @@ func (r *resolver) addFile(path string) error {
 		origin := fmt.Sprintf("%s:%d", path, l.line)
 		if l.args != nil {
 			f, err := parseFilterLine(l.args)
+			if err == nil {
+				err = checkCategory(r.store, f.category)
+			}
 			if err != nil {
 				return atOrigin(origin, err)
 			}
@@ -190,6 +193,9 @@ func resolveTargets(ctx context.Context, store *loader.Store, sel, files []strin
 	r := &resolver{store: store, variants: variants, visitedSuite: map[string]bool{}}
 	if cliFilters.active() {
 		if err := cliFilters.validate(); err != nil {
+			return nil, err
+		}
+		if err := checkCategory(store, cliFilters.category); err != nil {
 			return nil, err
 		}
 		r.filterSets = append(r.filterSets, cliFilters)
