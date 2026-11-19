@@ -249,7 +249,10 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, body
 	if err != nil {
 		return nil, c.wrapDialError(err)
 	}
-	if resp.StatusCode >= 300 {
+	// Like the SDK, only 4xx and 5xx are errors: dockerd answers 304 Not
+	// Modified when a container is already in the asked-for state (starting
+	// a running container, stopping a stopped one), which is a no-op.
+	if resp.StatusCode >= 400 {
 		defer resp.Body.Close()
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 		msg := strings.TrimSpace(string(b))
@@ -289,7 +292,7 @@ func (c *Client) doJSON(ctx context.Context, method, path string, q url.Values, 
 		return err
 	}
 	defer resp.Body.Close()
-	if out == nil {
+	if out == nil || resp.StatusCode == http.StatusNotModified {
 		io.Copy(io.Discard, resp.Body)
 		return nil
 	}
@@ -335,6 +338,24 @@ type streamMessage struct {
 	Aux json.RawMessage `json:"aux"`
 }
 
+// err returns the failure m reports, or nil. Daemons have sent it in two
+// forms, a top-level "error" string and an "errorDetail" object (dockerd sends
+// both; the Moby API module dropped "error"), so either one alone fails the
+// stream, as it does for the SDK engine.
+func (m streamMessage) err() error {
+	if m.Error == "" && m.ErrorDetail == nil {
+		return nil
+	}
+	msg := m.Error
+	if m.ErrorDetail != nil && strings.TrimSpace(m.ErrorDetail.Message) != "" {
+		msg = m.ErrorDetail.Message
+	}
+	if msg = strings.TrimSpace(msg); msg == "" {
+		msg = "the daemon reported an error with no message"
+	}
+	return errors.New(msg)
+}
+
 // drainStream consumes a JSON progress stream, writing human text to out and
 // returning the first error the daemon reported.
 func drainStream(r io.Reader, out io.Writer) error {
@@ -348,12 +369,8 @@ func drainStream(r io.Reader, out io.Writer) error {
 			}
 			return fmt.Errorf("reading daemon stream: %w", err)
 		}
-		if m.Error != "" {
-			msg := m.Error
-			if m.ErrorDetail != nil && m.ErrorDetail.Message != "" {
-				msg = m.ErrorDetail.Message
-			}
-			return errors.New(strings.TrimSpace(msg))
+		if err := m.err(); err != nil {
+			return err
 		}
 		if out == nil {
 			continue

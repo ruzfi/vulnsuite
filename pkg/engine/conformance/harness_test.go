@@ -175,6 +175,26 @@ func (h *harness) failPull(ref, msg string) {
 	h.d.pullErr[ref] = msg
 }
 
+// failPush makes pushing ref fail with msg, reported in the progress stream
+// (daemon only: the fake has no push failure hook).
+func (h *harness) failPush(t *testing.T, ref, msg string) {
+	t.Helper()
+	h.needsDaemon(t)
+	h.d.mu.Lock()
+	defer h.d.mu.Unlock()
+	h.d.pushErr[ref] = msg
+}
+
+// streamErrorForm makes the daemon report progress-stream failures in only
+// one form, "error" or "errorDetail" (dockerd sends both).
+func (h *harness) streamErrorForm(t *testing.T, form string) {
+	t.Helper()
+	h.needsDaemon(t)
+	h.d.mu.Lock()
+	defer h.d.mu.Unlock()
+	h.d.errForm = form
+}
+
 // failBuild makes every build fail with msg (reported in the build stream,
 // after some step output).
 func (h *harness) failBuild(msg string) {

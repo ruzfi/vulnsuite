@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -165,7 +166,7 @@ func (e *Engine) ImagePull(ctx context.Context, ref, platform string, out io.Wri
 	if err != nil {
 		return fmt.Errorf("pull %s: %w", ref, err)
 	}
-	if err := drain(ctx, resp.JSONMessages(ctx), out); err != nil {
+	if err := drain(ctx, messages(ctx, resp), out); err != nil {
 		return fmt.Errorf("pull %s: %w", ref, err)
 	}
 	return nil
@@ -218,7 +219,7 @@ func (e *Engine) ImagePush(ctx context.Context, ref string, out io.Writer) error
 	if err != nil {
 		return fmt.Errorf("push %s: %w", ref, err)
 	}
-	if err := drain(ctx, resp.JSONMessages(ctx), out); err != nil {
+	if err := drain(ctx, messages(ctx, resp), out); err != nil {
 		return fmt.Errorf("push %s: %w", ref, err)
 	}
 	return nil
@@ -584,17 +585,74 @@ func parsePlatform(s string) (ocispec.Platform, error) {
 	return p, nil
 }
 
+// streamMessage is one line of a JSON progress stream (build, pull, push).
+// Daemons have reported failures in two forms, an "errorDetail" object and a
+// top-level "error" string (dockerd sends both). The Moby API module's
+// jsonstream.Message dropped "error", so it is decoded here too: a daemon or
+// proxy that sends only that form must not have its failure read as success.
+type streamMessage struct {
+	jsonstream.Message
+	ErrorMessage string `json:"error,omitempty"`
+}
+
+// err returns the failure m reports, or nil.
+func (m streamMessage) err() error {
+	if m.Error == nil && m.ErrorMessage == "" {
+		return nil
+	}
+	msg := m.ErrorMessage
+	if m.Error != nil && strings.TrimSpace(m.Error.Message) != "" {
+		msg = m.Error.Message
+	}
+	if msg = strings.TrimSpace(msg); msg == "" {
+		msg = "the daemon reported an error with no message"
+	}
+	return errors.New(msg)
+}
+
+// messages decodes a pull/push response as a sequence of streamMessage, like
+// the SDK's JSONMessages (which would drop the "error" form): rc is closed
+// when the sequence ends or ctx is cancelled.
+func messages(ctx context.Context, rc io.ReadCloser) iter.Seq2[streamMessage, error] {
+	return func(yield func(streamMessage, error) bool) {
+		stop := context.AfterFunc(ctx, func() { _ = rc.Close() })
+		defer func() {
+			stop()
+			_ = rc.Close()
+		}()
+		dec := json.NewDecoder(rc)
+		for {
+			var m streamMessage
+			if err := dec.Decode(&m); err != nil {
+				if errors.Is(err, io.EOF) {
+					return
+				}
+				// A read cut short by cancellation reports the cancellation,
+				// not the closed body.
+				if cerr := ctx.Err(); cerr != nil {
+					err = cerr
+				}
+				yield(streamMessage{}, err)
+				return
+			}
+			if !yield(m, nil) {
+				return
+			}
+		}
+	}
+}
+
 // drain consumes a pull/push message stream, writing status changes to out.
-func drain(ctx context.Context, msgs func(func(jsonstream.Message, error) bool), out io.Writer) error {
+func drain(ctx context.Context, msgs iter.Seq2[streamMessage, error], out io.Writer) error {
 	var last string
 	var failed error
-	msgs(func(m jsonstream.Message, err error) bool {
+	msgs(func(m streamMessage, err error) bool {
 		if err != nil {
 			failed = err
 			return false
 		}
-		if m.Error != nil {
-			failed = errors.New(strings.TrimSpace(m.Error.Message))
+		if err := m.err(); err != nil {
+			failed = err
 			return false
 		}
 		if out != nil && m.Status != "" && m.Progress == nil {
@@ -621,15 +679,15 @@ func drain(ctx context.Context, msgs func(func(jsonstream.Message, error) bool),
 func drainReader(r io.Reader, out io.Writer) error {
 	dec := json.NewDecoder(r)
 	for {
-		var m jsonstream.Message
+		var m streamMessage
 		if err := dec.Decode(&m); err != nil {
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return fmt.Errorf("reading build stream: %w", err)
 		}
-		if m.Error != nil {
-			return errors.New(strings.TrimSpace(m.Error.Message))
+		if err := m.err(); err != nil {
+			return err
 		}
 		if out != nil && m.Stream != "" {
 			io.WriteString(out, m.Stream)
