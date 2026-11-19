@@ -257,7 +257,7 @@ rather than failed; use `-expose host` or scan from a container.
 | `unpinned-state-image` | error (warning with `-allow-unpinned`) | a state's `image` override has no digest |
 | `unpinned-sidecar` | error (warning with `-allow-unpinned`) | a sidecar image, or a state's sidecar override, has no digest |
 | `short-commit` | warning | `base.commit` is an abbreviated commit id; use the full SHA |
-| `missing-context`, `missing-dockerfile`, `missing-patch`, `missing-overlay` | error | a referenced file is not in the template |
+| `missing-context`, `missing-dockerfile`, `missing-patch`, `missing-overlay` | error | a referenced file is not in the template (`missing-dockerfile`: the build context has no Dockerfile and a state does not overlay one) |
 | `path-escapes-template` | error | a referenced path resolves (through a symlink) outside the template folder |
 | `patch-needs-source` | error | a patch on an `image` base |
 | `empty-verify` | error | an http probe asserts nothing |
@@ -272,7 +272,7 @@ rather than failed; use `-expose host` or scan from a container.
 | `undeclared-port` | warning | `healthcheck.tcp.port` or a verify probe's `port` is not declared in `service.ports` (usually a typo; a `tcp` probe with `closed: true` is exempt) |
 | `shadowed-contract` | warning | the template folder holds a second contract file (`contract.yaml`, `contract.yml`, `template.yaml`); only the first is loaded |
 | `no-patched`, `no-verify`, `weak-verify`, `identical-states` | warning | the template proves less than it could (`identical-states`: vulnerable and patched have the same image, build inputs, command, sidecar images and seed) |
-| `source-no-diff` | warning | a source base where states have no patch/image difference |
+| `source-no-diff` | warning | a source base with a `patched` state where no state has a patch or overlay, so both build the same commit |
 | `no-healthcheck`, `no-vuln-ref`, `no-references`, `scanner-unnamed` | warning | missing provenance |
 | `no-detected-by` | warning | no scanner template linked and `detection` unset |
 | `fidelity-unset` | warning | metadata.fidelity is not set (real or simulated) |

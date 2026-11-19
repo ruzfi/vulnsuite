@@ -419,3 +419,58 @@ func TestShadowedContract(t *testing.T) {
 		t.Fatal("a lone contract must not be reported as shadowed")
 	}
 }
+
+// Issue #93 item 2: on a source base, one state with a patch is enough; the
+// warning is for states that cannot differ at all.
+func TestSourceNoDiff(t *testing.T) {
+	head := pinHead + "base: { kind: source, repo: https://example.invalid/x.git, commit: 0123456789abcdef0123456789abcdef01234567 }\nstates:\n"
+	cases := []struct {
+		name, states string
+		warn         bool
+	}{
+		{"patched has the patch", "  vulnerable: {}\n  patched: { patch: patches/fix.patch }\n", false},
+		{"vulnerable has the patch", "  vulnerable: { patch: patches/vuln.patch }\n  patched: {}\n", false},
+		{"patched has an overlay", "  vulnerable: {}\n  patched: { overlay: [ { src: files/x, dest: conf/x } ] }\n", false},
+		{"no difference", "  vulnerable: {}\n  patched: {}\n", true},
+		{"no patched state", "  vulnerable: {}\n", false},
+	}
+	for _, tc := range cases {
+		got := findingsFor((&Validator{}).Check(parse(t, head+tc.states)), "source-no-diff")
+		if (len(got) > 0) != tc.warn {
+			t.Errorf("%s: source-no-diff = %v, want warning %v", tc.name, got, tc.warn)
+		}
+	}
+}
+
+// Issue #93 item 6: a build context needs no Dockerfile of its own when every
+// state overlays one into the context; the builder reads generated files first.
+func TestMissingDockerfileOverlaid(t *testing.T) {
+	doc := func(vuln, patched string) string {
+		return pinHead + "base: { kind: build, context: src }\nstates:\n" +
+			"  vulnerable: { overlay: [ " + vuln + " ] }\n  patched: { overlay: [ " + patched + " ] }\n"
+	}
+	own := "{ src: files/Dockerfile, dest: Dockerfile }"
+	other := "{ src: files/x, dest: etc/x }"
+	cases := []struct {
+		name, doc string
+		lacking   string // "" = no finding
+	}{
+		{"every state overlays it", doc(own, "{ src: files/Dockerfile, dest: ./Dockerfile }"), ""},
+		{"one state does not", doc(own, other), "patched"},
+		{"none does", doc(other, other), "build context has no Dockerfile"},
+	}
+	for _, tc := range cases {
+		c := parse(t, tc.doc)
+		os.MkdirAll(filepath.Join(c.Folder, "src"), 0o755)
+		os.MkdirAll(filepath.Join(c.Folder, "files"), 0o755)
+		os.WriteFile(filepath.Join(c.Folder, "files", "Dockerfile"), []byte("FROM scratch\n"), 0o644)
+		os.WriteFile(filepath.Join(c.Folder, "files", "x"), []byte("x"), 0o644)
+		got := findingsFor((&Validator{}).Check(c), "missing-dockerfile")
+		switch {
+		case tc.lacking == "" && len(got) > 0:
+			t.Errorf("%s: unexpected %v", tc.name, got)
+		case tc.lacking != "" && (len(got) != 1 || !strings.Contains(got[0].Message, tc.lacking)):
+			t.Errorf("%s: want one missing-dockerfile naming %q, got %v", tc.name, tc.lacking, got)
+		}
+	}
+}
