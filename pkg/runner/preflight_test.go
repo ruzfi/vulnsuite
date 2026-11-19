@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/ruzfi/vulnsuite/pkg/contract"
@@ -12,6 +13,7 @@ func boolp(b bool) *bool { return &b }
 func TestPreflight(t *testing.T) {
 	linuxAmd := engine.HostInfo{OS: "linux", Arch: "amd64"}
 	linuxArm := engine.HostInfo{OS: "linux", Arch: "arm64"}
+	winArm := engine.HostInfo{OS: "windows", Arch: "arm64"}
 
 	cases := []struct {
 		name string
@@ -19,15 +21,19 @@ func TestPreflight(t *testing.T) {
 		host engine.HostInfo
 		want string
 		plat string
+		// cause and missing are checked on a skip.
+		cause   string
+		missing []string
 	}{
-		{"no requirements", contract.Requires{}, linuxArm, ActionNative, ""},
-		{"arch matches", contract.Requires{Arch: []string{"amd64", "arm64"}}, linuxArm, ActionNative, ""},
-		{"amd64-only on arm emulates", contract.Requires{Arch: []string{"amd64"}}, linuxArm, ActionEmulated, "linux/amd64"},
-		{"amd64-only, emulation off, on arm skips", contract.Requires{Arch: []string{"amd64"}, Emulation: boolp(false)}, linuxArm, ActionSkip, ""},
-		{"kvm on linux/amd64 is native", contract.Requires{KVM: true, Arch: []string{"amd64"}}, linuxAmd, ActionNative, ""},
-		{"kvm on arm skips", contract.Requires{KVM: true, Arch: []string{"amd64"}, Emulation: boolp(false)}, linuxArm, ActionSkip, ""},
-		{"kvm on darwin-ish non-amd64 skips", contract.Requires{KVM: true}, linuxArm, ActionSkip, ""},
-		{"host_os mismatch skips", contract.Requires{HostOS: []string{"windows"}}, linuxAmd, ActionSkip, ""},
+		{"no requirements", contract.Requires{}, linuxArm, ActionNative, "", "", nil},
+		{"arch matches", contract.Requires{Arch: []string{"amd64", "arm64"}}, linuxArm, ActionNative, "", "", nil},
+		{"amd64-only on arm emulates", contract.Requires{Arch: []string{"amd64"}}, linuxArm, ActionEmulated, "linux/amd64", "", nil},
+		{"amd64-only, emulation off, on arm skips", contract.Requires{Arch: []string{"amd64"}, Emulation: boolp(false)}, linuxArm, ActionSkip, "", CauseArch, []string{"amd64"}},
+		{"amd64-only on a windows host cannot emulate", contract.Requires{Arch: []string{"amd64"}}, winArm, ActionSkip, "", CauseEmulation, []string{"amd64"}},
+		{"kvm on linux/amd64 is native", contract.Requires{KVM: true, Arch: []string{"amd64"}}, linuxAmd, ActionNative, "", "", nil},
+		{"kvm on arm skips", contract.Requires{KVM: true, Arch: []string{"amd64"}, Emulation: boolp(false)}, linuxArm, ActionSkip, "", CauseKVM, []string{"kvm"}},
+		{"kvm on darwin-ish non-amd64 skips", contract.Requires{KVM: true}, linuxArm, ActionSkip, "", CauseKVM, []string{"kvm"}},
+		{"host_os mismatch skips", contract.Requires{HostOS: []string{"windows"}}, linuxAmd, ActionSkip, "", CauseHostOS, []string{"windows"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -40,6 +46,9 @@ func TestPreflight(t *testing.T) {
 			}
 			if d.Skip() && d.Reason == "" {
 				t.Fatal("skip must carry a reason")
+			}
+			if d.Cause != tc.cause || !reflect.DeepEqual(d.Missing, tc.missing) {
+				t.Fatalf("cause %q missing %q, want %q %q (reason: %s)", d.Cause, d.Missing, tc.cause, tc.missing, d.Reason)
 			}
 		})
 	}

@@ -117,6 +117,16 @@ type outcomeEntry struct {
 	State  string `json:"state,omitempty"`
 	Reason string `json:"reason"`
 	Detail string `json:"detail,omitempty"`
+	// Cause and Missing say, for a requires skip, which requirement the host
+	// does not meet (runner.Cause*) and what it lacks.
+	Cause   string   `json:"cause,omitempty"`
+	Missing []string `json:"missing,omitempty"`
+}
+
+// requiresSkip is the -summary entry of a target the host's requires
+// preflight skipped.
+func requiresSkip(id, state string, d runner.Decision) outcomeEntry {
+	return outcomeEntry{ID: id, State: state, Reason: reasonRequires, Detail: d.Reason, Cause: d.Cause, Missing: d.Missing}
 }
 
 // runSummary is `run -json -summary`: what started, what failed and what was
@@ -304,7 +314,7 @@ Exposure modes:
 					case d.Skip() && !ignoreRequires:
 						g.printf("skip %s: %s\n", c.ID(), d.Reason)
 						skippedReq = append(skippedReq, c.ID())
-						skip([]*contract.Contract{c}, state, reasonRequires, d.Reason)
+						sum.Skipped = append(sum.Skipped, requiresSkip(c.ID(), state, d))
 						continue
 					case d.Skip() && ignoreRequires:
 						g.printf("%s does not meet requires (%s) -- running anyway (-ignore-requires)\n", c.ID(), d.Reason)
