@@ -293,7 +293,11 @@ each `skipped` entry of `build` has the same shape. `reason` is a stable code:
 | `unhealthy` | failed | started but not ready, a seed failed, or verify failed (also in `targets`: it is running) |
 
 The document is printed on failure and on Ctrl-C too, and the exit code is
-unchanged: non-zero whenever anything failed or was interrupted. In `build`,
+unchanged: non-zero whenever anything failed or was interrupted. The same holds
+for the bare `run -json` array: once the selection is resolved it is printed
+on every way out but a usage error (`[]` when a template fails to load or
+nothing came up), and `targets -json` prints `[]` when nothing is running,
+like `ps -json`, still exiting non-zero. In `build`,
 jobs an interrupt stopped before they started are counted (`N ok, M failed, K
 cancelled before starting`); in the bare `-json` array they appear with an
 `error`.
