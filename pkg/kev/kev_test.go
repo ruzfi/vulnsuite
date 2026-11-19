@@ -221,14 +221,78 @@ func TestFresherCacheBeatsStaleTemplates(t *testing.T) {
 			}
 		})
 	}
-	// A snapshot with no catalogVersion header cannot be dated, so it stays
-	// the source of truth.
+	// A snapshot with no catalogVersion header cannot be dated: a cache that
+	// can be dated (a -refresh-kev) wins over it, as USAGE.md promises.
 	plain := t.TempDir()
 	writeFile(t, filepath.Join(plain, "data", "cisa-kev.txt"), "CVE-2021-41773\n")
 	cache := t.TempDir()
 	_ = writeCache(filepath.Join(cache, "cisa-kev.json"), Set{"CVE-2014-0160": true}, "network", "2026-03-01T08:00:00Z", "2026.03.01")
-	if _, src, _ := Resolve(context.Background(), Options{TemplatesDir: plain, CacheDir: cache}); src.Origin != OriginTemplates || !src.AsOf.IsZero() {
-		t.Fatalf("undated snapshot: %+v", src)
+	if set, src, _ := Resolve(context.Background(), Options{TemplatesDir: plain, CacheDir: cache}); src.Origin != OriginCache || !set.Contains("CVE-2014-0160") {
+		t.Fatalf("undated snapshot vs dated cache: %+v", src)
+	}
+	// Neither can be dated: the snapshot stays the source of truth.
+	undated := t.TempDir()
+	_ = writeCache(filepath.Join(undated, "cisa-kev.json"), Set{"CVE-2014-0160": true}, "network", "", "")
+	if _, src, _ := Resolve(context.Background(), Options{TemplatesDir: plain, CacheDir: undated}); src.Origin != OriginTemplates {
+		t.Fatalf("undated snapshot vs undated cache: %+v", src)
+	}
+}
+
+// A cache that is valid JSON but holds no CVE ids is not a catalog: it is
+// ignored with a warning, exactly like a corrupt one, rather than used as an
+// empty catalog (KEV "-" everywhere, -no-kev matching everything).
+func TestIDLessCacheTreatedAsMissing(t *testing.T) {
+	for _, body := range []string{`null`, `{}`, `{"fetched":"2026-03-01T08:00:00Z","cves":[]}`, `{"cves":["bad","CVE-21-1"]}`} {
+		t.Run(body, func(t *testing.T) {
+			cache := t.TempDir()
+			writeFile(t, filepath.Join(cache, "cisa-kev.json"), body)
+			var warned []string
+			set, src, err := Resolve(context.Background(), Options{
+				TemplatesDir: t.TempDir(), CacheDir: cache,
+				Warn: func(m string) { warned = append(warned, m) },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if src.Origin != OriginNone || set.Len() != 0 {
+				t.Fatalf("origin=%q len=%d, want none/0", src.Origin, set.Len())
+			}
+			if len(warned) != 1 || !strings.Contains(warned[0], "no CVE ids") {
+				t.Fatalf("warnings = %q", warned)
+			}
+		})
+	}
+	// Nor does an id-less cache shadow a dated snapshot or count as newer.
+	tpl, cache := t.TempDir(), t.TempDir()
+	writeFile(t, filepath.Join(tpl, "data", "cisa-kev.txt"), "# catalogVersion: 2026.01.10\nCVE-2021-41773\n")
+	writeFile(t, filepath.Join(cache, "cisa-kev.json"), `{"fetched":"2026-03-01T08:00:00Z","catalog_version":"2026.03.01","cves":[]}`)
+	if _, src, _ := Resolve(context.Background(), Options{TemplatesDir: tpl, CacheDir: cache, Warn: func(string) {}}); src.Origin != OriginTemplates {
+		t.Fatalf("id-less cache beat the snapshot: %+v", src)
+	}
+}
+
+// A refresh whose cache write fails still returns the fresh set, and warns.
+func TestRefreshWarnsWhenCacheWriteFails(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"vulnerabilities":[{"cveID":"CVE-2021-41773"}]}`))
+	}))
+	defer srv.Close()
+	// The cache directory is a regular file, so it cannot be created.
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	writeFile(t, blocker, "x")
+	var warned []string
+	set, src, err := Resolve(context.Background(), Options{
+		Refresh: true, CacheDir: blocker, Client: srv.Client(), FeedURL: srv.URL,
+		Warn: func(m string) { warned = append(warned, m) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if src.Origin != OriginNetwork || !set.Contains("CVE-2021-41773") {
+		t.Fatalf("src=%+v set=%v", src, set)
+	}
+	if len(warned) != 1 || !strings.Contains(warned[0], "could not write the KEV cache") {
+		t.Fatalf("warnings = %q", warned)
 	}
 }
 
