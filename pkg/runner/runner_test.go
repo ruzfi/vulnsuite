@@ -423,3 +423,55 @@ func TestHostModeDaemonAssignedPorts(t *testing.T) {
 		t.Fatalf("a failed run must clean up: %v", fe.Containers)
 	}
 }
+
+// #94 item 1: the published ports and schemes are recorded on the container at
+// run time and read back by Running, so `targets` needs no template.
+func TestRunRecordsPublishedPortsLabel(t *testing.T) {
+	fe := enginetest.New()
+	r := New(fe)
+	r.Reach = func(string, int, time.Duration) probes.Reach { return probes.Unreachable }
+	c := &contract.Contract{
+		APIVersion: contract.APIVersion,
+		Kind:       "Target",
+		Metadata:   contract.Metadata{ID: "label-test"},
+		Base:       contract.Base{Kind: contract.BaseImage, Image: "example:latest"},
+		Service: contract.Service{Ports: []contract.Port{
+			{Container: 8443, Protocol: "https"},
+			{Container: 5432, Publish: true},
+			{Container: 1234}, // internal-only: not recorded
+		}},
+		States: map[string]*contract.State{"vulnerable": {Name: "vulnerable"}},
+	}
+	ctx := context.Background()
+	h, err := r.Run(ctx, c, "vulnerable", Exposure{Mode: ModeInternal}, Options{ReadyTimeout: time.Second, Build: builder.Options{Pull: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fe.Containers[h.Container].Spec.Labels[LabelPorts]; got != "8443/https,5432" {
+		t.Fatalf("%s label = %q", LabelPorts, got)
+	}
+	rows, err := r.Running(ctx, DefaultNetwork)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []PublishedPort{{ContainerPort: 8443, Scheme: "https"}, {ContainerPort: 5432}}
+	if len(rows) != 1 || len(rows[0].Published) != 2 || rows[0].Published[0] != want[0] || rows[0].Published[1] != want[1] {
+		t.Fatalf("Published: %+v", rows)
+	}
+}
+
+func TestParsePortsLabel(t *testing.T) {
+	got := ParsePortsLabel("3000/http, 22 ,bogus,0/http,70000,8443/https")
+	want := []PublishedPort{{ContainerPort: 3000, Scheme: "http"}, {ContainerPort: 22}, {ContainerPort: 8443, Scheme: "https"}}
+	if len(got) != len(want) {
+		t.Fatalf("got %+v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %+v", got)
+		}
+	}
+	if got := ParsePortsLabel(""); got == nil || len(got) != 0 {
+		t.Fatalf("empty label must be an empty, non-nil list: %#v", got)
+	}
+}

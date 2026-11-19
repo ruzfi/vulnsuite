@@ -441,3 +441,40 @@ func TestRunTargetsFileEmitsCleanURLs(t *testing.T) {
 		}
 	}
 }
+
+// #94 item 1: `targets` addresses a running target from the ports recorded on
+// its container, so a target whose template is outside the templates root (or
+// was removed, or changed its port since) is still listed correctly.
+func TestTargetsUsesPortsRecordedOnContainer(t *testing.T) {
+	root := fixtures(t)
+	fe := enginetest.New()
+	code, out, errOut := run(t, fe, "-T", root, "run", "-t", "grafana", "-detach", "-no-verify", "-ready-timeout", "1s")
+	if code != ExitOK {
+		t.Fatalf("run: %d\n%s\n%s", code, out, errOut)
+	}
+	// A different (empty) templates root: grafana is not in it.
+	elsewhere := t.TempDir()
+	code, out, errOut = run(t, fe, "-T", elsewhere, "targets", "-by", "alias")
+	if code != ExitOK || !strings.Contains(out, "http://grafana-8.3.0-cve-2021-43798-vulnerable:3000") {
+		t.Fatalf("targets with the template outside the root: %d\n%s\n%s", code, out, errOut)
+	}
+
+	// The recorded port wins over the template's current one.
+	name := contract.ContainerNamePrefix + "grafana-8.3.0-cve-2021-43798-vulnerable"
+	fe.Containers[name].Spec.Labels["dev.vulnsuite.ports"] = "4443/https"
+	code, out, errOut = run(t, fe, "-T", root, "targets", "-by", "alias")
+	if code != ExitOK || !strings.Contains(out, "https://grafana-8.3.0-cve-2021-43798-vulnerable:4443") || strings.Contains(out, ":3000") {
+		t.Fatalf("targets should use the recorded port: %d\n%s\n%s", code, out, errOut)
+	}
+}
+
+// #94 item 1: a container from before the ports label whose template is gone
+// is reported as such, not with "try again in a moment".
+func TestTargetsUnresolvableTemplateMessage(t *testing.T) {
+	fe := enginetest.New()
+	seedHostTarget(fe, "127.0.0.1", 49154) // no ports label: falls back to the store
+	code, out, errOut := run(t, fe, "-T", t.TempDir(), "targets")
+	if code != ExitFail || strings.Contains(errOut, "try again") || !strings.Contains(errOut, "not in") || !strings.Contains(errOut, "no known ports") {
+		t.Fatalf("targets: %d\n%s\n%s", code, out, errOut)
+	}
+}

@@ -328,7 +328,13 @@ when `-subnet` or `-gateway` differs from the existing one.
 `dev.vulnsuite.*` labels: `stop -t foo` stops exactly template `foo` (never
 `foo-bar`), and containers vulnsuite did not start are left alone.
 `stop -prune-net` also removes `vulnsuite-net`, which only makes sense when
-stopping everything; with a selector it is a usage error.
+stopping everything; with a selector it is a usage error. `run`
+also records a target's published ports and their schemes on the container
+(`dev.vulnsuite.ports`), so `targets` addresses it correctly even when its
+template is outside the templates directory, was removed or changed by
+`update-templates`, or now declares a different port. Containers started by an
+older vulnsuite fall back to the template; if that is gone too, `targets` says
+so and asks you to restart the target.
 
 **Ctrl-C.** Interrupting `run` while targets are starting stops the batch,
 removes what it had started and exits non-zero (`interrupted`). Interrupting a
