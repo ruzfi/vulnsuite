@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -43,6 +44,29 @@ func (p portMapFlag) Set(v string) error {
 		return fmt.Errorf("container port %d is mapped more than once", cp)
 	}
 	(*p.m)[cp] = hp
+	return nil
+}
+
+// checkHostPortMap rejects -host-port-map keys that are not ports the target
+// publishes in host mode: such a pin would be silently ignored.
+func checkHostPortMap(m map[int]int, c *contract.Contract) error {
+	pubs := c.Service.HostPublishPorts()
+	published := map[int]bool{}
+	var list []string
+	for _, p := range pubs {
+		published[p.Container] = true
+		list = append(list, strconv.Itoa(p.Container))
+	}
+	keys := make([]int, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+	for _, k := range keys {
+		if !published[k] {
+			return usageError{fmt.Sprintf("-host-port-map %d=%d: %s does not publish container port %d (it publishes %s)", k, m[k], c.ID(), k, strings.Join(list, ", "))}
+		}
+	}
 	return nil
 }
 
@@ -193,6 +217,17 @@ Exposure modes:
 			if pinned && exp.Mode != runner.ModeHost {
 				return usageError{"-host-port / -host-port-map need -expose host"}
 			}
+			// Flags of another exposure mode would be silently ignored.
+			if exp.Mode != runner.ModeHost && flagSet(fs, "bind") {
+				return usageError{fmt.Sprintf("-bind is used only by -expose host (the mode is %s)", exp.Mode)}
+			}
+			if exp.Mode != runner.ModeMacvlan {
+				for _, name := range []string{"parent", "ip", "subnet", "gateway"} {
+					if flagSet(fs, name) {
+						return usageError{fmt.Sprintf("-%s is used only by -expose macvlan (the mode is %s)", name, exp.Mode)}
+					}
+				}
+			}
 			var readyTimeoutD time.Duration
 			if readyTimeout != "" {
 				d, err := contract.ParseDuration(readyTimeout, 0)
@@ -325,6 +360,11 @@ Exposure modes:
 			}
 			if multi && pinned {
 				return usageError{fmt.Sprintf("-host-port / -host-port-map pin one target's ports but %d targets would start (%s); select one target, or omit them for free ports", len(runnable), contractIDs(runnable))}
+			}
+			if len(runnable) == 1 && len(exp.HostPortMap) > 0 {
+				if err := checkHostPortMap(exp.HostPortMap, runnable[0]); err != nil {
+					return err
+				}
 			}
 
 			opts := runner.Options{Verify: !noVerify, AllowHostAccess: allowHostAccess, Build: builder.Options{Pull: !noPull, NoCache: noCache, Force: force, Platform: platform}}
@@ -616,6 +656,9 @@ func cmdStop() *Command {
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
 			sel = append(sel, args...)
+			if pruneNet && len(sel) > 0 {
+				return usageError{"-prune-net removes the network only when stopping everything; drop the selectors, or run `vulnsuite stop -prune-net` once the rest is down"}
+			}
 			eng, err := g.Engine(ctx)
 			if err != nil {
 				return err
