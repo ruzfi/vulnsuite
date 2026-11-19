@@ -490,11 +490,13 @@ func (e *Engine) NetworkExists(ctx context.Context, name string) (bool, error) {
 	return false, err
 }
 
-func (e *Engine) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (string, error) {
+// NetworkEnsure creates the network when missing and returns it as the
+// daemon reports it; an existing network is returned with its own settings.
+func (e *Engine) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (engine.Network, error) {
 	if res, err := e.cli.NetworkInspect(ctx, spec.Name, client.NetworkInspectOptions{}); err == nil {
-		return res.Network.ID, nil
+		return toNetwork(res.Network), nil
 	} else if !cerrdefs.IsNotFound(err) {
-		return "", err
+		return engine.Network{}, err
 	}
 	driver := spec.Driver
 	if driver == "" {
@@ -505,30 +507,49 @@ func (e *Engine) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (st
 	if spec.Subnet != "" {
 		prefix, err := netip.ParsePrefix(spec.Subnet)
 		if err != nil {
-			return "", fmt.Errorf("subnet %q: %w", spec.Subnet, err)
+			return engine.Network{}, fmt.Errorf("subnet %q: %w", spec.Subnet, err)
 		}
 		cfg := network.IPAMConfig{Subnet: prefix}
 		if spec.Gateway != "" {
 			gw, err := netip.ParseAddr(spec.Gateway)
 			if err != nil {
-				return "", fmt.Errorf("gateway %q: %w", spec.Gateway, err)
+				return engine.Network{}, fmt.Errorf("gateway %q: %w", spec.Gateway, err)
 			}
 			cfg.Gateway = gw
 		}
 		opts.IPAM = &network.IPAM{Driver: "default", Config: []network.IPAMConfig{cfg}}
 	}
-	res, err := e.cli.NetworkCreate(ctx, spec.Name, opts)
-	if err != nil {
+	if _, err := e.cli.NetworkCreate(ctx, spec.Name, opts); err != nil {
 		// A concurrent run created it between our inspect and create: use
-		// that one.
+		// that one (the caller checks its settings).
 		if cerrdefs.IsConflict(err) {
 			if again, ierr := e.cli.NetworkInspect(ctx, spec.Name, client.NetworkInspectOptions{}); ierr == nil {
-				return again.Network.ID, nil
+				return toNetwork(again.Network), nil
 			}
 		}
-		return "", err
+		return engine.Network{}, err
 	}
-	return res.ID, nil
+	// Read back what the daemon made, so the caller sees the same fields for
+	// a new network as for an existing one.
+	res, err := e.cli.NetworkInspect(ctx, spec.Name, client.NetworkInspectOptions{})
+	if err != nil {
+		return engine.Network{}, fmt.Errorf("inspect new network %s: %w", spec.Name, err)
+	}
+	return toNetwork(res.Network), nil
+}
+
+func toNetwork(n network.Inspect) engine.Network {
+	out := engine.Network{ID: n.ID, Driver: n.Driver, Internal: n.Internal, Options: n.Options}
+	if len(n.IPAM.Config) > 0 {
+		c := n.IPAM.Config[0]
+		if c.Subnet.IsValid() {
+			out.Subnet = c.Subnet.String()
+		}
+		if c.Gateway.IsValid() {
+			out.Gateway = c.Gateway.String()
+		}
+	}
+	return out
 }
 
 func (e *Engine) NetworkRemove(ctx context.Context, name string) error {

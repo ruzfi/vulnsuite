@@ -543,26 +543,47 @@ var cases = []conformanceCase{
 	// -- networks -------------------------------------------------------------------
 	{"network_ensure_creates", func(t *testing.T, h *harness) {
 		spec := engine.NetworkSpec{Name: "vs-new", Internal: true, Subnet: "10.77.0.0/24", Gateway: "10.77.0.1"}
-		id, err := h.eng.NetworkEnsure(bg(t), spec)
-		if err != nil || id == "" {
-			t.Fatalf("NetworkEnsure = %q, %v", id, err)
+		n, err := h.eng.NetworkEnsure(bg(t), spec)
+		if err != nil || n.ID == "" {
+			t.Fatalf("NetworkEnsure = %+v, %v", n, err)
 		}
 		got, ok := h.network("vs-new")
 		if !ok || !got.Internal || got.Subnet != spec.Subnet || got.Gateway != spec.Gateway {
 			t.Fatalf("created network %+v (exists %v), want %+v", got, ok, spec)
 		}
-		if again, err := h.eng.NetworkEnsure(bg(t), spec); err != nil || again != id {
-			t.Fatalf("second NetworkEnsure = %q, %v; want the same id %q", again, err, id)
+		// The new network is reported as the daemon made it.
+		if n.Driver != "bridge" || !n.Internal || n.Subnet != spec.Subnet || n.Gateway != spec.Gateway {
+			t.Fatalf("NetworkEnsure reported %+v for the new network, want bridge, internal, %s via %s", n, spec.Subnet, spec.Gateway)
+		}
+		if again, err := h.eng.NetworkEnsure(bg(t), spec); err != nil || again.ID != n.ID {
+			t.Fatalf("second NetworkEnsure = %+v, %v; want the same id %q", again, err, n.ID)
 		}
 	}},
 	{"network_ensure_keeps_existing", func(t *testing.T, h *harness) {
 		id := h.seedNetwork(engine.NetworkSpec{Name: "vs-net", Internal: true})
 		got, err := h.eng.NetworkEnsure(bg(t), engine.NetworkSpec{Name: "vs-net", Internal: false})
-		if err != nil || got != id {
-			t.Fatalf("NetworkEnsure on an existing network = %q, %v; want its id %q", got, err, id)
+		if err != nil || got.ID != id {
+			t.Fatalf("NetworkEnsure on an existing network = %+v, %v; want its id %q", got, err, id)
 		}
 		if spec, _ := h.network("vs-net"); !spec.Internal {
 			t.Fatal("NetworkEnsure changed an existing network; it must return it unchanged")
+		}
+		// It reports the existing network's own settings, not the requested
+		// ones, so the caller can tell that they differ.
+		if !got.Internal {
+			t.Fatalf("NetworkEnsure reported %+v for an internal network; Internal must come from the daemon", got)
+		}
+	}},
+	{"network_ensure_reports_existing_settings", func(t *testing.T, h *harness) {
+		h.seedNetwork(engine.NetworkSpec{Name: "vs-mv", Driver: "macvlan", Options: map[string]string{"parent": "eth0"},
+			Subnet: "192.168.5.0/24", Gateway: "192.168.5.1"})
+		got, err := h.eng.NetworkEnsure(bg(t), engine.NetworkSpec{Name: "vs-mv", Driver: "macvlan",
+			Options: map[string]string{"parent": "eth1"}, Subnet: "10.0.0.0/24"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Driver != "macvlan" || got.Options["parent"] != "eth0" || got.Subnet != "192.168.5.0/24" || got.Gateway != "192.168.5.1" || got.Internal {
+			t.Fatalf("NetworkEnsure reported %+v, want the existing macvlan network on eth0, 192.168.5.0/24 via 192.168.5.1", got)
 		}
 	}},
 	{"network_ensure_inspect_error_is_error", func(t *testing.T, h *harness) {
@@ -581,8 +602,8 @@ var cases = []conformanceCase{
 		var raced string
 		f.then = func(d *daemon) { raced = d.putNetwork(engine.NetworkSpec{Name: "vs-net"}, nil).id }
 		got, err := h.eng.NetworkEnsure(bg(t), engine.NetworkSpec{Name: "vs-net"})
-		if err != nil || got != raced {
-			t.Fatalf("NetworkEnsure after losing the create race = %q, %v; want the winner's id %q", got, err, raced)
+		if err != nil || got.ID != raced {
+			t.Fatalf("NetworkEnsure after losing the create race = %+v, %v; want the winner's id %q", got, err, raced)
 		}
 	}},
 	{"network_exists", func(t *testing.T, h *harness) {

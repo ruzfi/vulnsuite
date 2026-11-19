@@ -518,9 +518,9 @@ func (f *Fake) ContainerWait(ctx context.Context, id string) (int, error) {
 	}
 }
 
-func (f *Fake) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (string, error) {
+func (f *Fake) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (engine.Network, error) {
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return engine.Network{}, err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -529,7 +529,13 @@ func (f *Fake) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (stri
 	if _, ok := f.Networks[spec.Name]; !ok {
 		f.Networks[spec.Name] = spec
 	}
-	return "net-" + spec.Name, nil
+	n := f.Networks[spec.Name]
+	driver := n.Driver
+	if driver == "" {
+		driver = "bridge"
+	}
+	return engine.Network{ID: "net-" + spec.Name, Driver: driver, Internal: n.Internal, Options: n.Options,
+		Subnet: n.Subnet, Gateway: n.Gateway}, nil
 }
 
 func (f *Fake) NetworkExists(ctx context.Context, name string) (bool, error) {
