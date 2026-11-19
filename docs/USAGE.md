@@ -63,7 +63,10 @@ with `-t`. After `--`, nothing is parsed as a flag.
 ## Templates directory and `update-templates`
 
 The templates directory is `-templates DIR`, `$VULNSUITE_TEMPLATES`, the
-templates repository you are standing in, or `~/vulnsuite-templates`.
+templates repository or `update-templates` install you are standing in (from
+any subfolder: the git root, or the directory holding the
+`.vulnsuite-templates-version` marker, is the templates root), or
+`~/vulnsuite-templates`.
 `vulnsuite update-templates` fetches the templates into that same directory:
 
 - a git checkout is pulled (`--ff-only`); `-ref BRANCH|TAG|COMMIT` fetches the
@@ -77,7 +80,8 @@ templates repository you are standing in, or `~/vulnsuite-templates`.
 - anything else is replaced by the GitHub archive of `-ref` (default `main`),
   but only when the directory is missing, empty, or was installed by
   `update-templates` (it has a `.vulnsuite-templates-version` marker). Any other
-  non-empty directory is refused unless you pass `-force`. The archive is
+  non-empty directory is refused unless you pass `-force`; a subfolder of an
+  archive install is refused even with `-force`. The archive is
   refused, and the old directory kept, when it is over 256 MiB, expands past
   512 MiB or 50,000 entries, or holds no templates (a wrong `-repo`). The old
   directory is removed only once the new one is in place.
