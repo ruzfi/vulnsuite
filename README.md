@@ -138,6 +138,7 @@ schema for editors and CI is [schemas/contract.schema.json](schemas/contract.sch
 | `targets` | scannable URLs of the running targets, right port per template |
 | `stop` (`down`) | tear down targets, their sidecars and sidecar networks |
 | `images` | list or remove locally built images |
+| `host` (`doctor`) | what the daemon's machine offers targets: arch, CPU flags, `/dev/kvm`, kernel, amd64 emulation |
 | `update-templates` (`ut`) | fetch or update the community templates |
 
 `vulnsuite help <command>` prints every flag. The full reference is

@@ -118,21 +118,27 @@ func runHostProbe(ctx context.Context, eng engine.Engine, script string, opts Ho
 
 // ensureProbeImage makes HostProbeImage present for platform ("" = native).
 func ensureProbeImage(ctx context.Context, eng engine.Engine, platform string, opts HostProbeOptions) error {
-	ok, err := eng.ImageExists(ctx, HostProbeImage, platform)
+	return ensureImage(ctx, eng, HostProbeImage, platform, opts)
+}
+
+// ensureImage makes a host probe image present for platform, pulling it unless
+// opts.NoPull.
+func ensureImage(ctx context.Context, eng engine.Engine, ref, platform string, opts HostProbeOptions) error {
+	ok, err := eng.ImageExists(ctx, ref, platform)
 	if err != nil {
-		return fmt.Errorf("look up the host probe image %s: %w", HostProbeImage, err)
+		return fmt.Errorf("look up the host probe image %s: %w", ref, err)
 	}
 	if ok {
 		return nil
 	}
 	if opts.NoPull {
-		return fmt.Errorf("the host probe image %s is not present and pulling is off (-no-pull)", HostProbeImage)
+		return fmt.Errorf("the host probe image %s is not present and pulling is off (-no-pull)", ref)
 	}
 	if opts.Progress != nil {
-		fmt.Fprintf(opts.Progress, "pulling the host probe image %s...\n", HostProbeImage)
+		fmt.Fprintf(opts.Progress, "pulling the host probe image %s...\n", ref)
 	}
-	if err := eng.ImagePull(ctx, HostProbeImage, platform, nil); err != nil {
-		return fmt.Errorf("pull the host probe image %s: %w", HostProbeImage, err)
+	if err := eng.ImagePull(ctx, ref, platform, nil); err != nil {
+		return fmt.Errorf("pull the host probe image %s: %w", ref, err)
 	}
 	return nil
 }

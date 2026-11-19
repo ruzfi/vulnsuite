@@ -22,7 +22,7 @@ packages behind the CLI see [ARCHITECTURE.md](ARCHITECTURE.md).
 ## Commands
 
 ```text
-vulnsuite list [selector...] [filters] [-group H] [-variants]    list and filter templates (aliases: ls, search)
+vulnsuite list [selector...] [filters] [-group H] [-variants] [-runnable]  list and filter templates (aliases: ls, search)
 vulnsuite info <selector>                                        states, build kinds, probes, scanner templates (alias: show)
 vulnsuite validate [-t SEL]... [-strict] [-allow-unpinned]       structure + semantic lint
 vulnsuite build [vulnerable|patched] -t SEL... | -f FILE | <filters> | -all [-variants] [-j N] [-push -registry REG]
@@ -31,6 +31,7 @@ vulnsuite ps                                                     running targets
 vulnsuite targets [-file FILE] [-by auto|ip|alias|host]          scannable URLs, right port per template
 vulnsuite stop [-t SEL]... [-variants] [-prune-net]              tear down (targets, their sidecars and sidecar networks; alias: down)
 vulnsuite images [-rm]                                           locally built images
+vulnsuite host [-no-pull]                                        what the daemon's machine offers: arch, CPU flags, /dev/kvm, kernel, amd64 (alias: doctor)
 vulnsuite update-templates [-repo OWNER/NAME] [-ref REF] [-force]  fetch / update the community templates (alias: ut)
 vulnsuite version                                                version and templates checkout
 ```
@@ -487,6 +488,36 @@ non-zero exit skips the target with the probe's reason, in `run` and `build`.
 `-ignore-requires` overrides; `list -arch <a>` hides targets that can't run on
 that arch, and `list` and `info` show each template's requires (the REQUIRES
 column, `requires` in `list -json`). See [CONTRACT.md](CONTRACT.md).
+
+To see what the current daemon offers, ask it:
+
+```text
+$ vulnsuite host
+daemon       linux/arm64
+engine       29.8.2 (api 1.56, linux/arm64)
+kernel       7.2.12-orbstack-00394-gbecdd6130068
+/dev/kvm     no
+cpu flags    aes asimd ... (N)
+amd64        emulated
+probe image  busybox:1.37.0@sha256:a7dbc319...
+```
+
+The OS and arch come from the daemon's API; the kernel, `/dev/kvm` (a kvm
+device registered with the daemon's kernel), and the CPU flags are read on the
+daemon's machine in a short-lived pinned `busybox` container (no network, no
+capabilities), the same way `requires.cpu_flags` is checked. `amd64` is
+`native` on an amd64 daemon; elsewhere a linux/amd64 container is tried:
+`emulated` when it runs (qemu or Rosetta), `unavailable` when it does not.
+What cannot be read (offline and the probe image is not present, or with
+`-no-pull`) is shown as `unknown` with the reason, and the command exits
+non-zero. `host -json` prints the same as one object (`engine`, `os`, `arch`,
+`kernel`, `kvm`, `cpu_flags`, `amd64`, `amd64_detail`, `probe_error`,
+`probe_image`).
+
+`list -runnable` lists only the templates whose `requires` this daemon meets,
+by the same preflight `run` uses. It connects to the daemon (a plain `list`
+does not), reads the CPU flags only if a listed template sets `cpu_flags`, and
+does not evaluate `requires.probe` (that needs the target's image).
 
 ## Container hardening
 
