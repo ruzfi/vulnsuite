@@ -292,6 +292,24 @@ each `skipped` entry of `build` has the same shape. `reason` is a stable code:
 | `start` | failed | could not be built, pulled or started |
 | `unhealthy` | failed | started but not ready, a seed failed, or verify failed (also in `targets`: it is running) |
 
+A `requires` skip also says which requirement the host does not meet, so CI on
+a mixed fleet can tell a hardware skip from a regression without parsing
+`detail`: `cause` is a stable code and `missing` lists what the host lacks.
+Other entries carry neither field.
+
+```json
+{"id": "win-rdp", "state": "vulnerable", "reason": "requires",
+ "detail": "needs a [windows] container host; this host is linux",
+ "cause": "host_os", "missing": ["windows"]}
+```
+
+| cause | missing | meaning |
+| --- | --- | --- |
+| `host_os` | the accepted OSes | the daemon OS is not in `requires.host_os` |
+| `kvm` | `["kvm"]` | `requires.kvm` on a host that is not linux/amd64 |
+| `arch` | the accepted arches | the host arch is not in `requires.arch` and `emulation` is off |
+| `emulation` | the accepted arches | emulation is allowed, but the daemon (not linux) cannot emulate |
+
 The document is printed on failure and on Ctrl-C too, and the exit code is
 unchanged: non-zero whenever anything failed or was interrupted. The same holds
 for the bare `run -json` array: once the selection is resolved it is printed

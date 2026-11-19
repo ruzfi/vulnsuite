@@ -235,7 +235,7 @@ only (pulls and pushes).`,
 				d := runner.Preflight(j.Contract.Requires, host)
 				if d.Skip() && !ignoreRequires {
 					g.errorf("skip %s [%s]: %s\n", j.Contract.ID(), j.State, d.Reason)
-					skipped = append(skipped, outcomeEntry{ID: j.Contract.ID(), State: j.State, Reason: reasonRequires, Detail: d.Reason})
+					skipped = append(skipped, requiresSkip(j.Contract.ID(), j.State, d))
 					continue
 				}
 				if d.Action == runner.ActionEmulated && platform == "" {
