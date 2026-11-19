@@ -123,7 +123,7 @@ func kevAgeNote(src kev.Source, now time.Time) string {
 func cmdList() *Command {
 	var f filters
 	var groupFilter string
-	var variants bool
+	var variants, runnable bool
 	return &Command{
 		Name: "list", Aliases: []string{"ls", "search"},
 		Short: "list and filter templates by class, KEV, product surface, CVE and year",
@@ -164,6 +164,7 @@ gets a warning. Offline with neither present, KEV is shown as "?" and
 			f.register(fs)
 			fs.StringVar(&groupFilter, "group", "", "only members of this variant group (shows the whole family)")
 			fs.BoolVar(&variants, "variants", false, "expand variant groups to all members (default: collapse each group to its primary)")
+			fs.BoolVar(&runnable, "runnable", false, "only templates whose requires the current daemon meets (asks the daemon; see `vulnsuite host`)")
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
 			if err := f.validate(); err != nil {
@@ -232,6 +233,21 @@ gets a warning. Offline with neither present, KEV is shown as "?" and
 			if err != nil {
 				return err
 			}
+			// -runnable preflights each template's requires against the
+			// daemon, as run does (CPU flags read once, only if needed).
+			var pf *preflighter
+			if runnable {
+				eng, err := g.Engine(ctx)
+				if err != nil {
+					return err
+				}
+				host, err := eng.Info(ctx)
+				if err != nil {
+					return err
+				}
+				pf = &preflighter{ctx: ctx, g: g, eng: eng, host: host}
+			}
+			hidden := 0
 			rows := []listRow{} // -json prints [] (not null) when nothing matches
 			unloadable := 0
 			for _, p := range paths {
@@ -248,6 +264,10 @@ gets a warning. Offline with neither present, KEV is shown as "?" and
 					continue
 				}
 				if !f.match(store, c, p, kevSet, kevKnown) {
+					continue
+				}
+				if pf != nil && !c.Requires.Empty() && pf.decide(c.Requires).Skip() {
+					hidden++
 					continue
 				}
 				onKEV := kevSet.Any(c.CVEs())
@@ -319,6 +339,9 @@ gets a warning. Offline with neither present, KEV is shown as "?" and
 			}
 			tw.Flush()
 			g.printf("\n%d templates in %s\n", len(rows), store.Root)
+			if runnable {
+				g.printf("-runnable: %d hidden that this daemon cannot run (requires.probe is not evaluated: it needs the image)\n", hidden)
+			}
 			g.printf("KEV source: %s%s\n", kevSrc, kevAgeNote(kevSrc, now))
 			if anyHostAccess(rows) {
 				g.printf("* needs host access (device/elevated capability); run with -allow-host-access, and only for templates you trust.\n")
