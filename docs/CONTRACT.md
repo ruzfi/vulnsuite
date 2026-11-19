@@ -237,7 +237,9 @@ own:
   The Dockerfile and `.dockerignore` are always sent, as with `docker build`.
 - `overlay[].dest` is a plain path: letters, digits and `. _ @ % + = : , / -`,
   no whitespace, quotes, `$` or control characters, no `..` segments, and not
-  `/` itself. For an `image` base it must be absolute.
+  `/` itself. It names the file, so it may not end in `/` or `/.` (an `image`
+  base would copy into that directory, a `source`/`build` base would write a
+  file). For an `image` base it must be absolute.
 - `overlay[].mode` is four octal digits starting with `0` (`"0755"`): plain
   permission bits only, no setuid, setgid or sticky bit. It is set on the file
   in the build context's tar header, never through a generated `RUN` line.
