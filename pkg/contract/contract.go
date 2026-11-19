@@ -478,14 +478,21 @@ type Requires struct {
 	// KVM marks a target that needs /dev/kvm + nested virtualization (e.g. a
 	// Windows guest via dockur/windows); only a linux/amd64 host provides it.
 	KVM bool `yaml:"kvm,omitempty" json:"kvm,omitempty"`
+	// CPUFlags are CPU feature flags the daemon's machine must have, as Linux
+	// names them in /proc/cpuinfo (e.g. avx512vbmi, bmi2; "Features" on
+	// arm64). They rule out emulation: qemu does not provide them.
+	CPUFlags []string `yaml:"cpu_flags,omitempty" json:"cpu_flags,omitempty"`
 }
 
-// EmulationAllowed reports whether qemu emulation is permitted (default true).
-func (r Requires) EmulationAllowed() bool { return r.Emulation == nil || *r.Emulation }
+// EmulationAllowed reports whether qemu emulation is permitted (default true;
+// never with CPUFlags, which emulation cannot provide).
+func (r Requires) EmulationAllowed() bool {
+	return len(r.CPUFlags) == 0 && (r.Emulation == nil || *r.Emulation)
+}
 
 // Empty reports whether no requirements are declared.
 func (r Requires) Empty() bool {
-	return len(r.HostOS) == 0 && len(r.Arch) == 0 && r.Emulation == nil && !r.KVM
+	return len(r.HostOS) == 0 && len(r.Arch) == 0 && r.Emulation == nil && !r.KVM && len(r.CPUFlags) == 0
 }
 
 // Contract is a fully loaded target template.

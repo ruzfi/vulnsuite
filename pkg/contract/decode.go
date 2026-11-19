@@ -107,6 +107,7 @@ var (
 	deviceRe   = regexp.MustCompile(`^/dev/[a-zA-Z0-9/_-]+$`)
 	modeRe     = regexp.MustCompile(`^0[0-7]{3}$`)
 	timeoutRe  = regexp.MustCompile(`^\d+[smh]$`)
+	cpuFlagRe  = regexp.MustCompile(`^[a-z0-9_]+$`)
 	severities = map[string]bool{"info": true, "low": true, "medium": true, "high": true, "critical": true}
 	protocols  = map[string]bool{"http": true, "https": true, "tcp": true, "ssh": true, "ftp": true,
 		"smtp": true, "redis": true, "mysql": true, "postgres": true}
@@ -314,6 +315,16 @@ func (c *Contract) checkStructure(present map[string]any) error {
 		if !arches[a] {
 			return se(fmt.Sprintf("requires/arch/%d", i), "%q is not a known GOARCH (amd64, arm64, ...)", a)
 		}
+	}
+	seenFlag := map[string]bool{}
+	for i, f := range c.Requires.CPUFlags {
+		if !cpuFlagRe.MatchString(f) {
+			return se(fmt.Sprintf("requires/cpu_flags/%d", i), "%q is not a /proc/cpuinfo flag name (lower-case letters, digits, _)", f)
+		}
+		if seenFlag[f] {
+			return se(fmt.Sprintf("requires/cpu_flags/%d", i), "%q is listed more than once", f)
+		}
+		seenFlag[f] = true
 	}
 
 	s := c.Service

@@ -2,6 +2,7 @@ package runner
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/ruzfi/vulnsuite/pkg/contract"
 	"github.com/ruzfi/vulnsuite/pkg/engine"
@@ -21,6 +22,7 @@ const (
 	CauseKVM       = "kvm"       // requires.kvm on a host that cannot provide it
 	CauseArch      = "arch"      // the host arch is not in requires.arch and emulation is off
 	CauseEmulation = "emulation" // emulation is allowed, but this host cannot emulate
+	CauseCPUFlags  = "cpu_flags" // the daemon lacks requires.cpu_flags, or they could not be read
 )
 
 // Decision is the outcome of checking a target's requirements against a host.
@@ -66,10 +68,15 @@ func Preflight(req contract.Requires, host engine.HostInfo) Decision {
 
 	// Arch: native when the host arch is accepted (or none is required).
 	if len(req.Arch) == 0 || contains(req.Arch, hostArch) {
-		return Decision{Action: ActionNative}
+		return cpuFlags(req, host)
 	}
 
 	// Host arch not accepted: emulate on linux when allowed, else skip.
+	if len(req.CPUFlags) > 0 {
+		return skip(CauseArch, req.Arch,
+			"needs host arch %v with CPU flags %s, which rule out emulation (qemu does not provide them); this host is %s/%s",
+			req.Arch, strings.Join(req.CPUFlags, ","), hostOS, hostArch)
+	}
 	if !req.EmulationAllowed() {
 		return skip(CauseArch, req.Arch,
 			"needs host arch %v and emulation is off; this host is %s/%s", req.Arch, hostOS, hostArch)
@@ -80,6 +87,48 @@ func Preflight(req contract.Requires, host engine.HostInfo) Decision {
 	}
 	return Decision{Action: ActionEmulated, Platform: "linux/" + req.Arch[0], Reason: fmt.Sprintf(
 		"host is %s/%s; running %s image under emulation (slower)", hostOS, hostArch, req.Arch[0])}
+}
+
+// cpuFlags decides a target that runs natively on the host's arch: it runs
+// when the daemon has every flag in requires.cpu_flags. Flags that were not
+// (or could not be) read skip it, naming them all: a target that needs them
+// fails on a host without them, which must not look like a broken template.
+func cpuFlags(req contract.Requires, host engine.HostInfo) Decision {
+	if len(req.CPUFlags) == 0 {
+		return Decision{Action: ActionNative}
+	}
+	want := strings.Join(req.CPUFlags, ",")
+	if !host.CPUFlagsKnown {
+		why := "they were not read"
+		if host.CPUFlagsError != "" {
+			why = "could not read them: " + host.CPUFlagsError
+		}
+		return skip(CauseCPUFlags, req.CPUFlags, "needs CPU flags %s; the daemon's flags are unknown (%s)", want, why)
+	}
+	var missing, present []string
+	for _, f := range req.CPUFlags {
+		if contains(host.CPUFlags, f) {
+			present = append(present, f)
+		} else {
+			missing = append(missing, f)
+		}
+	}
+	if len(missing) == 0 {
+		return Decision{Action: ActionNative}
+	}
+	has := "none of them"
+	if len(present) > 0 {
+		has = strings.Join(present, ",")
+	}
+	return skip(CauseCPUFlags, missing, "needs CPU flags [%s]; daemon has %s", strings.Join(missing, " "), has)
+}
+
+// NeedsCPUFlags reports whether deciding req on host needs the daemon's CPU
+// flags, which are not read yet: everything else in req is met. A caller reads
+// them (ReadCPUFlags) only then, once, and decides again.
+func NeedsCPUFlags(req contract.Requires, host engine.HostInfo) bool {
+	return len(req.CPUFlags) > 0 && !host.CPUFlagsKnown && host.CPUFlagsError == "" &&
+		Preflight(req, host).Cause == CauseCPUFlags
 }
 
 func contains(list []string, v string) bool {

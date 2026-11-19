@@ -181,7 +181,7 @@ Exposure modes:
 			fs.StringVar(&platform, "platform", "", "target platform for builds, e.g. linux/amd64")
 			fs.StringVar(&readyTimeout, "ready-timeout", "", "override every template's healthcheck timeout, e.g. 120s")
 			fs.StringVar(&nucleiDir, "nuclei-templates", "", "nuclei-templates checkout used to resolve the scanner templates shown for each target")
-			fs.BoolVar(&ignoreRequires, "ignore-requires", false, "run even when the host does not meet a target's requires (arch/kvm/host_os)")
+			fs.BoolVar(&ignoreRequires, "ignore-requires", false, "run even when the host does not meet a target's requires (arch/kvm/host_os/cpu_flags)")
 			fs.BoolVar(&allowHostAccess, "allow-host-access", false, "honor a template's host device passthrough and elevated capabilities (host-access primitives; only for templates you trust)")
 			fs.BoolVar(&summary, "summary", false, "with -json, print {targets, failed, skipped} instead of the bare array of started targets")
 		},
@@ -307,9 +307,10 @@ Exposure modes:
 			var skippedReq, skippedHost []string
 			platformFor := map[*contract.Contract]string{}
 			eligible := runnable[:0:0]
+			pf := &preflighter{ctx: ctx, g: g, eng: eng, host: host, noPull: noPull, noRead: ignoreRequires}
 			for _, c := range runnable {
 				if !c.Requires.Empty() {
-					d := runner.Preflight(c.Requires, host)
+					d := pf.decide(c.Requires)
 					switch {
 					case d.Skip() && !ignoreRequires:
 						g.printf("skip %s: %s\n", c.ID(), d.Reason)

@@ -75,9 +75,11 @@ type listRow struct {
 	DetectedBy []string       `json:"detected_by,omitempty"`
 	Tags       []string       `json:"tags,omitempty"`
 	HostAccess bool           `json:"host_access,omitempty"`
-	Summary    string         `json:"summary"`
-	Path       string         `json:"path"`
-	Error      string         `json:"error,omitempty"`
+	// Requires is the template's requires block (absent when it has none).
+	Requires *contract.Requires `json:"requires,omitempty"`
+	Summary  string             `json:"summary"`
+	Path     string             `json:"path"`
+	Error    string             `json:"error,omitempty"`
 }
 
 // kevSourceInfo is the KEV data's provenance and age, for list -json.
@@ -260,6 +262,10 @@ gets a warning. Offline with neither present, KEV is shown as "?" and
 					HostAccess: runner.HostAccessReason(c) != "",
 					Summary:    c.Metadata.Summary, Path: p,
 				}
+				if !c.Requires.Empty() {
+					req := c.Requires
+					row.Requires = &req
+				}
 				if kevKnown {
 					v := onKEV
 					row.KEV = &v
@@ -284,10 +290,10 @@ gets a warning. Offline with neither present, KEV is shown as "?" and
 				return nil
 			}
 			tw := tabwriter.NewWriter(g.Stdout, 2, 4, 2, ' ', 0)
-			fmt.Fprintln(tw, "ID\tCATEGORY\tGROUP\tSEV\tCLASS\tCVE\tKEV\tFIDELITY\tKIND\tREFS\tDETECTED BY")
+			fmt.Fprintln(tw, "ID\tCATEGORY\tGROUP\tSEV\tCLASS\tCVE\tKEV\tFIDELITY\tKIND\tREQUIRES\tREFS\tDETECTED BY")
 			for _, r := range rows {
 				if r.Error != "" {
-					fmt.Fprintf(tw, "%s\t-\t-\t-\t-\t-\t-\t-\t-\t-\t(unloadable: %s)\n", r.ID, r.Error)
+					fmt.Fprintf(tw, "%s\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t(unloadable: %s)\n", r.ID, r.Error)
 					continue
 				}
 				det := strings.Join(r.DetectedBy, ",")
@@ -303,9 +309,13 @@ gets a warning. Offline with neither present, KEV is shown as "?" and
 				if r.HostAccess {
 					kind += "*"
 				}
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				req := "-"
+				if r.Requires != nil {
+					req = requiresText(*r.Requires)
+				}
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 					r.ID, dash(r.Category), groupCell(r, expanded), r.Severity, dash(strings.Join(r.Class, ",")),
-					yesNo(r.CVE), kevCell(r.KEV), r.Fidelity, kind, strings.Join(r.VulnRefs, ","), det)
+					yesNo(r.CVE), kevCell(r.KEV), r.Fidelity, kind, req, strings.Join(r.VulnRefs, ","), det)
 			}
 			tw.Flush()
 			g.printf("\n%d templates in %s\n", len(rows), store.Root)

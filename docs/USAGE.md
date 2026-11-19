@@ -309,6 +309,7 @@ Other entries carry neither field.
 | `kvm` | `["kvm"]` | `requires.kvm` on a host that is not linux/amd64 |
 | `arch` | the accepted arches | the host arch is not in `requires.arch` and `emulation` is off |
 | `emulation` | the accepted arches | emulation is allowed, but the daemon (not linux) cannot emulate |
+| `cpu_flags` | the flags the daemon lacks (all of them when its flags could not be read) | the daemon's machine lacks `requires.cpu_flags` |
 
 The document is printed on failure and on Ctrl-C too, and the exit code is
 unchanged: non-zero whenever anything failed or was interrupted. The same holds
@@ -472,12 +473,17 @@ bare-OS / device / protocol flaws with no reproducible image. `vulnsuite list
 -fidelity real|simulated` filters them.
 
 A target that only runs on a particular host declares a **`requires`** block
-(host `arch`, `/dev/kvm`, container-host `host_os`). `vulnsuite run` and
+(host `arch`, `/dev/kvm`, container-host `host_os`, `cpu_flags`). `vulnsuite run` and
 `build` preflight it against the daemon's OS/arch and **skip with a reason**
 rather than hanging -- so a KVM / Windows-VM target is skipped cleanly on an
 Apple Silicon Mac -- or run cross-arch images under emulation (`-platform`).
+A target with `cpu_flags` (e.g. AVX-512 VBMI) is skipped, naming the missing
+flags, on a daemon without them; the flags are read from the daemon's machine
+in a small pinned `busybox` container, only when a selected target sets them
+(see [CONTRACT.md](CONTRACT.md#requires)).
 `-ignore-requires` overrides; `list -arch <a>` hides targets that can't run on
-that arch. See [CONTRACT.md](CONTRACT.md).
+that arch, and `list` and `info` show each template's requires (the REQUIRES
+column, `requires` in `list -json`). See [CONTRACT.md](CONTRACT.md).
 
 ## Container hardening
 

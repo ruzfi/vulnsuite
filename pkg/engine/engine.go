@@ -128,6 +128,16 @@ type Network struct {
 type HostInfo struct {
 	OS   string // linux, windows
 	Arch string // amd64, arm64, ...
+	// CPUFlags are the CPU feature flags of the daemon's machine as its
+	// /proc/cpuinfo lists them ("flags" on x86, "Features" on arm64). Info
+	// does not fill them: the daemon's API does not report them, and reading
+	// them takes a container (runner.ReadCPUFlags). They are meaningful only
+	// when CPUFlagsKnown is set.
+	CPUFlags      []string
+	CPUFlagsKnown bool
+	// CPUFlagsError says why reading the flags failed ("" when they were
+	// read, or not tried).
+	CPUFlagsError string
 }
 
 // Engine is the container backend.

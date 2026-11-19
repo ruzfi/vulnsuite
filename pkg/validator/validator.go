@@ -87,6 +87,12 @@ func (v *Validator) requires(c *contract.Contract) []Finding {
 				"service.devices has /dev/kvm but requires.kvm is not set; add requires.kvm (and arch: [amd64]) so hosts without it skip cleanly"})
 		}
 	}
+	// cpu_flags rule out emulation (qemu does not provide them), so an
+	// explicit emulation: true next to them is contradicted and ignored.
+	if len(c.Requires.CPUFlags) > 0 && c.Requires.Emulation != nil && *c.Requires.Emulation {
+		out = append(out, Finding{Warning, c.ID(), "cpu-flags-with-emulation",
+			"requires.emulation is true but requires.cpu_flags is set, which rules emulation out (qemu does not provide CPU flags); drop emulation: true"})
+	}
 	return out
 }
 

@@ -120,7 +120,7 @@ var cases = []conformanceCase{
 			t.Fatalf("Ping = %q, %v", v, err)
 		}
 		info, err := h.eng.Info(bg(t))
-		if err != nil || info != (engine.HostInfo{OS: "linux", Arch: "amd64"}) {
+		if err != nil || !reflect.DeepEqual(info, engine.HostInfo{OS: "linux", Arch: "amd64"}) {
 			t.Fatalf("Info = %+v, %v; want linux/amd64", info, err)
 		}
 	}},
