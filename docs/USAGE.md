@@ -368,7 +368,12 @@ metadata:
 nuclei-templates checkout on the machine (`$NUCLEI_TEMPLATES`,
 `~/nuclei-templates`, or `-nuclei-templates DIR`) the ids are resolved to
 files, templates matching the target's CVEs that nobody declared yet are
-suggested, and `vulnsuite validate` warns about ids that don't exist:
+suggested, and `vulnsuite validate` warns about ids that don't exist. The
+checkout's index is cached in the user cache directory
+(`vulnsuite/nuclei-index-*.json`) and rebuilt whenever a template file is
+added, removed or changed (by path, size and modification time), so only the
+first run after a `git pull` pays for indexing; `run -q`, which prints no
+scanner lines, skips it:
 
 ```text
 $ vulnsuite info ssh-version-cve-2018-15473
