@@ -239,6 +239,28 @@ var cases = []conformanceCase{
 		}
 		mustExist(t, h, img, "", false)
 	}},
+	{"stream_error_in_one_form_is_error", func(t *testing.T, h *harness) {
+		// dockerd sends both "error" and "errorDetail"; a compatible daemon or
+		// proxy may send only one, and either alone must fail the operation.
+		for _, form := range []string{"error", "errorDetail"} {
+			h.streamErrorForm(t, form)
+			ref := "registry.example/vs/" + strings.ToLower(form) + ":1"
+			h.failPull(ref, "pull failed: "+form)
+			if err := h.eng.ImagePull(bg(t), ref, "", nil); !contains(err, "pull failed: "+form) {
+				t.Errorf("%s: ImagePull error = %v, want the stream's message", form, err)
+			}
+			h.failBuild("build failed: " + form)
+			if err := h.eng.ImageBuild(bg(t), engine.BuildOptions{Context: tarOf(t, map[string]string{"Dockerfile": "FROM scratch\n"}), Tags: []string{ref}}, nil); !contains(err, "build failed: "+form) {
+				t.Errorf("%s: ImageBuild error = %v, want the stream's message", form, err)
+			}
+			h.failBuild("")
+			h.seedImage(ref, "")
+			h.failPush(t, ref, "push failed: "+form)
+			if err := h.eng.ImagePush(bg(t), ref, nil); !contains(err, "push failed: "+form) {
+				t.Errorf("%s: ImagePush error = %v, want the stream's message", form, err)
+			}
+		}
+	}},
 	{"image_build_removes_intermediate_containers", func(t *testing.T, h *harness) {
 		h.needsDaemon(t)
 		if err := h.eng.ImageBuild(bg(t), engine.BuildOptions{Context: tarOf(t, nil), Tags: []string{img}}, nil); err != nil {
@@ -391,6 +413,24 @@ var cases = []conformanceCase{
 	{"container_start_missing_is_error", func(t *testing.T, h *harness) {
 		if err := h.eng.ContainerStart(bg(t), "vs-missing"); err == nil {
 			t.Fatal("starting a missing container must fail")
+		}
+	}},
+	{"container_start_running_is_noop", func(t *testing.T, h *harness) {
+		// dockerd answers 304 Not Modified; that is not an error.
+		id := run(t, h, engine.ContainerSpec{Name: "vs-a", Ports: []engine.PortBinding{{HostIP: "127.0.0.1", ContainerPort: 80}}})
+		before, err := h.eng.ContainerInspect(bg(t), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := h.eng.ContainerStart(bg(t), id); err != nil {
+			t.Fatalf("starting a running container: %v, want nil", err)
+		}
+		after, err := h.eng.ContainerInspect(bg(t), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !after.Running || after.Ports["80/tcp"] != before.Ports["80/tcp"] {
+			t.Fatalf("after a second start the container inspects as %+v, want it running with its ports unchanged (%v)", after, before.Ports)
 		}
 	}},
 	{"container_inspect_missing_is_error", func(t *testing.T, h *harness) {

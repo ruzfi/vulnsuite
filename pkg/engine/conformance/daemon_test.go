@@ -43,9 +43,14 @@ type daemon struct {
 	builds   []buildRecord
 	buildErr string            // every build fails with this when set
 	pullErr  map[string]string // ref -> error reported in the pull stream
-	waitErr  map[string]string // container name -> wait Error.Message
-	logs     string
-	execFn   func(container string, cmd []string) (int, string)
+	pushErr  map[string]string // ref -> error reported in the push stream
+	// errForm is how stream errors are reported: "" for both the "error"
+	// string and the "errorDetail" object (as dockerd does), or only one of
+	// "error" / "errorDetail" (as other compatible daemons and proxies may).
+	errForm string
+	waitErr map[string]string // container name -> wait Error.Message
+	logs    string
+	execFn  func(container string, cmd []string) (int, string)
 }
 
 type stubImage struct {
@@ -121,6 +126,7 @@ func newDaemon(t *testing.T) *daemon {
 		networks:   map[string]*stubNetwork{},
 		execs:      map[string]*stubExec{},
 		pullErr:    map[string]string{},
+		pushErr:    map[string]string{},
 		waitErr:    map[string]string{},
 		nextPort:   49152,
 	}
@@ -238,7 +244,14 @@ func stream(w http.ResponseWriter, msgs ...any) {
 	}
 }
 
-func streamError(msg string) map[string]any {
+// streamError is a progress-stream failure in form (see daemon.errForm).
+func streamError(form, msg string) map[string]any {
+	switch form {
+	case "error":
+		return map[string]any{"error": msg}
+	case "errorDetail":
+		return map[string]any{"errorDetail": map[string]string{"message": msg}}
+	}
 	return map[string]any{"errorDetail": map[string]string{"message": msg}, "error": msg}
 }
 
@@ -372,12 +385,13 @@ func (d *daemon) imagePull(w http.ResponseWriter, r *http.Request) {
 	ref := joinRef(q.Get("fromImage"), q.Get("tag"))
 	d.mu.Lock()
 	msg, failing := d.pullErr[ref]
+	form := d.errForm
 	if !failing {
 		d.putImage(ref, q.Get("platform"))
 	}
 	d.mu.Unlock()
 	if failing {
-		stream(w, map[string]string{"status": "Pulling from " + q.Get("fromImage")}, streamError(msg))
+		stream(w, map[string]string{"status": "Pulling from " + q.Get("fromImage")}, streamError(form, msg))
 		return
 	}
 	stream(w,
@@ -415,7 +429,7 @@ func (d *daemon) imageBuild(w http.ResponseWriter, r *http.Request) {
 	}
 	d.mu.Lock()
 	d.builds = append(d.builds, rec)
-	failMsg := d.buildErr
+	failMsg, form := d.buildErr, d.errForm
 	if failMsg == "" {
 		for _, t := range rec.Tags {
 			d.putImage(t, rec.Platform)
@@ -423,7 +437,7 @@ func (d *daemon) imageBuild(w http.ResponseWriter, r *http.Request) {
 	}
 	d.mu.Unlock()
 	if failMsg != "" {
-		stream(w, map[string]string{"stream": "Step 1/2 : FROM scratch\n"}, map[string]string{"stream": " ---> Running in 0123456789ab\n"}, streamError(failMsg))
+		stream(w, map[string]string{"stream": "Step 1/2 : FROM scratch\n"}, map[string]string{"stream": " ---> Running in 0123456789ab\n"}, streamError(form, failMsg))
 		return
 	}
 	stream(w, map[string]string{"stream": "Step 1/1 : FROM scratch\n"}, map[string]string{"stream": "Successfully tagged " + strings.Join(rec.Tags, ",") + "\n"})
@@ -451,9 +465,15 @@ func (d *daemon) imagePush(w http.ResponseWriter, r *http.Request, repo string) 
 	ref := joinRef(repo, r.URL.Query().Get("tag"))
 	d.mu.Lock()
 	_, ok := d.images[ref]
+	msg, failing := d.pushErr[ref]
+	form := d.errForm
 	d.mu.Unlock()
 	if !ok {
 		apiError(w, http.StatusNotFound, "An image does not exist locally with the tag: %s", repo)
+		return
+	}
+	if failing {
+		stream(w, map[string]string{"status": "The push refers to repository [" + repo + "]"}, streamError(form, msg))
 		return
 	}
 	stream(w, map[string]string{"status": "The push refers to repository [" + repo + "]"})
@@ -566,6 +586,12 @@ func (d *daemon) containers_(w http.ResponseWriter, r *http.Request, rest string
 	switch {
 	case action == "start" && r.Method == http.MethodPost:
 		d.mu.Lock()
+		if c.running {
+			// dockerd: starting a running container is 304 Not Modified.
+			d.mu.Unlock()
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
 		c.started, c.running = true, true
 		for i := range c.ports {
 			if c.ports[i].hostPort == "" || c.ports[i].hostPort == "0" {
