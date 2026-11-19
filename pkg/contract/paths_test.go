@@ -52,6 +52,9 @@ func TestParseRejectsEscapingPaths(t *testing.T) {
 		"dest ..":                             withVulnerable(minimal, "    overlay: [ { src: files/x, dest: /etc/../../x } ]\n"),
 		"dest root":                           withVulnerable(minimal, "    overlay: [ { src: files/x, dest: / } ]\n"),
 		"dest .. on build":                    withVulnerable(asBuild(minimal), "    overlay: [ { src: files/x, dest: ../x } ]\n"),
+		"dest trailing slash":                 withVulnerable(minimal, "    overlay: [ { src: files/x, dest: /usr/share/nginx/html/ } ]\n"),
+		"dest trailing slash-dot":             withVulnerable(minimal, "    overlay: [ { src: files/x, dest: /usr/share/nginx/html/. } ]\n"),
+		"dest trailing slash on build":        withVulnerable(asBuild(minimal), "    overlay: [ { src: files/x, dest: conf/ } ]\n"),
 		"env value newline":                   withVulnerable(minimal, "    environment: { A: \"x\\nRUN id\" }\n"),
 		"env value carriage ret":              withVulnerable(minimal, "    environment: { A: \"x\\rRUN id\" }\n"),
 		"env key newline":                     withVulnerable(minimal, "    environment: { \"A\\nRUN id\": x }\n"),
@@ -88,6 +91,7 @@ func TestParseAcceptsLocalPaths(t *testing.T) {
 	cases := map[string]string{
 		"overlay in files":       withVulnerable(minimal, "    overlay: [ { src: files/vuln/httpd.conf, dest: /usr/local/apache2/conf/httpd.conf, mode: \"0644\" } ]\n"),
 		"dotted dest":            withVulnerable(minimal, "    overlay: [ { src: files/x, dest: /usr/share/nginx/html/.git/config } ]\n"),
+		"dest ending in a dot":   withVulnerable(minimal, "    overlay: [ { src: files/x, dest: /etc/conf.d/a. } ]\n"),
 		"relative dest on build": withVulnerable(asBuild(minimal), "    overlay: [ { src: files/x, dest: Dockerfile }, { src: files/y, dest: VARIANT } ]\n"),
 		"patch on build":         withVulnerable(asBuild(minimal), "    patch: patches/fix.patch\n"),
 		"env with $ and quotes":  withVulnerable(minimal, "    environment: { PW: \"pa$word\", Q: \"a \\\"b\\\" c\", DOT.KEY: v }\n"),

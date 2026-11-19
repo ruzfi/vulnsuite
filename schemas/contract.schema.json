@@ -520,8 +520,8 @@
               },
               "dest": {
                 "type": "string",
-                "pattern": "^(?!(.*/)?\\.\\.(/|$))(?![/.]*$)[A-Za-z0-9._@%+=:,/-]+$",
-                "description": "Absolute path in the image (image base) or a path in the build context (source/build base). A plain path: letters, digits and . _ @ % + = : , / -; no whitespace, quotes, $ or control characters; no .. segments; not the root."
+                "pattern": "^(?!(.*/)?\\.\\.(/|$))(?![/.]*$)(?!.*/\\.?$)[A-Za-z0-9._@%+=:,/-]+$",
+                "description": "Absolute path in the image (image base) or a path in the build context (source/build base), naming the file. A plain path: letters, digits and . _ @ % + = : , / -; no whitespace, quotes, $ or control characters; no .. segments; not the root; no trailing / or /. (an image base would copy into that directory, a source/build base would write a file)."
               },
               "mode": {
                 "type": "string",
