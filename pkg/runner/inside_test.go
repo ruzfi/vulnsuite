@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -176,6 +177,9 @@ func deref(b *bool) any {
 // The listening check parses /proc/net/tcp{,6} with sh builtins: run it
 // against fixture files in a real shell.
 func TestListenScript(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the script runs inside Linux containers; Git Bash on Windows cannot read the fixture paths")
+	}
 	sh, err := exec.LookPath("sh")
 	if err != nil {
 		t.Skip("no sh")
