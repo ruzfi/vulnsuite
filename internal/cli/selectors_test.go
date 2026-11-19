@@ -25,7 +25,7 @@ kind: Target
 metadata:
   id: %s
   summary: demo
-  vuln_refs: [CVE-2026-1]%s
+  vuln_refs: [CVE-2026-0001]%s
 base: { kind: image, image: nginx:1, digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa }
 service: { ports: [ { container: 80, protocol: http } ] }
 states: { vulnerable: { verify: [ { http: { path: /, status: 200 } } ] } }

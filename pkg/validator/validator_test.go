@@ -253,9 +253,9 @@ func TestGroupChecks(t *testing.T) {
 
 	// Healthy group: one primary, unique variants, shared refs.
 	ok := []*contract.Contract{
-		groupMember(t, "php2shell-base", "php2shell", "", true, "CVE-2026-1"),
-		groupMember(t, "php2shell-waf", "php2shell", "waf-evasion", false, "CVE-2026-1"),
-		groupMember(t, "php2shell-chunked", "php2shell", "chunked", false, "CVE-2026-1"),
+		groupMember(t, "php2shell-base", "php2shell", "", true, "CVE-2026-0001"),
+		groupMember(t, "php2shell-waf", "php2shell", "waf-evasion", false, "CVE-2026-0001"),
+		groupMember(t, "php2shell-chunked", "php2shell", "chunked", false, "CVE-2026-0001"),
 	}
 	for rule := range rules(v.CheckAll(ok)) {
 		if strings.HasPrefix(rule, "group-") {
@@ -264,7 +264,7 @@ func TestGroupChecks(t *testing.T) {
 	}
 
 	// Single-member group (nickname): no primary needed, no variant needed.
-	nick := []*contract.Contract{groupMember(t, "redis-rce", "redis-nick", "", false, "CVE-2026-2")}
+	nick := []*contract.Contract{groupMember(t, "redis-rce", "redis-nick", "", false, "CVE-2026-0002")}
 	for rule := range rules(v.CheckAll(nick)) {
 		if strings.HasPrefix(rule, "group-") {
 			t.Fatalf("nickname fired %s", rule)
@@ -273,8 +273,8 @@ func TestGroupChecks(t *testing.T) {
 
 	// Zero primaries.
 	none := []*contract.Contract{
-		groupMember(t, "g-a", "g", "a", false, "CVE-2026-3"),
-		groupMember(t, "g-b", "g", "b", false, "CVE-2026-3"),
+		groupMember(t, "g-a", "g", "a", false, "CVE-2026-0003"),
+		groupMember(t, "g-b", "g", "b", false, "CVE-2026-0003"),
 	}
 	if rules(v.CheckAll(none))["group-no-primary"] != Error {
 		t.Fatal("zero primaries must be an error")
@@ -282,8 +282,8 @@ func TestGroupChecks(t *testing.T) {
 
 	// Multiple primaries.
 	two := []*contract.Contract{
-		groupMember(t, "g-a", "g", "a", true, "CVE-2026-3"),
-		groupMember(t, "g-b", "g", "b", true, "CVE-2026-3"),
+		groupMember(t, "g-a", "g", "a", true, "CVE-2026-0003"),
+		groupMember(t, "g-b", "g", "b", true, "CVE-2026-0003"),
 	}
 	if rules(v.CheckAll(two))["group-multiple-primaries"] != Error {
 		t.Fatal("two primaries must be an error")
@@ -291,8 +291,8 @@ func TestGroupChecks(t *testing.T) {
 
 	// Duplicate variant.
 	dup := []*contract.Contract{
-		groupMember(t, "g-a", "g", "same", true, "CVE-2026-3"),
-		groupMember(t, "g-b", "g", "same", false, "CVE-2026-3"),
+		groupMember(t, "g-a", "g", "same", true, "CVE-2026-0003"),
+		groupMember(t, "g-b", "g", "same", false, "CVE-2026-0003"),
 	}
 	if rules(v.CheckAll(dup))["group-duplicate-variant"] != Error {
 		t.Fatal("duplicate variant must be an error")
@@ -300,8 +300,8 @@ func TestGroupChecks(t *testing.T) {
 
 	// Non-primary member without a variant.
 	missing := []*contract.Contract{
-		groupMember(t, "g-a", "g", "", true, "CVE-2026-3"),
-		groupMember(t, "g-b", "g", "", false, "CVE-2026-3"),
+		groupMember(t, "g-a", "g", "", true, "CVE-2026-0003"),
+		groupMember(t, "g-b", "g", "", false, "CVE-2026-0003"),
 	}
 	if rules(v.CheckAll(missing))["group-variant-missing"] != Error {
 		t.Fatal("missing variant on a non-primary member must be an error")
@@ -309,8 +309,8 @@ func TestGroupChecks(t *testing.T) {
 
 	// Divergent vuln_refs: a soft warning.
 	diverge := []*contract.Contract{
-		groupMember(t, "g-a", "g", "a", true, "CVE-2026-3"),
-		groupMember(t, "g-b", "g", "b", false, "CVE-2026-9"),
+		groupMember(t, "g-a", "g", "a", true, "CVE-2026-0003"),
+		groupMember(t, "g-b", "g", "b", false, "CVE-2026-0009"),
 	}
 	if rules(v.CheckAll(diverge))["group-divergent-refs"] != Warning {
 		t.Fatal("divergent refs must warn")
@@ -318,11 +318,11 @@ func TestGroupChecks(t *testing.T) {
 
 	// group handle equal to a template id.
 	collide := []*contract.Contract{
-		groupMember(t, "php2shell", "other", "", true, "CVE-2026-3"),
-		groupMember(t, "other-a", "other", "a", false, "CVE-2026-3"),
+		groupMember(t, "php2shell", "other", "", true, "CVE-2026-0003"),
+		groupMember(t, "other-a", "other", "a", false, "CVE-2026-0003"),
 	}
 	// add a contract whose id equals the handle "other"
-	collide = append(collide, groupMember(t, "other", "solo", "", false, "CVE-2026-3"))
+	collide = append(collide, groupMember(t, "other", "solo", "", false, "CVE-2026-0003"))
 	if rules(v.CheckAll(collide))["group-id-collision"] != Error {
 		t.Fatal("group handle equal to an id must be an error")
 	}
@@ -332,8 +332,8 @@ func TestGroupMultiCategory(t *testing.T) {
 	cat := map[string]string{"web-g-a": "web-apps", "db-g-b": "databases"}
 	v := &Validator{CategoryOf: func(c *contract.Contract) string { return cat[c.ID()] }}
 	members := []*contract.Contract{
-		groupMember(t, "web-g-a", "g", "a", true, "CVE-2026-3"),
-		groupMember(t, "db-g-b", "g", "b", false, "CVE-2026-3"),
+		groupMember(t, "web-g-a", "g", "a", true, "CVE-2026-0003"),
+		groupMember(t, "db-g-b", "g", "b", false, "CVE-2026-0003"),
 	}
 	if rules(v.CheckAll(members))["group-multi-category"] != Warning {
 		t.Fatal("a group spanning two categories must warn")
