@@ -1000,22 +1000,16 @@ func (r *Runner) watchExit(ctx context.Context, container string, exited chan<- 
 
 func (r *Runner) waitReady(ctx context.Context, c *contract.Contract, h *Handle, timeout time.Duration) {
 	hc := c.Service.Healthcheck
-	running := func() bool {
-		det, err := r.Engine.ContainerInspect(ctx, h.Container)
-		return err == nil && det.Running
-	}
 	host, port := r.probeAddress(h, c)
 	if host == "" {
-		// Cannot reach it from here; the engine says whether it's running.
-		sleepCtx(ctx, 2*time.Second)
-		h.Ready = running()
+		// Cannot reach it from here: run the healthcheck inside the target.
+		h.Ready = r.waitReadyInside(ctx, c, h, time.Now().Add(timeout))
 		return
 	}
 	if probeFromHereFutile(h) {
 		// A remote daemon's loopback-published port never comes up here; don't
 		// burn the whole healthcheck timeout against it. verify explains.
-		sleepCtx(ctx, time.Second)
-		h.Ready = running()
+		h.Ready = r.waitReadyInside(ctx, c, h, time.Now().Add(timeout))
 		return
 	}
 	{
@@ -1023,7 +1017,7 @@ func (r *Runner) waitReady(ctx context.Context, c *contract.Contract, h *Handle,
 		// remote daemon publishes host ports on its own machine. A connection
 		// that is *refused* means the address is routable and the service just
 		// isn't up yet; a timeout / no-route means we can't reach it from here at
-		// all, so don't sit through the whole healthcheck.
+		// all, so check from inside the target instead.
 		reach := r.Reach
 		if reach == nil {
 			reach = probes.Reachability
@@ -1034,7 +1028,7 @@ func (r *Runner) waitReady(ctx context.Context, c *contract.Contract, h *Handle,
 				if h.Exposure.Mode != ModeHost {
 					h.IP = "" // verify will explain instead of failing
 				}
-				h.Ready = running()
+				h.Ready = r.waitReadyInside(ctx, c, h, time.Now().Add(timeout))
 				return
 			}
 		}
@@ -1063,6 +1057,97 @@ func (r *Runner) waitReady(ctx context.Context, c *contract.Contract, h *Handle,
 	default:
 		h.Ready = probes.WaitForPort(ctx, host, port, time.Until(deadline))
 	}
+}
+
+// Exit codes of the in-container healthcheck scripts.
+const (
+	insideReady    = 0
+	insideNotReady = 1
+	insideCannot   = 3 // the script cannot tell (no /proc/net/tcp)
+)
+
+// insidePoll is how often the in-container healthcheck runs.
+var insidePoll = 500 * time.Millisecond
+
+// waitReadyInside runs the healthcheck from inside the target's own network
+// namespace, for a target this machine cannot reach (internal mode on Docker
+// Desktop/OrbStack, macvlan, a remote daemon). Without it the target would be
+// ready as soon as it runs, and seeds would race the service's startup.
+//
+// A tcp (or default) healthcheck passes once something listens on the port,
+// read from /proc/net/tcp{,6} with POSIX sh builtins only, so it works in any
+// image with a shell. An http healthcheck uses curl when the image has it and
+// otherwise falls back to the listening check. An image the check cannot run in
+// (no shell, no /proc/net/tcp) gets the old answer: ready once it is running.
+func (r *Runner) waitReadyInside(ctx context.Context, c *contract.Contract, h *Handle, deadline time.Time) bool {
+	hc := c.Service.Healthcheck
+	port := c.Service.PrimaryPort().Container
+	if hc.TCP != nil && hc.TCP.Port != 0 {
+		port = hc.TCP.Port
+	}
+	cmd := listenScript(port)
+	if hc.HTTP != nil && h.Scheme != "" {
+		cmd = httpScript(h.Scheme, port, hc.HTTP.Path, hc.HTTP.Status)
+	}
+	running := func() bool {
+		det, err := r.Engine.ContainerInspect(ctx, h.Container)
+		return err == nil && det.Running
+	}
+	for first := true; ; first = false {
+		// At least one attempt, however short the timeout.
+		left := time.Until(deadline)
+		if (left <= 0 && !first) || ctx.Err() != nil {
+			return false
+		}
+		code, _, err := r.Engine.ContainerExec(ctx, h.Container, cmd, min(10*time.Second, max(left, 5*time.Second)))
+		switch {
+		case ctx.Err() != nil:
+			return false
+		case err == nil && code == insideReady:
+			return true
+		case err == nil && code == insideNotReady:
+			// not up yet
+		case err != nil && !running():
+			// Not started yet, or exited (the exit watcher then cancels ctx).
+		default:
+			// No shell (exec error, 126/127) or nothing to read: the check
+			// cannot run in this image.
+			return running()
+		}
+		sleepCtx(ctx, insidePoll)
+	}
+}
+
+// listenScript exits 0 when a TCP socket listens on port in the namespace it
+// runs in (state 0A in /proc/net/tcp or tcp6), 1 when none does, and 3 when
+// neither file can be read. POSIX sh builtins only: no cat, grep or awk.
+func listenScript(port int) string {
+	return fmt.Sprintf(`p=%04X; seen=; for f in /proc/net/tcp /proc/net/tcp6; do [ -r "$f" ] || continue; seen=1; `+
+		`while read -r _ l _ st _; do [ "$st" = 0A ] && [ "${l##*:}" = "$p" ] && exit 0; done < "$f"; done; `+
+		`[ -n "$seen" ] || exit 3; exit 1`, port)
+}
+
+// httpScript runs an http healthcheck with curl from inside the target, or the
+// listening check when the image has no curl. want 0 accepts any status.
+func httpScript(scheme string, port int, path string, want int) string {
+	if path == "" {
+		path = "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	url := fmt.Sprintf("%s://127.0.0.1:%d%s", scheme, port, path)
+	ok := `[ "$s" != 000 ]`
+	if want != 0 {
+		ok = fmt.Sprintf(`[ "$s" = %d ]`, want)
+	}
+	return fmt.Sprintf(`if command -v curl >/dev/null 2>&1; then s=$(curl -sk -o /dev/null -w '%%{http_code}' --max-time 5 %s); `+
+		`%s && exit 0; exit 1; fi; %s`, shellQuote(url), ok, listenScript(port))
+}
+
+// shellQuote quotes s as one sh word.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // sleepCtx sleeps for d or until ctx ends.
@@ -1098,18 +1183,21 @@ func (r *Runner) runProbes(ctx context.Context, c *contract.Contract, st *contra
 		h.VerifyDetail = "no verify probes declared"
 		return
 	}
+	exec := func(ctx context.Context, container, command string, timeout time.Duration) (int, string, error) {
+		return r.Engine.ContainerExec(ctx, container, command, timeout)
+	}
 	host, port := r.probeAddress(h, c)
 	if host == "" {
-		h.VerifyDetail = fmt.Sprintf("could not verify from this host in %s mode: the target's address lives on the Docker daemon's network, "+
+		r.runExecProbesOnly(ctx, st, h, exec, fmt.Sprintf("could not verify from this host in %s mode: the target's address lives on the Docker daemon's network, "+
 			"not this machine's (normal on Docker Desktop/OrbStack and macvlan, and whenever the daemon is remote). "+
-			"The target is up; scan it from a container on the same network, or use --expose host.", h.Exposure.Mode)
+			"The target is up; scan it from a container on the same network, or use --expose host.", h.Exposure.Mode))
 		return
 	}
 	if probeFromHereFutile(h) {
 		// The probe address resolves to our own loopback but the daemon, and so
 		// the target, is elsewhere. Report it as unreachable-from-here, not as a
 		// wrong state, and name the flag that fixes it.
-		h.VerifyDetail = remoteProbeHint(h)
+		r.runExecProbesOnly(ctx, st, h, exec, remoteProbeHint(h))
 		return
 	}
 	scheme := h.Scheme
@@ -1118,9 +1206,7 @@ func (r *Runner) runProbes(ctx context.Context, c *contract.Contract, st *contra
 	}
 	ok, results := probes.RunAll(ctx, st.Verify, probes.Target{
 		Host: host, Port: port, Scheme: scheme, Schemes: portSchemes(c), Container: h.Container, PortMap: hostPortMap(h),
-		Exec: func(ctx context.Context, container, command string, timeout time.Duration) (int, string, error) {
-			return r.Engine.ContainerExec(ctx, container, command, timeout)
-		},
+		Exec: exec,
 	})
 	if h.DaemonRemote && allTransportFailures(results) {
 		// Every probe failed to connect and the daemon is remote: the bound
@@ -1133,6 +1219,35 @@ func (r *Runner) runProbes(ctx context.Context, c *contract.Contract, st *contra
 	h.VerifyOK = &ok
 	h.Probes = results
 	h.VerifyDetail = probes.FormatResults(results)
+}
+
+// runExecProbesOnly verifies a target this machine cannot reach. exec probes
+// need no network path (they run inside the target through the engine), so
+// they run; the network probes are skipped and why says why. A failed exec
+// probe fails verify. When every probe is an exec probe and all pass, verify
+// passes; when network probes were skipped, the result is partial and VerifyOK
+// stays nil (not verified), with the exec results in the detail.
+func (r *Runner) runExecProbesOnly(ctx context.Context, st *contract.State, h *Handle, exec probes.ExecFunc, why string) {
+	var execs []contract.Probe
+	for _, p := range st.Verify {
+		if p.Kind() == "exec" {
+			execs = append(execs, p)
+		}
+	}
+	if len(execs) == 0 {
+		h.VerifyDetail = why
+		return
+	}
+	ok, results := probes.RunAll(ctx, execs, probes.Target{Container: h.Container, Exec: exec})
+	h.Probes = results
+	h.VerifyDetail = probes.FormatResults(results)
+	skipped := len(st.Verify) - len(execs)
+	if skipped > 0 {
+		h.VerifyDetail += fmt.Sprintf("\nskip %d network probe(s): %s", skipped, why)
+	}
+	if !ok || skipped == 0 {
+		h.VerifyOK = &ok
+	}
 }
 
 // portSchemes is the scheme of every declared container port ("" for raw TCP),

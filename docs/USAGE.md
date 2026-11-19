@@ -362,10 +362,14 @@ vulnsuite run -t <target> -expose host \
 ```
 
 On Docker Desktop the host cannot reach container IPs; vulnsuite notices and
-tells you to scan from a container or use `-expose host` instead of waiting
-out the healthcheck. The same is true when the daemon is remote (`internal`
-targets live on the daemon host's network, not yours) — there too, `-expose
-host -bind <daemon address>` gives you a scannable URL.
+tells you to scan from a container or use `-expose host`. The same is true when
+the daemon is remote (`internal` targets live on the daemon host's network, not
+yours) — there too, `-expose host -bind <daemon address>` gives you a scannable
+URL. The healthcheck then runs inside the target (it checks that the port
+listens, or, for an `http` healthcheck, asks `curl` when the image has it), so
+seeds still wait for the service; an image without a shell is taken as ready
+once it runs. `exec` verify probes still run, since they need no network path:
+a failing one fails verify, and the network probes are reported as skipped.
 
 ## Scanning the fleet (Nuclei or anything else)
 

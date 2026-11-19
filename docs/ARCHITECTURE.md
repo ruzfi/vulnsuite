@@ -52,8 +52,10 @@ implementation, not a change to the callers.
 cannot route to bridge IPs, on Linux and OrbStack it can. Rather than
 hard-coding an OS check, the runner classifies the first connection attempt:
 *refused* means routable but not up yet (keep waiting), a timeout / no route
-means unreachable (skip verification with an explanation instead of waiting
-out the healthcheck).
+means unreachable. Then the healthcheck runs inside the target through the
+engine's exec (a listening socket in `/proc/net/tcp`, or `curl` for an `http`
+healthcheck), and so do the `exec` verify probes; the network probes are
+skipped with an explanation.
 
 **State environment is baked into built images.** So a published image is a
 complete vulnerable (or patched) target on its own; the runner also passes
