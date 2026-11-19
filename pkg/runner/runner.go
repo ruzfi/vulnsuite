@@ -54,7 +54,39 @@ const (
 	// LabelSidecarNetwork names the private network a target state shares with
 	// its sidecars (only set when the template has sidecars).
 	LabelSidecarNetwork = "dev.vulnsuite.sidecar_network"
+	// LabelPorts records the ports a target publishes to a scanner, primary
+	// first, as "3000/http,8443/https,5432" (no scheme: raw TCP), so `targets`
+	// can address a running target without its template (FormatPortsLabel).
+	LabelPorts = "dev.vulnsuite.ports"
 )
+
+// FormatPortsLabel renders published ports as the LabelPorts value.
+func FormatPortsLabel(ports []contract.Port) string {
+	parts := make([]string, 0, len(ports))
+	for _, p := range ports {
+		v := strconv.Itoa(p.Container)
+		if s := p.Scheme(); s != "" {
+			v += "/" + s
+		}
+		parts = append(parts, v)
+	}
+	return strings.Join(parts, ",")
+}
+
+// ParsePortsLabel reads a LabelPorts value back as container ports with their
+// schemes, in order. Malformed entries are skipped.
+func ParsePortsLabel(v string) []PublishedPort {
+	out := []PublishedPort{}
+	for _, part := range strings.Split(v, ",") {
+		port, scheme, _ := strings.Cut(strings.TrimSpace(part), "/")
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			continue
+		}
+		out = append(out, PublishedPort{ContainerPort: n, Scheme: scheme})
+	}
+	return out
+}
 
 // Container roles.
 const (
@@ -429,6 +461,7 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 	if scNet != "" {
 		spec.Labels[LabelSidecarNetwork] = scNet
 	}
+	spec.Labels[LabelPorts] = FormatPortsLabel(c.Service.HostPublishPorts())
 	for _, d := range c.Service.Devices {
 		spec.Devices = append(spec.Devices, engine.Device{PathOnHost: d, PathInContainer: d})
 	}
@@ -1287,8 +1320,13 @@ type Target struct {
 	HostPort  int    `json:"host_port,omitempty"`
 	// Ports is every published port's host binding (host mode), by ascending
 	// container port. HostIP/HostPort above mirror the first. Scheme is unset
-	// here (the daemon doesn't know it); callers fill it from the template.
+	// here (the daemon doesn't know it); see Published.
 	Ports []PublishedPort `json:"ports,omitempty"`
+	// Published is the ports the target publishes to a scanner with their
+	// schemes, primary first, as recorded on the container at run time
+	// (LabelPorts). Nil for containers started before vulnsuite recorded them:
+	// callers then fall back to the template.
+	Published []PublishedPort `json:"published_ports,omitempty"`
 }
 
 // fleetMember classifies a listed container: whether vulnsuite manages it,
@@ -1335,6 +1373,9 @@ func (r *Runner) Running(ctx context.Context, network string) ([]Target, error) 
 			continue
 		}
 		t := Target{ID: id, State: state, Container: row.Name, Status: row.Status, Image: row.Image}
+		if v, ok := row.Labels[LabelPorts]; ok {
+			t.Published = ParsePortsLabel(v)
+		}
 		if det, err := r.Engine.ContainerInspect(ctx, row.Name); err == nil {
 			prefer := row.Labels[LabelNetwork]
 			if _, ok := det.IPs[prefer]; !ok || prefer == "" {

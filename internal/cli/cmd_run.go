@@ -814,10 +814,6 @@ the subnet. Non-HTTP targets come out as host:port for network templates.`,
 			default:
 				return usageError{fmt.Sprintf("unknown -by %q (auto, ip, alias or host)", by)}
 			}
-			store, err := g.Store()
-			if err != nil {
-				return err
-			}
 			eng, err := g.Engine(ctx)
 			if err != nil {
 				return err
@@ -829,9 +825,39 @@ the subnet. Non-HTTP targets come out as host:port for network templates.`,
 			if len(rows) == 0 {
 				return fmt.Errorf("no targets running.  start some with:  vulnsuite run -t <selector>")
 			}
-			byID, err := store.ByID()
-			if err != nil {
-				return err
+			// The published ports and schemes come from the container (recorded
+			// at run time), so a target whose template is outside the templates
+			// root, or no longer loads, is still addressable. Only containers
+			// from before that label fall back to the templates store.
+			var byID map[string]*contract.Contract
+			var storeRoot string
+			var storeErr error
+			loaded := false
+			portsOf := func(r runner.Target) ([]runner.PublishedPort, error) {
+				if r.Published != nil {
+					return r.Published, nil
+				}
+				if !loaded {
+					loaded = true
+					store, err := g.Store()
+					if err == nil {
+						storeRoot = store.Root
+						byID, err = store.ByID()
+					}
+					storeErr = err
+				}
+				if storeErr != nil {
+					return nil, fmt.Errorf("no ports recorded on the container and the templates store is unavailable: %v", storeErr)
+				}
+				c, ok := byID[r.ID]
+				if !ok {
+					return nil, fmt.Errorf("no ports recorded on the container and the template is not in %s", storeRoot)
+				}
+				var out []runner.PublishedPort
+				for _, pp := range c.Service.HostPublishPorts() {
+					out = append(out, runner.PublishedPort{ContainerPort: pp.Container, Scheme: pp.Scheme()})
+				}
+				return out, nil
 			}
 			type pair struct {
 				ID    string `json:"id"`
@@ -839,13 +865,15 @@ the subnet. Non-HTTP targets come out as host:port for network templates.`,
 				URL   string `json:"url"`
 			}
 			var pairs []pair
+			unresolved, noAddr := 0, 0
 			for _, r := range rows {
-				c, ok := byID[r.ID]
-				if !ok {
-					g.errorf("skip %s: template not found in %s\n", r.ID, store.Root)
+				published, err := portsOf(r)
+				if err != nil {
+					g.errorf("skip %s [%s]: %v (restart it with `vulnsuite run` to record its ports)\n", r.ID, r.State, err)
+					unresolved++
 					continue
 				}
-				published := c.Service.HostPublishPorts()
+				before := len(pairs)
 				// host mode (explicit, or auto when the target has host bindings):
 				// one row per actual host binding, primary first.
 				if by == "host" || (by == "auto" && len(r.Ports) > 0) {
@@ -854,30 +882,47 @@ the subnet. Non-HTTP targets come out as host:port for network templates.`,
 						bind[pb.ContainerPort] = pb
 					}
 					for _, pp := range published {
-						pb, ok := bind[pp.Container]
+						pb, ok := bind[pp.ContainerPort]
 						if !ok {
 							continue
 						}
 						pairs = append(pairs, pair{r.ID, r.State,
-							runner.FormatTarget(pp.Scheme(), reportableHostIP(pb.HostIP), pb.HostPort)})
+							runner.FormatTarget(pp.Scheme, reportableHostIP(pb.HostIP), pb.HostPort)})
 					}
-					continue
+				} else {
+					// alias / ip (and auto with no host bindings): address each
+					// published container port at the alias or container IP.
+					for _, pp := range published {
+						host := r.IP
+						if by == "alias" {
+							host = runner.TargetAlias(r.ID, r.State)
+						}
+						if host == "" {
+							continue
+						}
+						pairs = append(pairs, pair{r.ID, r.State, runner.FormatTarget(pp.Scheme, host, pp.ContainerPort)})
+					}
 				}
-				// alias / ip (and auto with no host bindings): address each
-				// published container port at the alias or container IP.
-				for _, pp := range published {
-					host := r.IP
-					if by == "alias" {
-						host = runner.TargetAlias(r.ID, r.State)
-					}
-					if host == "" {
-						continue
-					}
-					pairs = append(pairs, pair{r.ID, r.State, runner.FormatTarget(pp.Scheme(), host, pp.Container)})
+				if len(pairs) == before {
+					noAddr++
 				}
 			}
 			if len(pairs) == 0 {
-				return fmt.Errorf("running targets have no resolvable address yet (try again in a moment, or -by alias)")
+				var why []string
+				if unresolved > 0 {
+					why = append(why, fmt.Sprintf("%d with no known ports (see above)", unresolved))
+				}
+				if noAddr > 0 {
+					hint := "no container ip on the network; try -by alias"
+					switch by {
+					case "host":
+						hint = "not published on the host; run with -expose host, or use -by ip / -by alias"
+					case "alias":
+						hint = "no published ports"
+					}
+					why = append(why, fmt.Sprintf("%d with no address -by %s (%s)", noAddr, by, hint))
+				}
+				return fmt.Errorf("no scannable address for the %d running target(s): %s", len(rows), strings.Join(why, "; "))
 			}
 			// -file is written whatever the output format, so
 			// `vulnsuite -json targets -file F && nuclei -l F` works.
