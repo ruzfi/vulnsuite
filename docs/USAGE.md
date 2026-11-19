@@ -223,6 +223,9 @@ vulnsuite build -t grafana -force -no-cache     # rebuild from scratch
 vulnsuite build -all -push -registry ghcr.io/you/vulnsuite
 ```
 
+`-registry` without `-push` is a usage error (it would do nothing), and a state
+named twice in `-state` is built once.
+
 Built images carry labels (`dev.vulnsuite.id`, `.state`, `.hash`,
 `.vuln_refs`) and bake the state's environment in, so a published image is
 self-contained: `docker run ghcr.io/you/vulnsuite/<id>:vulnerable` is the
@@ -315,6 +318,8 @@ removes the sidecars and their network along with the target.
 `vulnsuite ps`, `targets` and `stop` find containers by their
 `dev.vulnsuite.*` labels: `stop -t foo` stops exactly template `foo` (never
 `foo-bar`), and containers vulnsuite did not start are left alone.
+`stop -prune-net` also removes `vulnsuite-net`, which only makes sense when
+stopping everything; with a selector it is a usage error.
 
 **Ctrl-C.** Interrupting `run` while targets are starting stops the batch,
 removes what it had started and exits non-zero (`interrupted`). Interrupting a
@@ -329,13 +334,18 @@ makes a remote daemon usable. `vulnsuite targets` reports that bound address, so
 the URLs it prints work from the scanner's machine; a port bound to all
 interfaces (`-bind 0.0.0.0`) is reported as `127.0.0.1`.
 
+Flags that belong to another exposure mode are usage errors (exit 2) rather
+than being ignored: `-bind` outside `host` mode, and `-parent`, `-ip`,
+`-subnet` or `-gateway` outside `macvlan` mode.
+
 A template may publish more than one port: the primary is always published, and
 any port marked `publish: true` in the contract is published alongside it and
 added to the scanner target lists. `-host-port` pins the primary's host port;
 `-host-port-map container=host` pins an additional one (repeatable). Unpinned
 published ports get a free host port assigned by the Docker daemon (on its own
 machine, so this works with a remote daemon too), all reported by `ps`, `targets` and
-`-targets-file`:
+`-targets-file`. A `-host-port-map` key that is not a port the target publishes
+is a usage error:
 
 ```bash
 vulnsuite run -t <target> -expose host \

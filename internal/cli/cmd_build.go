@@ -28,7 +28,10 @@ func parseStates(s string) ([]string, error) {
 		if !has(contract.StateNames, p) {
 			return nil, usageError{fmt.Sprintf("unknown state %q (vulnerable, patched or all)", p)}
 		}
-		out = append(out, p)
+		// A state named twice is built (and pushed) once.
+		if !has(out, p) {
+			out = append(out, p)
+		}
 	}
 	return out, nil
 }
@@ -149,6 +152,9 @@ only (pulls and pushes).`,
 			}
 			if push && registry == "" {
 				return usageError{"-push needs -registry"}
+			}
+			if registry != "" && !push {
+				return usageError{"-registry is only used by -push; add -push to publish the images, or drop -registry"}
 			}
 			store, err := g.Store()
 			if err != nil {
