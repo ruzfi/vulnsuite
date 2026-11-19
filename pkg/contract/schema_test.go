@@ -32,7 +32,7 @@ var supportedKeywords = map[string]bool{
 	"items": true, "minItems": true, "uniqueItems": true,
 	"pattern": true, "minLength": true, "maxLength": true, "propertyNames": true,
 	"minimum": true, "maximum": true, "exclusiveMinimum": true,
-	"oneOf": true, "$ref": true, "$defs": true,
+	"oneOf": true, "not": true, "if": true, "then": true, "$ref": true, "$defs": true,
 	// annotations
 	"$schema": true, "$id": true, "title": true, "description": true,
 }
@@ -193,6 +193,10 @@ func TestSchemaChecker(t *testing.T) {
 		{`{"exclusiveMinimum":0}`, 0.5, true},
 		{`{"oneOf":[{"const":1},{"type":"number"}]}`, 1.0, false},
 		{`{"oneOf":[{"const":1},{"type":"string"}]}`, 1.0, true},
+		{`{"not":{"enum":["a"]}}`, "a", false},
+		{`{"not":{"enum":["a"]}}`, "b", true},
+		{`{"if":{"const":1},"then":{"type":"string"}}`, 1.0, false},
+		{`{"if":{"const":1},"then":{"type":"string"}}`, 2.0, true},
 		{`{"$ref":"#/$defs/n"}`, 0.0, false},
 		{`{"$ref":"#/$defs/n"}`, 2.0, true},
 	}
@@ -329,6 +333,14 @@ func schemaCheck(root, s map[string]any, v any, loc string) []string {
 		}
 		if n != 1 {
 			fail("matches %d of oneOf's %d schemas, want exactly 1", n, len(one))
+		}
+	}
+	if not, ok := s["not"].(map[string]any); ok && len(schemaCheck(root, not, v, loc)) == 0 {
+		fail("matches a schema it must not match")
+	}
+	if cond, ok := s["if"].(map[string]any); ok && len(schemaCheck(root, cond, v, loc)) == 0 {
+		if then, ok := s["then"].(map[string]any); ok {
+			errs = append(errs, schemaCheck(root, then, v, loc)...)
 		}
 	}
 	switch x := v.(type) {

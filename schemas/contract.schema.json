@@ -13,6 +13,43 @@
     "states"
   ],
   "additionalProperties": false,
+  "if": {
+    "required": [
+      "base"
+    ],
+    "properties": {
+      "base": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "enum": [
+              "source",
+              "build"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "then": {
+    "description": "A source or build base builds every state from its own source: a per-state image (and the digest pinning it) applies only to kind: image.",
+    "properties": {
+      "states": {
+        "additionalProperties": {
+          "propertyNames": {
+            "not": {
+              "enum": [
+                "image",
+                "digest"
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
   "properties": {
     "apiVersion": {
       "enum": [
@@ -447,12 +484,12 @@
       "properties": {
         "image": {
           "type": "string",
-          "description": "Per-state image override (reuse-if-matches): e.g. patched = a newer tag. Pin it with digest (`validate`: unpinned-state-image). Part of the content hash of an overlay build."
+          "description": "Per-state image override (reuse-if-matches): e.g. patched = a newer tag. Only for kind: image bases; a source or build base rejects it. Pin it with digest (`validate`: unpinned-state-image). Part of the content hash of an overlay build."
         },
         "digest": {
           "type": "string",
           "pattern": "^sha256:[0-9a-f]{64}$",
-          "description": "Digest pinning the state's image override."
+          "description": "Digest pinning the state's image override (kind: image bases only)."
         },
         "patch": {
           "type": "string",

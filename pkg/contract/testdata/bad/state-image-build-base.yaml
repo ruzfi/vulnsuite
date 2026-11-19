@@ -1,0 +1,15 @@
+# want: states/vulnerable/image: a per-state image applies only to kind: image
+apiVersion: vulnsuite/v1
+kind: Target
+metadata:
+  id: demo-target
+  summary: demo
+base:
+  kind: build
+  context: src
+service:
+  ports: [ { container: 80, protocol: http } ]
+states:
+  vulnerable:
+    image: nginx:1.25
+    digest: sha256:1111111111111111111111111111111111111111111111111111111111111111

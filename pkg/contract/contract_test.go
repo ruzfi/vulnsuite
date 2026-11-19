@@ -256,3 +256,34 @@ func TestDurations(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+// Issue #93 item 7: with several invalid states (or state sidecar overrides),
+// Parse reports the same error every time: names first, then the states in
+// canonical order, sidecar overrides by name. It used to range over the maps.
+func TestParseErrorsAreDeterministic(t *testing.T) {
+	badDigest := "    digest: sha256:zz\n"
+	cases := map[string]struct{ doc, want string }{
+		"two invalid states": {
+			strings.Replace(withVulnerable(minimal, badDigest), "    image: httpd:2.4.51\n", "    image: httpd:2.4.51\n"+badDigest, 1),
+			"states/vulnerable/digest",
+		},
+		"unknown and invalid state": {
+			withVulnerable(minimal, badDigest) + "  fixed: {}\n",
+			"states/fixed: unknown state",
+		},
+		"two invalid sidecar overrides": {
+			withVulnerable(strings.Replace(minimal, "  command: \"httpd-foreground\"\n",
+				"  command: \"httpd-foreground\"\n  sidecars: [ { name: a, image: x }, { name: b, image: y } ]\n", 1),
+				"    sidecars: { b: { image: \"\" }, a: { image: \"\" } }\n"),
+			"states/vulnerable/sidecars/a/image",
+		},
+	}
+	for name, tc := range cases {
+		for i := 0; i < 50; i++ {
+			_, err := Parse([]byte(tc.doc))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("%s (run %d): want an error containing %q, got %v", name, i, tc.want, err)
+			}
+		}
+	}
+}

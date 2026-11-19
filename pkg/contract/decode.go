@@ -338,15 +338,23 @@ func (c *Contract) checkStructure() error {
 	if len(c.States) == 0 || !c.HasState(StateVulnerable) {
 		return se("states/vulnerable", "is required")
 	}
-	for name, st := range c.States {
-		known := false
-		for _, n := range StateNames {
-			if n == name {
-				known = true
-			}
-		}
-		if !known {
+	// Check names before contents, and states in a fixed order, so a contract
+	// with several errors always reports the same one (ranging over the map
+	// would pick one at random).
+	names := make([]string, 0, len(c.States))
+	for name := range c.States {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if !has(StateNames, name) {
 			return se("states/"+name, "unknown state; only vulnerable and patched are allowed")
+		}
+	}
+	for _, name := range StateNames {
+		st, ok := c.States[name]
+		if !ok {
+			continue
 		}
 		if st == nil {
 			return se("states/"+name, "must be a mapping")
@@ -354,6 +362,17 @@ func (c *Contract) checkStructure() error {
 		loc := "states/" + name
 		if st.Digest != "" && !digestRe.MatchString(st.Digest) {
 			return se(loc+"/digest", "must look like sha256:<64 hex>")
+		}
+		// A source or build base builds every state from the same checkout or
+		// context; nothing runs FROM a state image there, so one would be
+		// silently ignored and "patched" would still be the vulnerable build.
+		if b.Kind != BaseImage {
+			if st.Image != "" {
+				return se(loc+"/image", "a per-state image applies only to kind: image; a %s base builds every state from its own source, so make the states differ with a patch or overlay", b.Kind)
+			}
+			if st.Digest != "" {
+				return se(loc+"/digest", "pins a per-state image, which applies only to kind: image")
+			}
 		}
 		if st.Patch != "" {
 			if err := checkLocalPath(st.Patch); err != nil {
@@ -379,7 +398,13 @@ func (c *Contract) checkStructure() error {
 				return se(loc+"/environment", "%v", err)
 			}
 		}
-		for scName, ov := range st.Sidecars {
+		scNames := make([]string, 0, len(st.Sidecars))
+		for scName := range st.Sidecars {
+			scNames = append(scNames, scName)
+		}
+		sort.Strings(scNames)
+		for _, scName := range scNames {
+			ov := st.Sidecars[scName]
 			if ov.Image == "" {
 				return se(fmt.Sprintf("%s/sidecars/%s/image", loc, scName), "is required")
 			}
