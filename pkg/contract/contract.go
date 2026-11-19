@@ -482,6 +482,33 @@ type Requires struct {
 	// names them in /proc/cpuinfo (e.g. avx512vbmi, bmi2; "Features" on
 	// arm64). They rule out emulation: qemu does not provide them.
 	CPUFlags []string `yaml:"cpu_flags,omitempty" json:"cpu_flags,omitempty"`
+	// Probe is a host check for what no dedicated field covers (a kernel
+	// version, cgroup v2, a sysctl, a device): a shell command run in the
+	// target's image before anything starts. A non-zero exit skips the target
+	// with Reason.
+	Probe *RequiresProbe `yaml:"probe,omitempty" json:"probe,omitempty"`
+}
+
+// DefaultRequiresProbeTimeout bounds a requires.probe without a timeout.
+const DefaultRequiresProbeTimeout = 30 * time.Second
+
+// RequiresProbe is requires.probe.
+type RequiresProbe struct {
+	// Run is a /bin/sh -c command; exit 0 means the host can run the target.
+	Run string `yaml:"run" json:"run"`
+	// Reason is the skip reason shown when Run exits non-zero.
+	Reason string `yaml:"reason" json:"reason"`
+	// Timeout bounds Run (<n>s|m|h, default 30s); running out fails the target.
+	Timeout string `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+}
+
+// TimeoutDuration is Timeout parsed (DefaultRequiresProbeTimeout when unset).
+func (p RequiresProbe) TimeoutDuration() time.Duration {
+	d, err := ParseDuration(p.Timeout, DefaultRequiresProbeTimeout)
+	if err != nil || d <= 0 {
+		return DefaultRequiresProbeTimeout
+	}
+	return d
 }
 
 // EmulationAllowed reports whether qemu emulation is permitted (default true;
@@ -492,7 +519,7 @@ func (r Requires) EmulationAllowed() bool {
 
 // Empty reports whether no requirements are declared.
 func (r Requires) Empty() bool {
-	return len(r.HostOS) == 0 && len(r.Arch) == 0 && r.Emulation == nil && !r.KVM && len(r.CPUFlags) == 0
+	return len(r.HostOS) == 0 && len(r.Arch) == 0 && r.Emulation == nil && !r.KVM && len(r.CPUFlags) == 0 && r.Probe == nil
 }
 
 // Contract is a fully loaded target template.

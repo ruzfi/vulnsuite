@@ -23,6 +23,7 @@ type portBinding struct {
 
 type createBody struct {
 	Image        string              `json:"Image"`
+	Entrypoint   []string            `json:"Entrypoint,omitempty"`
 	Cmd          []string            `json:"Cmd,omitempty"`
 	Env          []string            `json:"Env,omitempty"`
 	User         string              `json:"User,omitempty"`
@@ -60,7 +61,7 @@ type networkingConfig struct {
 
 // ContainerCreate creates (but does not start) a container.
 func (c *Client) ContainerCreate(ctx context.Context, spec engine.ContainerSpec) (string, error) {
-	body := createBody{Image: spec.Image, Cmd: spec.Cmd, Env: spec.Env, User: spec.User, Labels: spec.Labels}
+	body := createBody{Image: spec.Image, Entrypoint: spec.Entrypoint, Cmd: spec.Cmd, Env: spec.Env, User: spec.User, Labels: spec.Labels}
 	hc := &body.HostConfig
 	hc.CapAdd, hc.CapDrop, hc.SecurityOpt, hc.Binds, hc.AutoRemove = spec.CapAdd, spec.CapDrop, spec.SecurityOpt, spec.Binds, spec.AutoRemove
 	for _, d := range spec.Devices {

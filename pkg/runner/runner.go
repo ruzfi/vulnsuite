@@ -328,6 +328,10 @@ type Options struct {
 	// capabilities. Off by default: those are host-access primitives and
 	// templates are untrusted, so the user must opt in per run.
 	AllowHostAccess bool
+	// IgnoreRequires skips the template's requires.probe (-ignore-requires).
+	// Otherwise the probe runs once the image is resolved, before anything
+	// starts, and a failing probe makes Run return a *SkipError.
+	IgnoreRequires bool
 }
 
 // safeCaps are capabilities benign enough to add without host-access consent.
@@ -410,6 +414,17 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 	img, err := r.Builder.Resolve(ctx, c, state, opts.Build)
 	if err != nil {
 		return nil, err
+	}
+	// requires.probe needs the image, so it runs here: after the image is
+	// resolved, before any container, sidecar or network of the target.
+	if c.Requires.Probe != nil && !opts.IgnoreRequires {
+		d, err := RequiresProbe(ctx, r.Engine, c, state, img.Ref, opts.Build.Platform)
+		if err != nil {
+			return nil, err
+		}
+		if d.Skip() {
+			return nil, &SkipError{ID: c.ID(), Decision: d}
+		}
 	}
 	name := c.ContainerName(state)
 	port := c.Service.PrimaryPort()

@@ -326,6 +326,17 @@ func (c *Contract) checkStructure(present map[string]any) error {
 		}
 		seenFlag[f] = true
 	}
+	if p := c.Requires.Probe; p != nil {
+		if strings.TrimSpace(p.Run) == "" {
+			return se("requires/probe/run", "must be a non-empty shell command")
+		}
+		if strings.TrimSpace(p.Reason) == "" {
+			return se("requires/probe/reason", "must say what a host that fails the probe lacks")
+		}
+		if p.Timeout != "" && !timeoutRe.MatchString(p.Timeout) {
+			return se("requires/probe/timeout", "must look like 30s or 2m")
+		}
+	}
 
 	s := c.Service
 	if len(s.Ports) == 0 {

@@ -51,8 +51,11 @@ type NetworkAttachment struct {
 
 // ContainerSpec describes a container to create.
 type ContainerSpec struct {
-	Name        string
-	Image       string
+	Name  string
+	Image string
+	// Entrypoint replaces the image's entrypoint when set (the image's
+	// default command is then not used either: Cmd is all there is).
+	Entrypoint  []string
 	Cmd         []string
 	Env         []string
 	User        string

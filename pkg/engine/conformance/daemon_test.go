@@ -63,6 +63,7 @@ type stubImage struct {
 type stubContainer struct {
 	id, name, image string
 	labels          map[string]string
+	entrypoint, cmd []string
 	ports           []stubPort
 	networks        map[string]*stubEndpoint // network name -> endpoint
 	started         bool
@@ -561,6 +562,8 @@ func (d *daemon) imageRemove(w http.ResponseWriter, r *http.Request, ref string)
 func (d *daemon) containerCreate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Image      string
+		Entrypoint []string
+		Cmd        []string
 		Labels     map[string]string
 		HostConfig struct {
 			NetworkMode  string
@@ -597,7 +600,7 @@ func (d *daemon) containerCreate(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusNotFound, "network %s not found", mode)
 		return
 	}
-	c := &stubContainer{id: d.newID(), name: name, image: body.Image, labels: body.Labels, networks: map[string]*stubEndpoint{}}
+	c := &stubContainer{id: d.newID(), name: name, image: body.Image, labels: body.Labels, entrypoint: body.Entrypoint, cmd: body.Cmd, networks: map[string]*stubEndpoint{}}
 	if c.name == "" {
 		c.name = "auto_" + c.id[:6]
 	}
