@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -308,17 +309,32 @@ func (v *Validator) filesExist(c *contract.Contract) []Finding {
 			if df == "" {
 				df = "Dockerfile"
 			}
+			// A state may overlay its own Dockerfile into the context (the
+			// builder reads generated files first), so the context needs one
+			// only for the states that do not.
+			var lacking []string
+			for _, name := range c.DeclaredStates() {
+				if !overlaysFile(c.States[name], df) {
+					lacking = append(lacking, name)
+				}
+			}
+			missing := func() {
+				msg := "build context has no " + df
+				if len(lacking) < len(c.DeclaredStates()) {
+					msg += ", and it is not overlaid in: " + strings.Join(lacking, ", ")
+				}
+				out = append(out, Finding{Error, c.ID(), "missing-dockerfile", msg})
+			}
 			p, err := contract.ConfinedPath(ctx, df)
 			switch {
 			case errors.Is(err, contract.ErrPathEscapes):
 				escapes("dockerfile", df)
+			case len(lacking) == 0:
 			case err != nil:
-				out = append(out, Finding{Error, c.ID(), "missing-dockerfile",
-					"build context has no " + df})
+				missing()
 			default:
 				if info, err := os.Stat(p); err != nil || !info.Mode().IsRegular() {
-					out = append(out, Finding{Error, c.ID(), "missing-dockerfile",
-						"build context has no " + df})
+					missing()
 				}
 			}
 		}
@@ -343,6 +359,18 @@ func (v *Validator) filesExist(c *contract.Contract) []Finding {
 		}
 	}
 	return out
+}
+
+// overlaysFile reports whether st overlays a file at the build-context path
+// name, compared the way the builder places overlays in the context.
+func overlaysFile(st *contract.State, name string) bool {
+	clean := func(p string) string { return strings.TrimPrefix(path.Clean("/"+filepath.ToSlash(p)), "/") }
+	for _, o := range st.Overlay {
+		if clean(o.Dest) == clean(name) {
+			return true
+		}
+	}
+	return false
 }
 
 // safeCaps mirrors the runner's benign-capability allowlist.
@@ -375,13 +403,21 @@ func (v *Validator) states(c *contract.Contract) []Finding {
 		out = append(out, Finding{Warning, c.ID(), "no-patched",
 			"no patched state; a template is most useful with both, so a scanner's discrimination can be checked"})
 	}
-	if c.Base.Kind == contract.BaseSource {
+	// A source base builds every state from the one pinned commit, so the
+	// states differ only through a patch or an overlay. One state having it is
+	// enough (the usual shape: vulnerable is the commit, patched adds the fix);
+	// a state image is never read on a source base and makes no difference.
+	if c.Base.Kind == contract.BaseSource && c.HasPatched() {
+		differs := false
 		for _, name := range c.DeclaredStates() {
 			st := c.States[name]
-			if st.Patch == "" && st.Image == "" {
-				out = append(out, Finding{Warning, c.ID(), "source-no-diff",
-					name + ": source base but no patch or image override; vulnerable and patched may build identically"})
+			if st.Patch != "" || len(st.Overlay) > 0 {
+				differs = true
 			}
+		}
+		if !differs {
+			out = append(out, Finding{Warning, c.ID(), "source-no-diff",
+				"source base but no state has a patch or overlay; vulnerable and patched build the same commit"})
 		}
 	}
 	// Compare the content hashes (image + patch + overlay content + env + command),
