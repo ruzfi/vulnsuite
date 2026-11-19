@@ -180,19 +180,23 @@ Exposure modes:
 				return usageError{"-summary shapes the -json output; add -json"}
 			}
 			// sum collects every selected target's fate for -summary. Once the
-			// selection is resolved it is emitted on every way out (success,
+			// selection is resolved the -json output (the summary, or the bare
+			// array of started targets) is emitted on every way out (success,
 			// failure, interrupt) except a usage error, so a pipeline always
 			// gets a document to parse.
 			sum := runSummary{Targets: []*runner.Handle{}, Failed: []outcomeEntry{}, Skipped: []outcomeEntry{}}
 			resolved, emitted := false, false
-			emitSummary := func() error {
+			emitOutput := func() error {
 				emitted = true
-				return g.emitJSON(sum)
+				if summary {
+					return g.emitJSON(sum)
+				}
+				return g.emitJSON(sum.Targets)
 			}
 			defer func() {
 				var ue usageError
-				if summary && resolved && !emitted && !errors.As(retErr, &ue) {
-					retErr = errors.Join(retErr, emitSummary())
+				if g.JSON && resolved && !emitted && !errors.As(retErr, &ue) {
+					retErr = errors.Join(retErr, emitOutput())
 				}
 			}()
 			skip := func(cs []*contract.Contract, state, reason, detail string) {
@@ -482,12 +486,8 @@ Exposure modes:
 
 			sum.Targets = append(sum.Targets, handles...)
 			switch {
-			case summary:
-				if err := emitSummary(); err != nil {
-					return err
-				}
 			case g.JSON:
-				if err := g.emitJSON(handles); err != nil {
+				if err := emitOutput(); err != nil {
 					return err
 				}
 			default:
@@ -813,12 +813,27 @@ the subnet. Non-HTTP targets come out as host:port for network templates.`,
 			fs.StringVar(&network, "network", runner.DefaultNetwork, "internal network name")
 		},
 		NoArgs: true,
-		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
+		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) (retErr error) {
 			switch by {
 			case "auto", "ip", "alias", "host":
 			default:
 				return usageError{fmt.Sprintf("unknown -by %q (auto, ip, alias or host)", by)}
 			}
+			type pair struct {
+				ID    string `json:"id"`
+				State string `json:"state"`
+				URL   string `json:"url"`
+			}
+			// With -json the list is printed on every way out but a usage
+			// error, like ps -json: [] when nothing is running or the engine
+			// is unreachable, the URLs resolved so far on a later failure.
+			pairs := []pair{}
+			emitted := false
+			defer func() {
+				if g.JSON && !emitted {
+					retErr = errors.Join(retErr, g.emitJSON(pairs))
+				}
+			}()
 			eng, err := g.Engine(ctx)
 			if err != nil {
 				return err
@@ -864,12 +879,6 @@ the subnet. Non-HTTP targets come out as host:port for network templates.`,
 				}
 				return out, nil
 			}
-			type pair struct {
-				ID    string `json:"id"`
-				State string `json:"state"`
-				URL   string `json:"url"`
-			}
-			var pairs []pair
 			unresolved, noAddr := 0, 0
 			for _, r := range rows {
 				published, err := portsOf(r)
@@ -941,6 +950,7 @@ the subnet. Non-HTTP targets come out as host:port for network templates.`,
 				}
 			}
 			if g.JSON {
+				emitted = true
 				return g.emitJSON(pairs)
 			}
 			if file != "" {
