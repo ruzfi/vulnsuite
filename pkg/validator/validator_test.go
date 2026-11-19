@@ -150,6 +150,17 @@ func TestRequiresRules(t *testing.T) {
 	if _, bad := rules(v.Check(parse(t, doc2)))["kvm-without-requires"]; bad {
 		t.Fatal("requires.kvm set should silence it")
 	}
+	// #119: cpu_flags rule emulation out, so emulation: true contradicts them.
+	flags := strings.Replace(base, "states:", "requires: { arch: [amd64], cpu_flags: [avx512vbmi], emulation: true }\nstates:", 1)
+	if rules(v.Check(parse(t, flags)))["cpu-flags-with-emulation"] != Warning {
+		t.Fatal("cpu-flags-with-emulation expected")
+	}
+	for _, req := range []string{"{ arch: [amd64], cpu_flags: [avx512vbmi] }", "{ arch: [amd64], cpu_flags: [avx512vbmi], emulation: false }", "{ emulation: true }"} {
+		doc := strings.Replace(base, "states:", "requires: "+req+"\nstates:", 1)
+		if _, bad := rules(v.Check(parse(t, doc)))["cpu-flags-with-emulation"]; bad {
+			t.Fatalf("cpu-flags-with-emulation on %s", req)
+		}
+	}
 }
 
 func TestFidelityRules(t *testing.T) {

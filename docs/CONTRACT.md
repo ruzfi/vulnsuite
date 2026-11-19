@@ -117,6 +117,7 @@ requires:
   arch: [amd64]        # host CPU arch(es) that run natively; empty = any
   emulation: false     # allow qemu when host arch is not in arch (default true)
   kvm: true            # needs /dev/kvm + nested virt (a linux/amd64 host)
+  cpu_flags: [avx512f, avx512bw, avx512vbmi, bmi2]   # CPU features the daemon's machine must have
 ```
 
 Preflight decisions (`vulnsuite run` / `build`):
@@ -128,6 +129,24 @@ Preflight decisions (`vulnsuite run` / `build`):
 | host arch not in `arch`, `emulation` false | skip (reason) |
 | `kvm: true` on a non-`linux/amd64` host | skip (reason) |
 | `host_os` set and the daemon OS is not in it | skip (reason) |
+| `cpu_flags` set, host arch not in `arch` | skip (reason): `cpu_flags` imply no emulation, since qemu does not provide them |
+| `cpu_flags` set, native, the daemon lacks some | skip, naming them: `needs CPU flags [avx512vbmi]; daemon has avx512f,avx512bw,bmi2` |
+| `cpu_flags` set, native, the daemon's flags cannot be read | skip (reason, with the error) |
+
+`cpu_flags` are Linux's names from `/proc/cpuinfo` (the `flags` line on x86,
+`Features` on arm64; lower-case letters, digits and `_`). The daemon's API does
+not report them, so they are read on the **daemon's** machine, not the one
+running vulnsuite (a VM or hypervisor in between can hide flags): a short-lived
+container from a digest-pinned `busybox` image, with no network and no
+capabilities, prints `/proc/cpuinfo`'s flag lines. This happens only when a
+selected target sets `cpu_flags` and meets everything else, and at most once per
+command. When the cores disagree (a hybrid CPU) only the flags every core has
+count. If the flags cannot be read -- the probe image cannot be pulled (offline,
+or `-no-pull` without it present), or the container fails -- they are
+**unknown**: a warning names the error, and every target that sets `cpu_flags`
+is skipped with that error as the reason. They are never assumed present.
+`emulation: true` next to `cpu_flags` is ignored (`validate` warns:
+`cpu-flags-with-emulation`).
 
 A skipped target is reported and the rest of the batch continues;
 `-ignore-requires` runs it anyway. `list -arch <a>` hides targets that cannot
@@ -292,6 +311,7 @@ rather than failed; use `-expose host` or scan from a container.
 | `fidelity-unset` | warning | metadata.fidelity is not set (real or simulated) |
 | `simulated-on-image-base` | warning | fidelity: simulated but the base is a prebuilt image |
 | `kvm-without-requires` | warning | service.devices has /dev/kvm but requires.kvm is not set |
+| `cpu-flags-with-emulation` | warning | requires.emulation is true but requires.cpu_flags is set, which rules emulation out |
 | `host-device-access` | warning | `service.devices` passes a host device through; `run` needs `-allow-host-access` |
 | `elevated-capability` | warning | `cap_add` adds a capability that can escape the container; `run` needs `-allow-host-access` |
 | `primary-no-group` | warning | `primary: true` is set without a `group` |

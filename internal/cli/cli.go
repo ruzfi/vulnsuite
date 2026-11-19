@@ -123,6 +123,17 @@ func (g *Global) printf(format string, args ...any) {
 	fmt.Fprintf(g.Stdout, format, args...)
 }
 
+// progress is where printf writes (nil under -q), for code that takes a writer.
+func (g *Global) progress() io.Writer {
+	switch {
+	case g.Quiet:
+		return nil
+	case g.JSON:
+		return g.Stderr
+	}
+	return g.Stdout
+}
+
 func (g *Global) errorf(format string, args ...any) {
 	fmt.Fprintf(g.Stderr, format, args...)
 }

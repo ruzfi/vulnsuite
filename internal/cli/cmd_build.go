@@ -227,12 +227,13 @@ only (pulls and pushes).`,
 			// -platform applies to every job (Options.Platform) instead.
 			emulated := map[string]bool{}
 			var kept []builder.Job
+			pf := &preflighter{ctx: ctx, g: g, eng: eng, host: host, noPull: noPull, noRead: ignoreRequires}
 			for _, j := range jobsList {
 				if j.Contract.Requires.Empty() {
 					kept = append(kept, j)
 					continue
 				}
-				d := runner.Preflight(j.Contract.Requires, host)
+				d := pf.decide(j.Contract.Requires)
 				if d.Skip() && !ignoreRequires {
 					g.errorf("skip %s [%s]: %s\n", j.Contract.ID(), j.State, d.Reason)
 					skipped = append(skipped, requiresSkip(j.Contract.ID(), j.State, d))

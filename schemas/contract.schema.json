@@ -480,6 +480,15 @@
         "kvm": {
           "type": "boolean",
           "description": "needs /dev/kvm + nested virtualization (a linux/amd64 host)"
+        },
+        "cpu_flags": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9_]+$"
+          },
+          "description": "CPU feature flags the daemon's machine must have, as /proc/cpuinfo names them (x86 `flags`, arm64 `Features`), e.g. [avx512f, avx512bw, avx512vbmi, bmi2]. Read from the daemon (not the CLI host) only when a selected target sets it; a target whose flags are missing, or cannot be read, is skipped. Implies no emulation: qemu does not provide them."
         }
       }
     }

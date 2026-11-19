@@ -104,20 +104,7 @@ writing a template and contributing it upstream.`,
 			}
 			kv("ports", strings.Join(ports, ", "))
 			if !c.Requires.Empty() {
-				var parts []string
-				if len(c.Requires.HostOS) > 0 {
-					parts = append(parts, "host_os "+strings.Join(c.Requires.HostOS, "/"))
-				}
-				if len(c.Requires.Arch) > 0 {
-					parts = append(parts, "arch "+strings.Join(c.Requires.Arch, "/"))
-				}
-				if c.Requires.KVM {
-					parts = append(parts, "kvm")
-				}
-				if !c.Requires.EmulationAllowed() {
-					parts = append(parts, "no-emulation")
-				}
-				kv("requires", strings.Join(parts, ", "))
+				kv("requires", requiresText(c.Requires))
 			}
 			if reason := runner.HostAccessReason(c); reason != "" {
 				kv("host access", reason+" -- run needs -allow-host-access (trust the template first)")
@@ -273,4 +260,26 @@ func checkScannerDir(flagName, dir string) error {
 		return usageError{fmt.Sprintf("%s %s: not a directory", flagName, dir)}
 	}
 	return nil
+}
+
+// requiresText is a requires block on one line, for info and list's REQUIRES
+// column, e.g. "arch amd64, cpu_flags avx512f,bmi2".
+func requiresText(r contract.Requires) string {
+	var parts []string
+	if len(r.HostOS) > 0 {
+		parts = append(parts, "host_os "+strings.Join(r.HostOS, "/"))
+	}
+	if len(r.Arch) > 0 {
+		parts = append(parts, "arch "+strings.Join(r.Arch, "/"))
+	}
+	if r.KVM {
+		parts = append(parts, "kvm")
+	}
+	if r.Emulation != nil && !*r.Emulation { // cpu_flags imply it: not repeated
+		parts = append(parts, "no-emulation")
+	}
+	if len(r.CPUFlags) > 0 {
+		parts = append(parts, "cpu_flags "+strings.Join(r.CPUFlags, ","))
+	}
+	return strings.Join(parts, ", ")
 }
