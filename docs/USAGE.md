@@ -218,8 +218,9 @@ Built images carry labels (`dev.vulnsuite.id`, `.state`, `.hash`,
 self-contained: `docker run ghcr.io/you/vulnsuite/<id>:vulnerable` is the
 vulnerable target, no vulnsuite needed.
 
-Push credentials come from `~/.docker/config.json` (or its credential
-helpers), or from `VULNSUITE_REGISTRY_USER` / `VULNSUITE_REGISTRY_TOKEN`. The
+Push credentials come from `~/.docker/config.json` (its credential helpers,
+or its `auths` entries in any form the docker CLI writes: `auth`, separate
+`username`/`password`, or an `identitytoken` as `az acr login` stores), or from `VULNSUITE_REGISTRY_USER` / `VULNSUITE_REGISTRY_TOKEN`. The
 env pair names no registry, so it is scoped: by default it is sent **only when
 pushing** to `-registry`, never when pulling the base or sidecar images a
 template names. Set `VULNSUITE_REGISTRY` (a host such as `ghcr.io`, or the

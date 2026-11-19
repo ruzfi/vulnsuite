@@ -45,9 +45,9 @@ type Config struct {
 }
 
 type dockerConfig struct {
-	Auths       map[string]struct{ Auth string } `json:"auths"`
-	CredsStore  string                           `json:"credsStore"`
-	CredHelpers map[string]string                `json:"credHelpers"`
+	Auths       map[string]authEntry `json:"auths"`
+	CredsStore  string               `json:"credsStore"`
+	CredHelpers map[string]string    `json:"credHelpers"`
 
 	// helpers caches credential helper answers for this config, keyed by
 	// helper and server.
@@ -241,11 +241,40 @@ func lookup(ctx context.Context, ref string, push bool) (Config, bool) {
 		if !sameRegistry(key, reg) {
 			continue
 		}
-		if u, p, ok := plainAuth(conf.Auths[key].Auth); ok {
-			return Config{Username: u, Password: p, ServerAddress: reg}, true
+		if a, ok := conf.Auths[key].config(reg); ok {
+			return a, true
 		}
 	}
 	return Config{}, false
+}
+
+// authEntry is one entry of a docker config's auths, in any of the forms the
+// docker CLI writes and reads: a base64 "user:password" auth, separate
+// username and password fields, and an identity (OAuth refresh) token, which
+// e.g. az acr login stores beside a placeholder auth.
+type authEntry struct {
+	Auth          string `json:"auth"`
+	Username      string `json:"username"`
+	Password      string `json:"password"`
+	IdentityToken string `json:"identitytoken"`
+}
+
+// config resolves e the way the docker CLI does: auth, when set, supplies the
+// username and password, otherwise the separate fields do; an identity token
+// is carried alongside. ok is false for an entry that holds no credential or
+// whose auth is not base64 "user:password".
+func (e authEntry) config(server string) (Config, bool) {
+	u, p := e.Username, e.Password
+	if e.Auth != "" {
+		var ok bool
+		if u, p, ok = plainAuth(e.Auth); !ok {
+			return Config{}, false
+		}
+	}
+	if u == "" && p == "" && e.IdentityToken == "" {
+		return Config{}, false
+	}
+	return Config{Username: u, Password: p, IdentityToken: e.IdentityToken, ServerAddress: server}, true
 }
 
 func sortedKeys[V any](m map[string]V) []string {
@@ -355,8 +384,8 @@ func Empty() string { return Encode(Config{}) }
 // Configs returns every credential the docker config knows about, keyed by
 // registry, for builds that pull from private registries. Each registry named
 // in auths or credHelpers is resolved through its credential helper (the
-// per-registry credHelpers entry, else credsStore) and falls back to the plain
-// base64 auth stored in auths. Keys are normalised the way registryOf names a
+// per-registry credHelpers entry, else credsStore) and falls back to the
+// credential stored in auths (auth, username/password, identitytoken). Keys are normalised the way registryOf names a
 // registry (hubAddress for Docker Hub, host[:port] otherwise); when several
 // config keys name one registry, the first that resolves (in sorted order)
 // wins.
@@ -395,8 +424,8 @@ func ConfigsContext(ctx context.Context) map[string]Config {
 				continue
 			}
 		}
-		if u, p, ok := plainAuth(conf.Auths[key].Auth); ok {
-			m[reg] = Config{Username: u, Password: p, ServerAddress: reg}
+		if a, ok := conf.Auths[key].config(reg); ok {
+			m[reg] = a
 		}
 	}
 	return m

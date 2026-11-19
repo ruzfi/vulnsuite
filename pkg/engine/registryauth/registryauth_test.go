@@ -331,3 +331,51 @@ func TestConfigsNeverCarryEnvCreds(t *testing.T) {
 		}
 	}
 }
+
+// TestAuthsEntryForms covers every auths entry form the docker CLI reads: an
+// identity token beside a placeholder auth (az acr login), separate
+// username/password fields, and an identity token alone. Lookup (pulls and
+// pushes) and Configs (builds) must agree.
+func TestAuthsEntryForms(t *testing.T) {
+	scratchConfig(t, `{"auths": {
+	  "myreg.azurecr.io": {"auth": "`+basic("00000000-0000-0000-0000-000000000000", "")+`", "identitytoken": "refresh-token"},
+	  "split.example.com": {"username": "splituser", "password": "splitpass"},
+	  "token.example.com": {"identitytoken": "only-token"},
+	  "both.example.com": {"auth": "`+basic("authuser", "authpass")+`", "username": "ignored", "password": "ignored"},
+	  "bad.example.com": {"auth": "not base64!", "username": "u", "password": "p"},
+	  "empty.example.com": {"username": "", "password": ""}
+	}}`)
+	want := map[string]Config{
+		"myreg.azurecr.io":  {Username: "00000000-0000-0000-0000-000000000000", IdentityToken: "refresh-token", ServerAddress: "myreg.azurecr.io"},
+		"split.example.com": {Username: "splituser", Password: "splitpass", ServerAddress: "split.example.com"},
+		"token.example.com": {IdentityToken: "only-token", ServerAddress: "token.example.com"},
+		"both.example.com":  {Username: "authuser", Password: "authpass", ServerAddress: "both.example.com"},
+	}
+	for reg, w := range want {
+		if a, ok := Lookup(reg + "/app:1"); !ok || a != w {
+			t.Errorf("Lookup(%s/app:1) = %+v, %v; want %+v", reg, a, ok, w)
+		}
+		if a, ok := LookupPush(reg + "/app:1"); !ok || a != w {
+			t.Errorf("LookupPush(%s/app:1) = %+v, %v; want %+v", reg, a, ok, w)
+		}
+		if h := For(reg + "/app:1"); h == "" {
+			t.Errorf("For(%s/app:1) is empty, want %+v", reg, w)
+		} else if got := decode(t, h); got != w {
+			t.Errorf("For(%s/app:1) decodes to %+v, want %+v", reg, got, w)
+		}
+	}
+	for _, reg := range []string{"bad.example.com", "empty.example.com"} {
+		if a, ok := Lookup(reg + "/app:1"); ok {
+			t.Errorf("Lookup(%s/app:1) = %+v, want no credential", reg, a)
+		}
+	}
+	got := Configs()
+	if len(got) != len(want) {
+		t.Errorf("Configs() = %+v, want %+v", got, want)
+	}
+	for reg, w := range want {
+		if got[reg] != w {
+			t.Errorf("Configs()[%q] = %+v, want %+v", reg, got[reg], w)
+		}
+	}
+}
