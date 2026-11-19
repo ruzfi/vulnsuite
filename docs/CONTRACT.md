@@ -209,6 +209,13 @@ demonstrate the *impact* from the advisory, not a matcher.
     stdout_matches: "root:"
 ```
 
+A port counts as open, for a `tcp` probe and for a `tcp` (or default)
+healthcheck, only when something listens on it. A connection that is accepted
+and then closed within 300ms without a byte counts as closed: in host exposure
+mode the published port is held by Docker's port proxy, which accepts before the
+service listens in the container. A server that greets the client, or one that
+waits for the client to speak first, counts as open.
+
 The `net` probe runs an ordered send/expect dialogue over a single TCP connection (optionally TLS), for multi-step protocols -- FTP SITE commands, SMTP, line protocols -- that a one-shot `tcp` probe cannot express. Each step optionally sends bytes, then reads the response and asserts `expect` (regex must match) and/or `expect_absent`. The connection is TLS when `tls: true` is set or when the probed port is declared `protocol: https` (the primary port when `port` is left out); a dialogue with any other port, e.g. SMTP on 25 of an https target, stays plain.
 
 HTTP probes are sent over a raw socket so the request line is exactly what the
