@@ -143,6 +143,23 @@ var cases = []conformanceCase{
 		mustExist(t, h, img, "linux/x86_64", true)
 		mustExist(t, h, img, "linux/arm64", false)
 	}},
+	{"image_exists_normalises_reference", func(t *testing.T, h *harness) {
+		// The daemon resolves a reference before looking it up: a bare name
+		// is :latest, and a Docker Hub name may be spelt in full.
+		h.seedImage("busybox:latest", "")
+		for _, ref := range []string{"busybox", "busybox:latest", "docker.io/library/busybox", "docker.io/library/busybox:latest"} {
+			mustExist(t, h, ref, "", true)
+		}
+		mustExist(t, h, "busybox:1.36", "", false)
+		h.seedImage("registry.example/vs/bare", "")
+		mustExist(t, h, "registry.example/vs/bare:latest", "", true)
+		if _, err := h.eng.ContainerCreate(bg(t), engine.ContainerSpec{Name: "vs-bb", Image: "busybox"}); err != nil {
+			t.Errorf("creating from busybox after busybox:latest was recorded: %v", err)
+		}
+		if err := h.eng.ImageTag(bg(t), "docker.io/library/busybox", "registry.example/vs/bb:1"); err != nil {
+			t.Errorf("tagging docker.io/library/busybox after busybox:latest was recorded: %v", err)
+		}
+	}},
 	{"image_exists_daemon_error_is_error", func(t *testing.T, h *harness) {
 		h.seedImage(img, "")
 		h.fail(t, "GET", `^/images/.+/json$`, 500, "layer store corrupt")
@@ -261,9 +278,29 @@ var cases = []conformanceCase{
 			}
 		}
 	}},
+	{"image_build_without_dockerfile_fails", func(t *testing.T, h *harness) {
+		for _, tc := range []struct {
+			files      map[string]string
+			dockerfile string
+		}{
+			{map[string]string{"app.txt": "hi"}, ""},
+			{map[string]string{"Dockerfile": "FROM scratch\n"}, "sub/Dockerfile"},
+		} {
+			err := h.eng.ImageBuild(bg(t), engine.BuildOptions{Context: tarOf(t, tc.files), Tags: []string{img}, Dockerfile: tc.dockerfile}, nil)
+			if !contains(err, "Cannot locate specified Dockerfile") {
+				t.Errorf("building %v with Dockerfile %q: %v, want the daemon's Cannot locate specified Dockerfile", tc.files, tc.dockerfile, err)
+			}
+			mustExist(t, h, img, "", false)
+		}
+		// The default name also matches a lower-case dockerfile.
+		if err := h.eng.ImageBuild(bg(t), engine.BuildOptions{Context: tarOf(t, map[string]string{"dockerfile": "FROM scratch\n"}), Tags: []string{img}}, nil); err != nil {
+			t.Fatalf("building with a lower-case dockerfile: %v", err)
+		}
+		mustExist(t, h, img, "", true)
+	}},
 	{"image_build_removes_intermediate_containers", func(t *testing.T, h *harness) {
 		h.needsDaemon(t)
-		if err := h.eng.ImageBuild(bg(t), engine.BuildOptions{Context: tarOf(t, nil), Tags: []string{img}}, nil); err != nil {
+		if err := h.eng.ImageBuild(bg(t), engine.BuildOptions{Context: tarOf(t, map[string]string{"Dockerfile": "FROM scratch\n"}), Tags: []string{img}}, nil); err != nil {
 			t.Fatal(err)
 		}
 		q := h.lastBuild(t).Query

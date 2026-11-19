@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path"
 	"regexp"
 	"sort"
 	"strconv"
@@ -16,6 +17,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/distribution/reference"
 
 	"github.com/ruzfi/vulnsuite/pkg/engine"
 )
@@ -160,7 +163,33 @@ func (d *daemon) putImage(ref, platform string) {
 		platform = "linux/amd64"
 	}
 	os, arch, variant := engine.SplitPlatform(platform)
-	d.images[ref] = &stubImage{id: "sha256:" + d.newID(), os: os, arch: arch, variant: variant}
+	d.images[imageKey(ref)] = &stubImage{id: "sha256:" + d.newID(), os: os, arch: arch, variant: variant}
+}
+
+// imageKey is the name dockerd resolves an image reference to, so that
+// "busybox", "busybox:latest" and "docker.io/library/busybox:latest" are one
+// image. d.images is keyed by it.
+func imageKey(ref string) string {
+	named, err := reference.ParseNormalizedNamed(ref)
+	if err != nil {
+		return ref
+	}
+	return reference.TagNameOnly(named).String()
+}
+
+// familiar is how dockerd lists an image key ("busybox:latest").
+func familiar(key string) string {
+	named, err := reference.ParseNormalizedNamed(key)
+	if err != nil {
+		return key
+	}
+	return reference.FamiliarString(named)
+}
+
+// lookupImage returns the image ref names. Called with d.mu held.
+func (d *daemon) lookupImage(ref string) (*stubImage, bool) {
+	img, ok := d.images[imageKey(ref)]
+	return img, ok
 }
 
 func (d *daemon) addNetwork(spec engine.NetworkSpec) string {
@@ -326,7 +355,7 @@ func (d *daemon) images_(w http.ResponseWriter, r *http.Request, rest string) {
 
 func (d *daemon) imageInspect(w http.ResponseWriter, r *http.Request, ref string) {
 	d.mu.Lock()
-	img, ok := d.images[ref]
+	img, ok := d.lookupImage(ref)
 	d.mu.Unlock()
 	if !ok {
 		apiError(w, http.StatusNotFound, "No such image: %s", ref)
@@ -353,14 +382,14 @@ func (d *daemon) imageInspect(w http.ResponseWriter, r *http.Request, ref string
 			return
 		}
 	}
-	writeJSON(w, 200, map[string]any{"Id": img.id, "RepoTags": []string{ref}, "Os": img.os, "Architecture": img.arch, "Variant": img.variant})
+	writeJSON(w, 200, map[string]any{"Id": img.id, "RepoTags": []string{familiar(imageKey(ref))}, "Os": img.os, "Architecture": img.arch, "Variant": img.variant})
 }
 
 func (d *daemon) imageList(w http.ResponseWriter) {
 	d.mu.Lock()
 	byID := map[string][]string{}
-	for ref, img := range d.images {
-		byID[img.id] = append(byID[img.id], ref)
+	for key, img := range d.images {
+		byID[img.id] = append(byID[img.id], familiar(key))
 	}
 	d.mu.Unlock()
 	out := []map[string]any{}
@@ -429,6 +458,15 @@ func (d *daemon) imageBuild(w http.ResponseWriter, r *http.Request) {
 	}
 	d.mu.Lock()
 	d.builds = append(d.builds, rec)
+	if !hasDockerfile(rec.Files, rec.Dockerfile) {
+		d.mu.Unlock()
+		name := rec.Dockerfile
+		if name == "" {
+			name = "Dockerfile"
+		}
+		apiError(w, http.StatusInternalServerError, "Cannot locate specified Dockerfile: %s", name)
+		return
+	}
 	failMsg, form := d.buildErr, d.errForm
 	if failMsg == "" {
 		for _, t := range rec.Tags {
@@ -443,6 +481,25 @@ func (d *daemon) imageBuild(w http.ResponseWriter, r *http.Request) {
 	stream(w, map[string]string{"stream": "Step 1/1 : FROM scratch\n"}, map[string]string{"stream": "Successfully tagged " + strings.Join(rec.Tags, ",") + "\n"})
 }
 
+// hasDockerfile reports whether a build context holds the Dockerfile asked
+// for (name, "Dockerfile" when empty; the default also matches "dockerfile",
+// as in dockerd).
+func hasDockerfile(files map[string]string, name string) bool {
+	clean := func(p string) string { return strings.TrimPrefix(path.Clean("/"+p), "/") }
+	want := []string{clean(name)}
+	if name == "" {
+		want = []string{"Dockerfile", "dockerfile"}
+	}
+	for f := range files {
+		for _, w := range want {
+			if clean(f) == w {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (d *daemon) imageTag(w http.ResponseWriter, r *http.Request, source string) {
 	q := r.URL.Query()
 	tag := q.Get("tag")
@@ -451,20 +508,20 @@ func (d *daemon) imageTag(w http.ResponseWriter, r *http.Request, source string)
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	img, ok := d.images[source]
+	img, ok := d.lookupImage(source)
 	if !ok {
 		apiError(w, http.StatusNotFound, "No such image: %s", source)
 		return
 	}
 	cp := *img
-	d.images[joinRef(q.Get("repo"), tag)] = &cp
+	d.images[imageKey(joinRef(q.Get("repo"), tag))] = &cp
 	w.WriteHeader(http.StatusCreated)
 }
 
 func (d *daemon) imagePush(w http.ResponseWriter, r *http.Request, repo string) {
 	ref := joinRef(repo, r.URL.Query().Get("tag"))
 	d.mu.Lock()
-	_, ok := d.images[ref]
+	_, ok := d.lookupImage(ref)
 	msg, failing := d.pushErr[ref]
 	form := d.errForm
 	d.mu.Unlock()
@@ -483,19 +540,19 @@ func (d *daemon) imageRemove(w http.ResponseWriter, r *http.Request, ref string)
 	force := r.URL.Query().Get("force") == "1" || r.URL.Query().Get("force") == "true"
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if _, ok := d.images[ref]; !ok {
+	if _, ok := d.lookupImage(ref); !ok {
 		apiError(w, http.StatusNotFound, "No such image: %s", ref)
 		return
 	}
 	if !force {
 		for _, c := range d.containers {
-			if c.image == ref {
+			if imageKey(c.image) == imageKey(ref) {
 				apiError(w, http.StatusConflict, "conflict: unable to remove repository reference %q (must force) - container %s is using its referenced image", ref, c.id[:12])
 				return
 			}
 		}
 	}
-	delete(d.images, ref)
+	delete(d.images, imageKey(ref))
 	writeJSON(w, 200, []map[string]string{{"Untagged": ref}})
 }
 
@@ -523,7 +580,7 @@ func (d *daemon) containerCreate(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get("name")
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if _, ok := d.images[body.Image]; !ok {
+	if _, ok := d.lookupImage(body.Image); !ok {
 		apiError(w, http.StatusNotFound, "No such image: %s", body.Image)
 		return
 	}
@@ -670,7 +727,7 @@ func (d *daemon) containerInspect(w http.ResponseWriter, c *stubContainer) {
 	writeJSON(w, 200, map[string]any{
 		"Id":     c.id,
 		"Name":   "/" + c.name,
-		"Image":  d.images[c.image].idOr(c.image),
+		"Image":  d.images[imageKey(c.image)].idOr(c.image),
 		"State":  map[string]any{"Status": status, "Running": c.running, "ExitCode": c.exitCode},
 		"Config": map[string]any{"Image": c.image, "Labels": c.labels},
 		"NetworkSettings": map[string]any{

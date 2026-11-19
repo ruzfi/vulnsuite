@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"path"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/distribution/reference"
 
 	"github.com/ruzfi/vulnsuite/pkg/engine"
 )
@@ -127,7 +130,61 @@ func (f *Fake) ImageExists(ctx context.Context, ref, platform string) (bool, err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.Images[ref] && f.platformOK(ref, platform), nil
+	key, ok := f.image(ref)
+	return ok && f.platformOK(key, platform), nil
+}
+
+// normalizeRef is the name a daemon resolves an image reference to, so that
+// "busybox", "busybox:latest" and "docker.io/library/busybox:latest" are one
+// image. A reference that does not parse is returned unchanged.
+func normalizeRef(ref string) string {
+	named, err := reference.ParseNormalizedNamed(ref)
+	if err != nil {
+		return ref
+	}
+	return reference.TagNameOnly(named).String()
+}
+
+// image returns the Images key that ref names, matched like a daemon does
+// (see normalizeRef): ref itself when recorded, else the first (sorted)
+// recorded reference that names the same image. Called with f.mu held.
+func (f *Fake) image(ref string) (string, bool) {
+	if f.Images[ref] {
+		return ref, true
+	}
+	want := normalizeRef(ref)
+	keys := make([]string, 0, len(f.Images))
+	for k, ok := range f.Images {
+		if ok {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if normalizeRef(k) == want {
+			return k, true
+		}
+	}
+	return "", false
+}
+
+// dockerfileIn reports whether the build context files hold the Dockerfile a
+// build asks for (name, "Dockerfile" when empty). Like the legacy builder,
+// the default name also matches a lower-case "dockerfile".
+func dockerfileIn(files map[string]string, name string) bool {
+	clean := func(p string) string { return strings.TrimPrefix(path.Clean("/"+p), "/") }
+	want := []string{clean(name)}
+	if name == "" {
+		want = []string{"Dockerfile", "dockerfile"}
+	}
+	for f := range files {
+		for _, w := range want {
+			if clean(f) == w {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // platformOK reports whether the image ref satisfies platform.
@@ -197,6 +254,14 @@ func (f *Fake) ImageBuild(ctx context.Context, opts engine.BuildOptions, out io.
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.Builds = append(f.Builds, Build{Tags: opts.Tags, Dockerfile: opts.Dockerfile, BuildArgs: opts.BuildArgs, Labels: opts.Labels, NoCache: opts.NoCache, Platform: opts.Platform, Files: files, Modes: modes, Links: links})
+	if !dockerfileIn(files, opts.Dockerfile) {
+		// The daemon's error when the context lacks the Dockerfile.
+		name := opts.Dockerfile
+		if name == "" {
+			name = "Dockerfile"
+		}
+		return fmt.Errorf("Cannot locate specified Dockerfile: %s", name)
+	}
 	if f.FailBuild != "" {
 		if out != nil {
 			fmt.Fprintln(out, "Step 1/1 : FROM x")
@@ -219,11 +284,12 @@ func (f *Fake) ImageTag(ctx context.Context, source, target string) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if !f.Images[source] {
+	key, ok := f.image(source)
+	if !ok {
 		return fmt.Errorf("no such image %s", source)
 	}
 	f.Images[target] = true
-	f.setPlatform(target, f.ImagePlatforms[source])
+	f.setPlatform(target, f.ImagePlatforms[key])
 	f.Tagged = append(f.Tagged, [2]string{source, target})
 	return nil
 }
@@ -234,7 +300,7 @@ func (f *Fake) ImagePush(ctx context.Context, ref string, out io.Writer) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if !f.Images[ref] {
+	if _, ok := f.image(ref); !ok {
 		return fmt.Errorf("no such image %s", ref)
 	}
 	f.Pushes = append(f.Pushes, ref)
@@ -252,6 +318,11 @@ func (f *Fake) ImageRemove(ctx context.Context, ref string, _ bool) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Remove ref under every spelling it was recorded as.
+	for key, ok := f.image(ref); ok; key, ok = f.image(ref) {
+		delete(f.Images, key)
+		delete(f.ImagePlatforms, key)
+	}
 	delete(f.Images, ref)
 	return nil
 }
@@ -278,10 +349,11 @@ func (f *Fake) ContainerCreate(ctx context.Context, spec engine.ContainerSpec) (
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if !f.Images[spec.Image] {
+	key, ok := f.image(spec.Image)
+	if !ok {
 		return "", fmt.Errorf("no such image: %s", spec.Image)
 	}
-	if !f.platformOK(spec.Image, spec.Platform) {
+	if !f.platformOK(key, spec.Platform) {
 		return "", fmt.Errorf("image %s was found but does not match the specified platform %s", spec.Image, spec.Platform)
 	}
 	if _, dup := f.Containers[spec.Name]; dup {
