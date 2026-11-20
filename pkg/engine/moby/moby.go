@@ -373,6 +373,7 @@ func (e *Engine) ContainerInspect(ctx context.Context, id string) (*engine.Conta
 	}
 	if c.State != nil {
 		out.Running = c.State.Running
+		out.Paused = c.State.Paused
 		out.ExitCode = c.State.ExitCode
 	}
 	if c.NetworkSettings != nil {

@@ -315,7 +315,9 @@ sockets. It is per state like any probe: patched writes its own sequence.
 It runs through the engine only (exec, pause, archive reads, logs) and on the
 private sidecar network, so a sequence without `http`, `tcp` or `net` steps
 verifies in every exposure mode, internal mode on Docker Desktop and OrbStack
-included.
+included. A sequence with such a step needs the network path, so where this
+machine cannot reach the target it is skipped like a network probe ("could
+not verify from this host"), not failed.
 
 ```yaml
 service:
@@ -386,7 +388,7 @@ attempt `timeout`:
 | `freeze` / `resume` | `docker pause` / `unpause` of the target container, never a sidecar |
 | `sleep` | waits, cut short by the attempt timeout |
 | `http`, `tcp`, `net` | against the same address the other probes use. When this machine cannot reach the target (internal mode on Docker Desktop, macvlan, a remote daemon's loopback) the step cannot run and the attempt is not reached, with the same explanation as skipped network probes |
-| `expect_sanitizer` | reads the files in `log_dir` that are new or changed since the attempt started (only the appended part of a file that grew; at most 1 MiB per file) and parses every `ERROR: <Name>Sanitizer: <description>` report in them. `kind` matches the report's `SUMMARY` class or a word of its description (`attempting double-free` is a `double-free`); `frame` must match a frame of the report's first stack (the faulting access, up to the first blank line), written as `func file:line`. A report is written after resume, so the step waits up to 5 s for a matching one; `none` watches the whole 5 s and fails on the first report |
+| `expect_sanitizer` | reads the files in `log_dir` that are new or changed since the attempt started (only the appended part of a file that grew; at most 1 MiB per file, so a file that was already past 1 MiB yields nothing new; at most 4096 files and 64 MiB in all, past which the attempt is not reached) and parses every `ERROR: <Name>Sanitizer: <description>` report in them. `kind` matches the report's `SUMMARY` class or a word of its description (`attempting double-free` is a `double-free`); `frame` must match a frame of the report's first stack (the faulting access, up to the first blank line), written as `func file:line`. A report is written after resume, so the step waits up to 5 s for a matching one; `none` watches the whole 5 s and fails on the first report |
 | `expect_log` | the regexp (dot matches newline) against what the target logged since the attempt started, waiting up to 5 s for it |
 
 Every attempt ends as exactly one of:
@@ -422,12 +424,18 @@ The core guarantees:
   timeout, on Ctrl-C (the unpause runs on its own short-lived context), and at
   the end of the attempt even when its `resume` was never reached. A freeze
   lasts at most 30 s; past that the target is unpaused at once, even while a
-  step is still running, and the attempt is not reached.
+  step is still running, and the attempt is not reached. A failed unpause is
+  retried (for up to 15 s, while the target is still paused), a pause whose
+  request failed is undone in case the daemon paused anyway, and a target an
+  earlier attempt left paused is unpaused before the next one.
 - **Restart between attempts**: when the target exited during an attempt (an
   ASan build with `halt_on_error=1` aborts after its report), it is started
   again and its healthcheck waited for before the next attempt; the attempt
   shows `(target restarted)`. A target that cannot be started again makes the
-  remaining attempts not reached.
+  remaining attempts not reached. The same check runs once more after the
+  last attempt, so later verify probes and your scanner find the target up
+  (the detail ends with `the target was restarted afterwards`); a target
+  that does not come back is not ready, which fails the run.
 - **`vulnsuite stop` removes a paused target**: the daemon's forced remove
   takes a paused container, so a run that crashed mid-freeze leaves nothing
   frozen behind.
@@ -482,6 +490,7 @@ rather than failed; use `-expose host` or scan from a container.
 | `sequence-unbalanced-freeze` | error | a `sequence` has a `freeze` without a `resume`, a nested `freeze`, or a `resume` without a `freeze` |
 | `exec-in-frozen-target` | error | an `exec` step without `container` (so in the target) between `freeze` and `resume` |
 | `network-step-while-frozen` | error | an `http`, `tcp` or `net` step between `freeze` and `resume` (it would block on the frozen target) |
+| `sanitizer-while-frozen` | warning | an `expect_sanitizer` between `freeze` and `resume`: the frozen target cannot write a report, so `none` always holds there |
 | `unknown-sidecar` | error | an `exec` step's `container` names no `service.sidecars` entry |
 | `sanitizer-without-log-dir` | error | an `expect_sanitizer` step without `service.sanitizer.log_dir` |
 | `sequence-no-assertion` | error | a `sequence` with no `expect_sanitizer`, `expect_log`, or `exec` with `expect_exit`/`stdout_matches` |

@@ -91,10 +91,13 @@ type ContainerInfo struct {
 
 // ContainerDetail is the inspected view of a container.
 type ContainerDetail struct {
-	ID       string
-	Name     string
-	Image    string
-	Running  bool
+	ID      string
+	Name    string
+	Image   string
+	Running bool
+	// Paused is set while the container is paused (it still counts as
+	// Running, as the daemon reports it).
+	Paused   bool
 	ExitCode int
 	// IPs maps network name -> IPv4 address.
 	IPs map[string]string
@@ -258,6 +261,11 @@ func (f FileContent) Truncated() bool { return int64(len(f.Data)) < f.Size }
 // MaxDirFiles bounds how many files ContainerReadDir returns.
 const MaxDirFiles = 4096
 
+// MaxDirBytes bounds the content ContainerReadDir returns in all, across its
+// files: the directory belongs to the container, and maxBytes per file times
+// MaxDirFiles would let it fill the caller's memory.
+const MaxDirBytes = 64 << 20
+
 // DirFilesFromTar reads the regular files directly in a directory out of the
 // tar stream the archive API returns for it (GET /containers/{id}/archive).
 // root is the archive's root entry, the "name" in the daemon's path stat
@@ -271,13 +279,14 @@ const MaxDirFiles = 4096
 // a regular file already taken counts as one); symlinks are skipped, never
 // followed. Content is capped at maxBytes per file (see
 // FileReader.ContainerReadDir), duplicates keep the first entry, and more than
-// MaxDirFiles files is an error.
+// MaxDirFiles files, or more than MaxDirBytes of content in all, is an error.
 func DirFilesFromTar(r io.Reader, root string, maxBytes int64) (map[string]FileContent, error) {
 	prefix := strings.TrimSuffix(root, "/") + "/"
 	if maxBytes < 0 {
 		maxBytes = 0
 	}
 	out := map[string]FileContent{}
+	var total int64
 	tr := tar.NewReader(r)
 	for {
 		h, err := tr.Next()
@@ -320,6 +329,9 @@ func DirFilesFromTar(r io.Reader, root string, maxBytes int64) (map[string]FileC
 		}
 		if len(out) == MaxDirFiles {
 			return nil, fmt.Errorf("the directory holds more than %d files", MaxDirFiles)
+		}
+		if total += int64(len(fc.Data)); total > MaxDirBytes {
+			return nil, fmt.Errorf("the directory holds more than %d MiB", MaxDirBytes>>20)
 		}
 		out[name] = fc
 	}

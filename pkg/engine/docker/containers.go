@@ -178,6 +178,7 @@ func (c *Client) ContainerInspect(ctx context.Context, id string) (*engine.Conta
 		Name  string `json:"Name"`
 		State struct {
 			Running  bool `json:"Running"`
+			Paused   bool `json:"Paused"`
 			ExitCode int  `json:"ExitCode"`
 		} `json:"State"`
 		Config struct {
@@ -195,7 +196,7 @@ func (c *Client) ContainerInspect(ctx context.Context, id string) (*engine.Conta
 	}
 	out := &engine.ContainerDetail{
 		ID: d.ID, Name: strings.TrimPrefix(d.Name, "/"), Image: d.Config.Image,
-		Running: d.State.Running, ExitCode: d.State.ExitCode,
+		Running: d.State.Running, Paused: d.State.Paused, ExitCode: d.State.ExitCode,
 		IPs: map[string]string{}, Ports: map[string]engine.HostBinding{},
 	}
 	for name, n := range d.NetworkSettings.Networks {

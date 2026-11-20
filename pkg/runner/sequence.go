@@ -24,6 +24,8 @@ var (
 	// unpauseTimeout bounds the unpause that ends a freeze. It runs on a
 	// fresh context, so a cancelled or timed-out attempt still thaws.
 	unpauseTimeout = 15 * time.Second
+	// unpauseRetry is the wait between unpause attempts within unpauseTimeout.
+	unpauseRetry = 250 * time.Millisecond
 	// assertWindow is how long expect_sanitizer and expect_log wait for the
 	// report or log line to appear (a report is written, and symbolized, after
 	// resume). expect_sanitizer: none watches for the whole window.
@@ -131,7 +133,19 @@ func (x *sequenceExec) run(ctx context.Context, s *contract.SequenceProbe) probe
 	if positive {
 		ok = st.hit >= minHits
 	}
-	return probes.Result{OK: ok, Detail: sequenceDetail(positive, minHits, st, attempts, ctx.Err() != nil), Attempts: attempts}
+	detail := sequenceDetail(positive, minHits, st, attempts, ctx.Err() != nil)
+	// Leave the target as later probes, the scanner and `run` expect it:
+	// unpaused and running. The attempt that hit may have killed it
+	// (halt_on_error=1). A target that does not come back is reported here
+	// and, through h.Ready, fails the run as not ready.
+	if len(attempts) > 0 && ctx.Err() == nil {
+		if restarted, err := x.ensureRunning(ctx); err != nil {
+			detail += "; afterwards " + err.Error()
+		} else if restarted {
+			detail += "; the target was restarted afterwards"
+		}
+	}
+	return probes.Result{OK: ok, Detail: detail, Attempts: attempts}
 }
 
 // sequenceDetail renders the probe's one-line detail: the tally, then every
@@ -246,6 +260,9 @@ func octalMode(m fs.FileMode) string {
 // first, in case it is on its way down. It reports whether it restarted the
 // target.
 func (x *sequenceExec) ensureRunning(ctx context.Context) (bool, error) {
+	if err := x.unpauseIfPaused(ctx); err != nil {
+		return false, err
+	}
 	var det *engine.ContainerDetail
 	deadline := time.Now().Add(exitSettle)
 	for {
@@ -271,6 +288,35 @@ func (x *sequenceExec) ensureRunning(ctx context.Context) (bool, error) {
 		return true, fmt.Errorf("the target exited with code %d and was not ready after a restart: %s", code, x.h.ReadyDetail)
 	}
 	return true, nil
+}
+
+// unpauseIfPaused unpauses a target an earlier attempt left paused (an
+// unpause that kept failing, or a pause that landed after its request had
+// failed here).
+func (x *sequenceExec) unpauseIfPaused(ctx context.Context) error {
+	det, err := x.r.Engine.ContainerInspect(ctx, x.h.Container)
+	if err != nil {
+		return fmt.Errorf("the target is gone: %v", err)
+	}
+	if !det.Paused {
+		return nil
+	}
+	p, ok := x.r.Engine.(engine.Pauser)
+	if !ok {
+		return errors.New("the target is paused and this engine cannot unpause it")
+	}
+	fz := &freezer{p: p, container: x.h.Container, parent: ctx, frozen: true, stillPaused: x.stillPaused}
+	if err := fz.thaw(); err != nil {
+		return fmt.Errorf("the target was left paused: %v", err)
+	}
+	return nil
+}
+
+// stillPaused reports whether the target is known to be paused (not when it
+// cannot be inspected: it is gone, or the daemon is unreachable).
+func (x *sequenceExec) stillPaused(ctx context.Context) bool {
+	det, err := x.r.Engine.ContainerInspect(ctx, x.h.Container)
+	return err == nil && det.Paused
 }
 
 // refreshAddress re-reads the target's address after a restart: the daemon
@@ -313,12 +359,16 @@ type freezer struct {
 	mu        sync.Mutex
 	p         engine.Pauser
 	container string
-	frozen    bool
-	capped    bool
-	timer     *time.Timer
-	parent    context.Context
-	onCap     func()
-	thawErr   error
+	// stillPaused reports whether the target is still paused, so a failed
+	// unpause is retried only while that is so (not for a target that
+	// exited or was removed). nil: retry until unpauseTimeout.
+	stillPaused func(context.Context) bool
+	frozen      bool
+	capped      bool
+	timer       *time.Timer
+	parent      context.Context
+	onCap       func()
+	thawErr     error
 }
 
 func (f *freezer) freeze(ctx context.Context) error {
@@ -328,6 +378,13 @@ func (f *freezer) freeze(ctx context.Context) error {
 		return errors.New("the target is already frozen")
 	}
 	if err := f.p.ContainerPause(ctx, f.container); err != nil {
+		// The daemon may have paused the target although the request
+		// failed here (the attempt timed out or was cancelled while it was
+		// in flight): unpause it anyway, ignoring the error a target that
+		// is not paused gives.
+		uctx, cancel := context.WithTimeout(context.WithoutCancel(f.parent), unpauseTimeout)
+		_ = f.p.ContainerUnpause(uctx, f.container)
+		cancel()
 		return err
 	}
 	f.frozen = true
@@ -366,12 +423,29 @@ func (f *freezer) thawLocked() error {
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(f.parent), unpauseTimeout)
 	defer cancel()
-	err := f.p.ContainerUnpause(ctx, f.container)
-	f.frozen = false
-	if err != nil {
-		f.thawErr = fmt.Errorf("unpause the target: %w", err)
+	// Retry a failed unpause until it works or unpauseTimeout runs out: a
+	// target left paused fails every later attempt and probe.
+	var err error
+	for {
+		if err = f.p.ContainerUnpause(ctx, f.container); err == nil || ctx.Err() != nil {
+			break
+		}
+		if f.stillPaused != nil && !f.stillPaused(ctx) {
+			// Not paused any more (it exited, or is gone): nothing to
+			// retry. Report the error as before, and do not retry later.
+			f.frozen = false
+			f.thawErr = fmt.Errorf("unpause the target: %w", err)
+			return f.thawErr
+		}
+		sleepCtx(ctx, unpauseRetry)
 	}
-	return f.thawErr
+	if err != nil {
+		// Still frozen as far as we know: a later thaw tries again.
+		f.thawErr = fmt.Errorf("unpause the target: %w", err)
+		return f.thawErr
+	}
+	f.frozen, f.thawErr = false, nil
+	return nil
 }
 
 func (f *freezer) wasCapped() bool {
@@ -400,7 +474,7 @@ func (x *sequenceExec) attempt(parent context.Context, s *contract.SequenceProbe
 	defer cancel()
 	var fz *freezer
 	if p, ok := x.r.Engine.(engine.Pauser); ok {
-		fz = &freezer{p: p, container: x.h.Container, parent: parent, onCap: cancel}
+		fz = &freezer{p: p, container: x.h.Container, parent: parent, onCap: cancel, stillPaused: x.stillPaused}
 	}
 	var as attemptState
 	defer func() {
@@ -612,6 +686,15 @@ func (x *sequenceExec) newReports(ctx context.Context, snap map[string]logFile) 
 		if old, ok := snap[name]; ok {
 			if f.Size == old.size && f.ModTime.Equal(old.modTime) && sha256.Sum256(data) == old.sum {
 				continue // unchanged
+			}
+			if old.read < old.size && f.Size >= old.size && int64(len(data)) >= old.read &&
+				sha256.Sum256(data[:old.read]) == old.sum {
+				// The snapshot was cut at maxReportBytes and the file still
+				// starts with what it read: it grew (or was touched) past
+				// the cap. What is new lies beyond the bytes the engine
+				// returns, so nothing new can be read, and the old part
+				// must not be parsed again as a new report.
+				continue
 			}
 			if f.Size > old.size && old.read == old.size && int64(len(data)) >= old.size && sha256.Sum256(data[:old.size]) == old.sum {
 				data = data[old.size:] // appended to

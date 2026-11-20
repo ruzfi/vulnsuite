@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -265,7 +266,26 @@ func (s SequenceProbe) TimeoutDuration() time.Duration {
 	if s.Timeout <= 0 {
 		return DefaultSequenceTimeout
 	}
+	if s.Timeout >= float64(math.MaxInt64)/float64(time.Second) {
+		// A huge value would overflow to a negative duration, which ends
+		// every attempt at once: treat it as unbounded instead.
+		return time.Duration(math.MaxInt64)
+	}
 	return time.Duration(s.Timeout * float64(time.Second))
+}
+
+// HasNetworkStep reports whether a step reaches the target over the network
+// (http, tcp or net), which needs a path from this host to it.
+func (s *SequenceProbe) HasNetworkStep() bool {
+	if s == nil {
+		return false
+	}
+	for _, st := range s.Steps {
+		if st.HTTP != nil || st.TCP != nil || st.Net != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // SequenceStep is one step of a sequence. Exactly one of the kinds is set.

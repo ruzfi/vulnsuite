@@ -1245,7 +1245,22 @@ func (r *Runner) runProbes(ctx context.Context, c *contract.Contract, st *contra
 		return
 	}
 	tgt.Sequence = seq
-	ok, results := probes.RunAll(ctx, st.Verify, tgt)
+	ok := true
+	results := make([]probes.Result, 0, len(st.Verify))
+	for _, p := range st.Verify {
+		res := probes.Run(ctx, p, tgt)
+		results = append(results, res)
+		ok = ok && res.OK
+		if p.Kind() == "sequence" {
+			// A sequence may have restarted the target, and the daemon may
+			// have given its published ports other host ports: later
+			// probes dial the address as it is now.
+			if t, why := r.networkTarget(c, h, exec); why == "" {
+				t.Sequence = seq
+				tgt = t
+			}
+		}
+	}
 	if h.DaemonRemote && allTransportFailures(results) {
 		// Every probe failed to connect and the daemon is remote: the bound
 		// address isn't reachable from here, which is an addressing problem, not
@@ -1294,7 +1309,10 @@ func (r *Runner) networkTarget(c *contract.Contract, h *Handle, exec probes.Exec
 func (r *Runner) runExecProbesOnly(ctx context.Context, st *contract.State, h *Handle, tgt probes.Target, why string) {
 	var execs []contract.Probe
 	for _, p := range st.Verify {
-		if k := p.Kind(); k == "exec" || k == "sequence" {
+		// A sequence with an http, tcp or net step needs the network path
+		// too: run from here, every attempt would end not reached and fail
+		// verify for a reason that is this host's, not the target's.
+		if k := p.Kind(); k == "exec" || (k == "sequence" && !p.Sequence.HasNetworkStep()) {
 			execs = append(execs, p)
 		}
 	}
