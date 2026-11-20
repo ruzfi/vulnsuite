@@ -246,6 +246,10 @@ type FileContent struct {
 	Size int64
 	// Data is the file's content, cut to the caller's maxBytes.
 	Data []byte
+	// ModTime is the file's modification time as the archive reports it
+	// (whole seconds from dockerd; zero when unknown). A file rewritten with
+	// the same size shows up by it.
+	ModTime time.Time
 }
 
 // Truncated reports whether Data holds less than the whole file.
@@ -300,7 +304,7 @@ func DirFilesFromTar(r io.Reader, root string, maxBytes int64) (map[string]FileC
 			if err != nil {
 				return nil, fmt.Errorf("reading %s from the container archive: %w", name, err)
 			}
-			fc = FileContent{Size: h.Size, Data: data}
+			fc = FileContent{Size: h.Size, Data: data, ModTime: h.ModTime}
 		case tar.TypeLink:
 			target, ok := strings.CutPrefix(h.Linkname, prefix)
 			if !ok {
@@ -310,7 +314,7 @@ func DirFilesFromTar(r io.Reader, root string, maxBytes int64) (map[string]FileC
 			if !ok {
 				continue
 			}
-			fc = FileContent{Size: src.Size, Data: append([]byte(nil), src.Data...)}
+			fc = FileContent{Size: src.Size, Data: append([]byte(nil), src.Data...), ModTime: src.ModTime}
 		default:
 			continue
 		}

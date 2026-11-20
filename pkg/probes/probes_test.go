@@ -393,9 +393,10 @@ func TestInvalidRegexFailsProbe(t *testing.T) {
 	}
 }
 
-// Until the sequence executor lands (#98), a sequence probe fails with a clear
-// detail and never touches the target.
-func TestRunSequenceUnsupported(t *testing.T) {
+// Without an executor a sequence probe fails with a clear detail and never
+// touches the target; with one, Run hands it the sequence and fills in the
+// kind and elapsed time.
+func TestRunSequence(t *testing.T) {
 	called := false
 	tgt := Target{Container: "c", Exec: func(context.Context, string, string, time.Duration) (int, string, error) {
 		called = true
@@ -408,12 +409,21 @@ func TestRunSequenceUnsupported(t *testing.T) {
 	if r.OK || r.Kind != "sequence" || r.Detail != SequenceUnsupported || r.Transport || called {
 		t.Fatalf("result = %+v, exec called %v", r, called)
 	}
-	if !strings.Contains(r.Detail, "#98") {
-		t.Fatalf("detail %q", r.Detail)
-	}
 	ok, rs := RunAll(context.Background(), []contract.Probe{p}, tgt)
-	if ok || !strings.HasPrefix(FormatResults(rs), "FAIL sequence probes are not supported") {
+	if ok || FormatResults(rs) != "FAIL "+SequenceUnsupported {
 		t.Fatalf("RunAll = %v %q", ok, FormatResults(rs))
+	}
+
+	var got *contract.SequenceProbe
+	tgt.Sequence = func(_ context.Context, s *contract.SequenceProbe) Result {
+		got = s
+		time.Sleep(time.Millisecond)
+		return Result{OK: true, Detail: "sequence: 1/1 passed, 0 failed: #1 pass: ok",
+			Attempts: []SequenceAttempt{{Attempt: 1, Outcome: OutcomePass, Detail: "ok"}}}
+	}
+	r = Run(context.Background(), p, tgt)
+	if got != p.Sequence || !r.OK || r.Kind != "sequence" || r.Elapsed < time.Millisecond || len(r.Attempts) != 1 {
+		t.Fatalf("result = %+v", r)
 	}
 }
 

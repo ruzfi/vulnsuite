@@ -276,9 +276,10 @@ one attempt, in which the core freezes and resumes the target (`docker pause`)
 and reads the sanitizer reports and log lines written during the attempt.
 Sidecars are never frozen, so a driver sidecar can act on the frozen target's
 sockets. It is per state like any probe: patched writes its own sequence.
-This version parses and validates sequences, but `run` fails verify on one
-with `sequence probes are not supported by this version yet (#98)`; the
-executor is coming in a follow-up.
+It runs through the engine only (exec, pause, archive reads, logs) and on the
+private sidecar network, so a sequence without `http`, `tcp` or `net` steps
+verifies in every exposure mode, internal mode on Docker Desktop and OrbStack
+included.
 
 ```yaml
 service:
@@ -327,6 +328,73 @@ connects to it (`http`, `tcp`, `net`) while it is frozen, that `container`
 names a sidecar, and that the sequence asserts something: an
 `expect_sanitizer`, an `expect_log`, or an `exec` with `expect_exit` or
 `stdout_matches`.
+
+#### How a sequence runs
+
+Before the first attempt, when `service.sanitizer.log_dir` is set, `run`
+stats it through the Docker archive API: it must be a directory with mode
+`0777` or `1777`, otherwise verify fails with `sanitizer log_dir /var/log/asan
+is not writable by every user (mode 0755)` (or `does not exist`). A report
+the sanitizer cannot write is lost silently, so this is an error, not a
+warning. An engine that cannot pause containers (for `freeze`/`resume`) or
+read container files (for `log_dir`) fails verify with that reason; the
+sequence is never skipped.
+
+Each attempt records where the target's log ends and the size, time and
+content of every file in `log_dir`, then runs the steps in order under the
+attempt `timeout`:
+
+| Step | At run time |
+| --- | --- |
+| `exec` | in the target, or in the sidecar `container` of the same state. Default `expect_exit` 0 and `timeout` 30 s, as for an `exec` probe |
+| `freeze` / `resume` | `docker pause` / `unpause` of the target container, never a sidecar |
+| `sleep` | waits, cut short by the attempt timeout |
+| `http`, `tcp`, `net` | against the same address the other probes use. When this machine cannot reach the target (internal mode on Docker Desktop, macvlan, a remote daemon's loopback) the step cannot run and the attempt is not reached, with the same explanation as skipped network probes |
+| `expect_sanitizer` | reads the files in `log_dir` that are new or changed since the attempt started (only the appended part of a file that grew; at most 1 MiB per file) and parses every `ERROR: <Name>Sanitizer: <description>` report in them. `kind` matches the report's `SUMMARY` class or a word of its description (`attempting double-free` is a `double-free`); `frame` must match a frame of the report's first stack (the faulting access, up to the first blank line), written as `func file:line`. A report is written after resume, so the step waits up to 5 s for a matching one; `none` watches the whole 5 s and fails on the first report |
+| `expect_log` | the regexp (dot matches newline) against what the target logged since the attempt started, waiting up to 5 s for it |
+
+Every attempt ends as exactly one of:
+
+- **hit**: every assertion held, a positive `expect_sanitizer` among them;
+- **pass**: every assertion held, and there is no positive `expect_sanitizer` (patched);
+- **not reached**: an `exec`, `freeze`, `resume` or network step failed, an
+  `expect_log` did not match, or the attempt timed out. The race was not shown
+  to run, so the attempt counts toward neither side. An `exec` or network
+  failure ends the attempt; later steps do not run;
+- **fail**: an `expect_sanitizer` did not hold. A report during an attempt
+  with `expect_sanitizer: none` is a fail even when the attempt was otherwise
+  not reached.
+
+A sequence with a positive `expect_sanitizer` passes once `min_hits` attempts
+hit, and fails as soon as that can no longer happen. One without passes on its
+first passing attempt and fails on its first failed one, so a sanitizer report
+on patched in any attempt fails verify and `attempts` only absorbs harness
+errors. When no attempt reached the race, verify fails with the last reason.
+The detail lists every attempt:
+
+```
+sequence: 1/2 hits (min 1): #1 not reached: driver: exec "/trigger.py setup" -> exit 1 != 0; #2 hit: heap-use-after-free at ngx_resolver_process_a ngx_resolver.c:2142
+```
+
+`-json` carries the same per attempt in the probe's `attempts` (`attempt`,
+`outcome` = `hit`, `pass`, `not_reached` or `fail`, `detail`, `restarted`,
+`elapsed`).
+
+The core guarantees:
+
+- **A frozen target is always resumed**: after a failed step, on the attempt
+  timeout, on Ctrl-C (the unpause runs on its own short-lived context), and at
+  the end of the attempt even when its `resume` was never reached. A freeze
+  lasts at most 30 s; past that the target is unpaused at once, even while a
+  step is still running, and the attempt is not reached.
+- **Restart between attempts**: when the target exited during an attempt (an
+  ASan build with `halt_on_error=1` aborts after its report), it is started
+  again and its healthcheck waited for before the next attempt; the attempt
+  shows `(target restarted)`. A target that cannot be started again makes the
+  remaining attempts not reached.
+- **`vulnsuite stop` removes a paused target**: the daemon's forced remove
+  takes a paused container, so a run that crashed mid-freeze leaves nothing
+  frozen behind.
 
 ### Paths
 

@@ -1234,28 +1234,14 @@ func (r *Runner) runProbes(ctx context.Context, c *contract.Contract, st *contra
 	exec := func(ctx context.Context, container, command string, timeout time.Duration) (int, string, error) {
 		return r.Engine.ContainerExec(ctx, container, command, timeout)
 	}
-	host, port := r.probeAddress(h, c)
-	if host == "" {
-		r.runExecProbesOnly(ctx, st, h, exec, fmt.Sprintf("could not verify from this host in %s mode: the target's address lives on the Docker daemon's network, "+
-			"not this machine's (normal on Docker Desktop/OrbStack and macvlan, and whenever the daemon is remote). "+
-			"The target is up; scan it from a container on the same network, or use --expose host.", h.Exposure.Mode))
+	seq := r.sequenceFunc(c, h, exec)
+	tgt, why := r.networkTarget(c, h, exec)
+	if why != "" {
+		r.runExecProbesOnly(ctx, st, h, probes.Target{Container: h.Container, Exec: exec, Sequence: seq}, why)
 		return
 	}
-	if probeFromHereFutile(h) {
-		// The probe address resolves to our own loopback but the daemon, and so
-		// the target, is elsewhere. Report it as unreachable-from-here, not as a
-		// wrong state, and name the flag that fixes it.
-		r.runExecProbesOnly(ctx, st, h, exec, remoteProbeHint(h))
-		return
-	}
-	scheme := h.Scheme
-	if scheme == "" {
-		scheme = "http"
-	}
-	ok, results := probes.RunAll(ctx, st.Verify, probes.Target{
-		Host: host, Port: port, Scheme: scheme, Schemes: portSchemes(c), Container: h.Container, PortMap: hostPortMap(h),
-		Exec: exec,
-	})
+	tgt.Sequence = seq
+	ok, results := probes.RunAll(ctx, st.Verify, tgt)
 	if h.DaemonRemote && allTransportFailures(results) {
 		// Every probe failed to connect and the daemon is remote: the bound
 		// address isn't reachable from here, which is an addressing problem, not
@@ -1269,6 +1255,31 @@ func (r *Runner) runProbes(ctx context.Context, c *contract.Contract, st *contra
 	h.VerifyDetail = probes.FormatResults(results)
 }
 
+// networkTarget is where network probes reach the target from this machine,
+// or, when they cannot, why not (in which case the target is zero).
+func (r *Runner) networkTarget(c *contract.Contract, h *Handle, exec probes.ExecFunc) (probes.Target, string) {
+	host, port := r.probeAddress(h, c)
+	if host == "" {
+		return probes.Target{}, fmt.Sprintf("could not verify from this host in %s mode: the target's address lives on the Docker daemon's network, "+
+			"not this machine's (normal on Docker Desktop/OrbStack and macvlan, and whenever the daemon is remote). "+
+			"The target is up; scan it from a container on the same network, or use --expose host.", h.Exposure.Mode)
+	}
+	if probeFromHereFutile(h) {
+		// The probe address resolves to our own loopback but the daemon, and so
+		// the target, is elsewhere. Report it as unreachable-from-here, not as a
+		// wrong state, and name the flag that fixes it.
+		return probes.Target{}, remoteProbeHint(h)
+	}
+	scheme := h.Scheme
+	if scheme == "" {
+		scheme = "http"
+	}
+	return probes.Target{
+		Host: host, Port: port, Scheme: scheme, Schemes: portSchemes(c), Container: h.Container, PortMap: hostPortMap(h),
+		Exec: exec,
+	}, ""
+}
+
 // runExecProbesOnly verifies a target this machine cannot reach. exec and
 // sequence probes need no network path (they run through the engine and on
 // the private sidecar network), so they run; the network probes are skipped
@@ -1276,7 +1287,7 @@ func (r *Runner) runProbes(ctx context.Context, c *contract.Contract, st *contra
 // probe is one of those and all pass, verify passes; when network probes were
 // skipped, the result is partial and VerifyOK stays nil (not verified), with
 // the in-container results in the detail.
-func (r *Runner) runExecProbesOnly(ctx context.Context, st *contract.State, h *Handle, exec probes.ExecFunc, why string) {
+func (r *Runner) runExecProbesOnly(ctx context.Context, st *contract.State, h *Handle, tgt probes.Target, why string) {
 	var execs []contract.Probe
 	for _, p := range st.Verify {
 		if k := p.Kind(); k == "exec" || k == "sequence" {
@@ -1287,7 +1298,7 @@ func (r *Runner) runExecProbesOnly(ctx context.Context, st *contract.State, h *H
 		h.VerifyDetail = why
 		return
 	}
-	ok, results := probes.RunAll(ctx, execs, probes.Target{Container: h.Container, Exec: exec})
+	ok, results := probes.RunAll(ctx, execs, tgt)
 	h.Probes = results
 	h.VerifyDetail = probes.FormatResults(results)
 	skipped := len(st.Verify) - len(execs)

@@ -64,6 +64,8 @@ type File struct {
 	Mode fs.FileMode
 	// Data is a regular file's content, or a symlink's target.
 	Data string
+	// ModTime is when WriteFile last wrote it.
+	ModTime time.Time
 }
 
 // Fake is an in-memory engine.
@@ -820,7 +822,7 @@ func (f *Fake) WriteFile(container, p string, mode fs.FileMode, data string) err
 	if c.Files == nil {
 		c.Files = map[string]File{}
 	}
-	c.Files[path.Clean(p)] = File{Mode: mode, Data: data}
+	c.Files[path.Clean(p)] = File{Mode: mode, Data: data, ModTime: time.Now()}
 	return nil
 }
 
@@ -900,7 +902,8 @@ func (f *Fake) ContainerReadDir(ctx context.Context, id, dir string, maxBytes in
 	sort.Strings(names)
 	for _, p := range names {
 		file := c.Files[p]
-		h := &tar.Header{Name: strings.TrimSuffix(root, "/") + "/" + strings.TrimPrefix(p, strings.TrimSuffix(dir, "/")+"/"), Mode: int64(file.Mode.Perm())}
+		h := &tar.Header{Name: strings.TrimSuffix(root, "/") + "/" + strings.TrimPrefix(p, strings.TrimSuffix(dir, "/")+"/"), Mode: int64(file.Mode.Perm()),
+			ModTime: file.ModTime, Format: tar.FormatPAX} // sub-second, unlike dockerd's whole seconds
 		switch {
 		case file.Mode.IsDir():
 			h.Typeflag, h.Name = tar.TypeDir, h.Name+"/"

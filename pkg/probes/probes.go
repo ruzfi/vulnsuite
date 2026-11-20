@@ -33,6 +33,11 @@ const UserAgent = "vulnsuite-verify/1.0"
 // ExecFunc runs a shell command inside a container and returns (exit code, output).
 type ExecFunc func(ctx context.Context, container, command string, timeout time.Duration) (int, string, error)
 
+// SequenceFunc runs a sequence probe. It needs the container engine (freeze,
+// sidecar exec, archive reads), so the runner supplies it; Run fills in the
+// result's Kind and Elapsed.
+type SequenceFunc func(ctx context.Context, s *contract.SequenceProbe) Result
+
 // Target is where probes are sent.
 type Target struct {
 	Host   string
@@ -53,6 +58,9 @@ type Target struct {
 	// missing from a non-nil map is not reachable from here. Port (the default
 	// when a probe names none) is already the address to dial.
 	PortMap map[int]int
+	// Sequence runs sequence probes. Without it a sequence fails with
+	// SequenceUnsupported.
+	Sequence SequenceFunc
 }
 
 // dialPort resolves the port a probe dials: 0 means the target's own Port; a
@@ -91,6 +99,34 @@ type Result struct {
 	// lets a caller tell "I can't get to this address from here" from "the
 	// service answered but is in the wrong state".
 	Transport bool `json:"transport,omitempty"`
+	// Attempts is each attempt of a sequence probe, in order (nil for the
+	// other kinds).
+	Attempts []SequenceAttempt `json:"attempts,omitempty"`
+}
+
+// Sequence attempt outcomes.
+const (
+	// OutcomeHit: every assertion held, a positive expect_sanitizer among them.
+	OutcomeHit = "hit"
+	// OutcomePass: every assertion held and none expects a sanitizer report.
+	OutcomePass = "pass"
+	// OutcomeNotReached: an exec, network, freeze or resume step or an
+	// expect_log failed, or the attempt timed out: the race was not shown to
+	// run, so the attempt counts toward neither side.
+	OutcomeNotReached = "not_reached"
+	// OutcomeFail: an expect_sanitizer did not hold.
+	OutcomeFail = "fail"
+)
+
+// SequenceAttempt is the outcome of one attempt of a sequence probe.
+type SequenceAttempt struct {
+	Attempt int    `json:"attempt"` // 1-based
+	Outcome string `json:"outcome"` // OutcomeHit, OutcomePass, OutcomeNotReached or OutcomeFail
+	Detail  string `json:"detail"`
+	// Restarted is set when the target had exited and was started again
+	// before this attempt.
+	Restarted bool          `json:"restarted,omitempty"`
+	Elapsed   time.Duration `json:"elapsed"`
 }
 
 // connError marks a probe failure as a transport failure: the target could not
@@ -366,9 +402,9 @@ func secs(f float64, def time.Duration) time.Duration {
 	return time.Duration(f * float64(time.Second))
 }
 
-// SequenceUnsupported is the verify detail of a sequence probe in this
-// version, which parses and validates sequences but cannot run them yet.
-const SequenceUnsupported = "sequence probes are not supported by this version yet (#98)"
+// SequenceUnsupported is the detail of a sequence probe run without a
+// Target.Sequence executor.
+const SequenceUnsupported = "sequence probes need a container engine to run, and none was given"
 
 // Run executes one probe against the target.
 func Run(ctx context.Context, p contract.Probe, t Target) Result {
@@ -392,10 +428,16 @@ func Run(ctx context.Context, p contract.Probe, t Target) Result {
 	case "net":
 		ok, detail, err = runNet(ctx, p.Net, t)
 	case "sequence":
-		// Fail rather than skip: a target whose only proof is a sequence must
-		// not be reported as verified (or silently unverified) until the
-		// executor lands.
-		ok, detail = false, SequenceUnsupported
+		// Fail rather than skip without an executor: a target whose only
+		// proof is a sequence must not be reported as verified (or silently
+		// unverified).
+		if t.Sequence == nil {
+			ok, detail = false, SequenceUnsupported
+			break
+		}
+		r := t.Sequence(ctx, p.Sequence)
+		r.Kind, r.Elapsed = p.Kind(), time.Since(started)
+		return r
 	default:
 		err = fmt.Errorf("unknown probe kind %q", p.Kind())
 	}
@@ -878,6 +920,11 @@ func checkPatterns(p contract.Probe) error {
 	}
 	return nil
 }
+
+// MatchDotAll matches the Go regexp pat against text with dot matching
+// newline, the semantics of every probe pattern. A pattern that does not
+// compile matches nothing.
+func MatchDotAll(pat, text string) bool { return matchDotAll(pat, text) }
 
 // matchDotAll matches pat in dot-all mode. Run rejects patterns that do not
 // compile before any probe runs, so the error branch is unreachable there.
