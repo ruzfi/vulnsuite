@@ -182,13 +182,18 @@ func Parse(data []byte) (*Contract, error) {
 	}
 	// Which base keys are present, even with an empty value: the schema
 	// rejects `context: ""` on an image base like any other foreign key.
+	// Likewise which keys each sidecar writes: `image: ""` or `digest: ""`
+	// next to a build is a key the schema rejects there.
 	var keys struct {
-		Base map[string]any `yaml:"base"`
+		Base    map[string]any `yaml:"base"`
+		Service struct {
+			Sidecars []map[string]any `yaml:"sidecars"`
+		} `yaml:"service"`
 	}
 	if err := yaml.Unmarshal(data, &keys); err != nil {
 		return nil, fmt.Errorf("invalid YAML: %s", strings.TrimSpace(yaml.FormatError(err, false, false)))
 	}
-	if err := c.checkStructure(keys.Base); err != nil {
+	if err := c.checkStructure(keys.Base, keys.Service.Sidecars); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -206,8 +211,9 @@ var baseKeys = map[string]map[string]bool{
 }
 
 // checkStructure enforces the same rules as schemas/contract.schema.json.
-// present holds the keys written under base, empty values included.
-func (c *Contract) checkStructure(present map[string]any) error {
+// present holds the keys written under base, empty values included, and
+// sidecarKeys those of each service sidecar, in order.
+func (c *Contract) checkStructure(present map[string]any, sidecarKeys []map[string]any) error {
 	if c.APIVersion != APIVersion {
 		return se("apiVersion", "must be %q (got %q)", APIVersion, c.APIVersion)
 	}
@@ -386,15 +392,20 @@ func (c *Contract) checkStructure(present map[string]any) error {
 	}
 	seenSidecar := map[string]bool{}
 	for i, sc := range s.Sidecars {
-		if sc.Name == "" || sc.Image == "" {
-			return se(fmt.Sprintf("service/sidecars/%d", i), "name and image are required")
+		loc := fmt.Sprintf("service/sidecars/%d", i)
+		if sc.Build != nil {
+			if err := checkSidecarBuild(loc, sc, keysAt(sidecarKeys, i)); err != nil {
+				return err
+			}
+		} else if sc.Name == "" || sc.Image == "" {
+			return se(loc, "name and image are required")
 		}
 		if seenSidecar[sc.Name] {
-			return se(fmt.Sprintf("service/sidecars/%d/name", i), "sidecar %q is declared more than once", sc.Name)
+			return se(loc+"/name", "sidecar %q is declared more than once", sc.Name)
 		}
 		seenSidecar[sc.Name] = true
 		if sc.Digest != "" && !digestRe.MatchString(sc.Digest) {
-			return se(fmt.Sprintf("service/sidecars/%d/digest", i), "must look like sha256:<64 hex>")
+			return se(loc+"/digest", "must look like sha256:<64 hex>")
 		}
 	}
 
@@ -535,6 +546,55 @@ func (c *Contract) checkStructure(present map[string]any) error {
 			if n != 1 {
 				return se(ploc, "exactly one of http, exec, tcp, net, sequence must be set")
 			}
+		}
+	}
+	return nil
+}
+
+// sidecarNameRe is the name of a built sidecar, which is part of its image
+// tag (sidecar-<name>-<hash>): a Docker tag's characters, at most
+// maxSidecarName long so the tag stays within Docker's 128.
+var sidecarNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
+
+const maxSidecarName = 100
+
+// keysAt returns the i-th sidecar's key set (nil when out of range).
+func keysAt(keys []map[string]any, i int) map[string]any {
+	if i < len(keys) {
+		return keys[i]
+	}
+	return nil
+}
+
+// checkSidecarBuild checks a sidecar with a build: no image or digest next to
+// it (present holds the keys written, empty values included), a name that can
+// be part of an image tag, and a context and Dockerfile under the base build
+// path rules.
+func checkSidecarBuild(loc string, sc Sidecar, present map[string]any) error {
+	_, hasImage := present["image"]
+	if hasImage || sc.Image != "" {
+		return se(loc, "set either image or build, not both")
+	}
+	if _, hasDigest := present["digest"]; hasDigest || sc.Digest != "" {
+		return se(loc+"/digest", "pins an image; a built sidecar is pinned by its content and takes no digest")
+	}
+	if sc.Name == "" {
+		return se(loc+"/name", "is required")
+	}
+	if !sidecarNameRe.MatchString(sc.Name) || len(sc.Name) > maxSidecarName {
+		return se(loc+"/name", "%q must match %s and be at most %d characters: a built sidecar's name is part of its image tag", sc.Name, sidecarNameRe, maxSidecarName)
+	}
+	b := sc.Build
+	if b.Context == "" {
+		return se(loc+"/build/context", "is required")
+	}
+	if err := checkLocalPath(b.Context); err != nil {
+		return se(loc+"/build/context", "%q %v", b.Context, err)
+	}
+	_, hasDockerfile := present["build"].(map[string]any)["dockerfile"]
+	if b.Dockerfile != "" || hasDockerfile {
+		if err := checkLocalPath(b.Dockerfile); err != nil {
+			return se(loc+"/build/dockerfile", "%q %v", b.Dockerfile, err)
 		}
 	}
 	return nil

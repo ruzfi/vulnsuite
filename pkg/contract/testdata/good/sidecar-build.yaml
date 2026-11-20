@@ -1,0 +1,28 @@
+apiVersion: vulnsuite/v1
+kind: Target
+metadata:
+  id: demo-sidecar-build
+  summary: a target whose sidecars are built from contexts in the template
+base:
+  kind: image
+  image: nginx:1.27
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+service:
+  ports: [ { container: 80, protocol: http } ]
+  sidecars:
+    - name: driver
+      build: { context: sidecars/driver, dockerfile: Dockerfile, build_args: { PY: "3.13" } }
+      command: ["sleep", "infinity"]
+    - name: dns
+      build: { context: sidecars/dns }
+      environment: { PORT: "53" }
+    - { name: db, image: redis:7, digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111" }
+states:
+  vulnerable:
+    verify:
+      - http: { path: /, status: 200 }
+  patched:
+    sidecars:
+      dns: { image: "python:3.13-slim", digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222" }
+    verify:
+      - http: { path: /, status: 404 }

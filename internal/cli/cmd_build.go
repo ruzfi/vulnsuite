@@ -87,6 +87,27 @@ type buildResult struct {
 	Pushed    []string `json:"pushed,omitempty"`
 	Elapsed   string   `json:"elapsed,omitempty"`
 	Error     string   `json:"error,omitempty"`
+	// Sidecars are the state's built sidecar images (none for sidecars that
+	// run a prebuilt image).
+	Sidecars []sidecarResult `json:"sidecars,omitempty"`
+}
+
+// sidecarResult is one built sidecar image of a build result.
+type sidecarResult struct {
+	Name  string `json:"name"`
+	Ref   string `json:"ref"`
+	Built bool   `json:"built"`
+}
+
+// resolvedVerb says how an image was resolved: built, pulled or reused.
+func resolvedVerb(r *builder.Resolved) string {
+	switch {
+	case r.Built:
+		return "built"
+	case r.Pulled:
+		return "pulled"
+	}
+	return "reused"
 }
 
 func cmdBuild() *Command {
@@ -101,12 +122,17 @@ func cmdBuild() *Command {
 		Usage: "[vulnerable|patched] -t SEL... | -f FILE | <filter> | -all [-variants] [-state vulnerable|patched|all] [-j N] [-push -registry REG]",
 		Long: `Every state's image is tagged ` + contract.ImageRepoPrefix + `/<id>:<state>-<hash> where the hash
 covers the base, patches, overlays and environment. Identical inputs are never
-rebuilt. Prebuilt (image-kind) states are pulled, not built. A state
-positional (vulnerable or patched), anywhere among the arguments, is shorthand
-for -state: ` + "`build patched -t grafana`" + `.
+rebuilt. Prebuilt (image-kind) states are pulled, not built. A sidecar with a
+build is built with each state that runs it, tagged
+` + contract.ImageRepoPrefix + `/<id>:sidecar-<name>-<hash> (shared by the states); sidecars that run a
+prebuilt image are pulled by run, not here. A state positional (vulnerable
+or patched), anywhere among the arguments, is shorthand for -state:
+` + "`build patched -t grafana`" + `.
 
 With -push, each image is also tagged <registry>/<id>:<state> and
-<registry>/<id>:<state>-<hash> and pushed. Credentials come from
+<registry>/<id>:<state>-<hash> and pushed, and each built sidecar image
+<registry>/<id>:sidecar-<name> and <registry>/<id>:sidecar-<name>-<hash>
+(once, though both states run it). Credentials come from
 ~/.docker/config.json or VULNSUITE_REGISTRY_USER / VULNSUITE_REGISTRY_TOKEN.
 The env pair is only sent when pushing, never on pulls of template images,
 unless VULNSUITE_REGISTRY names a registry: then it is used for that registry
@@ -276,14 +302,10 @@ only (pulls and pushes).`,
 							g.errorf("%s", indent(lastLines(o.Log, 20), "    "))
 						}
 					} else {
-						verb := "reused"
-						switch {
-						case o.Resolved.Built:
-							verb = "built"
-						case o.Resolved.Pulled:
-							verb = "pulled"
+						g.printf("✔ %s [%s] %s (%s) %s  %s\n", id, o.Job.State, resolvedVerb(o.Resolved), o.Resolved.BuildKind, o.Resolved.Elapsed.Round(100*time.Millisecond), o.Resolved.Ref)
+						for _, sr := range o.Resolved.Sidecars {
+							g.printf("    sidecar %s %s  %s\n", sr.Sidecar, resolvedVerb(sr), sr.Ref)
 						}
-						g.printf("✔ %s [%s] %s (%s) %s  %s\n", id, o.Job.State, verb, o.Resolved.BuildKind, o.Resolved.Elapsed.Round(100*time.Millisecond), o.Resolved.Ref)
 					}
 					if showLog && o.Log != "" {
 						g.printf("%s", indent(o.Log, "    "))
@@ -305,6 +327,9 @@ only (pulls and pushes).`,
 				default:
 					r.Ref, r.BuildKind, r.Built, r.Pulled = o.Resolved.Ref, o.Resolved.BuildKind, o.Resolved.Built, o.Resolved.Pulled
 					r.Elapsed = o.Resolved.Elapsed.Round(100 * time.Millisecond).String()
+					for _, sr := range o.Resolved.Sidecars {
+						r.Sidecars = append(r.Sidecars, sidecarResult{Name: sr.Sidecar, Ref: sr.Ref, Built: sr.Built})
+					}
 					// requires.probe needs the image, so it runs on the result:
 					// a non-zero exit skips the job (it is not pushed), not
 					// being able to run it fails the job.
@@ -328,6 +353,9 @@ only (pulls and pushes).`,
 				results = append(results, r)
 			}
 			if push {
+				// A built sidecar image is shared by the states that run it:
+				// it is pushed with the first of them, by its local tag.
+				sidecarsPushed := map[string]bool{}
 				for i := range results {
 					r := &results[i]
 					if r.Error != "" {
@@ -339,12 +367,26 @@ only (pulls and pushes).`,
 					c := findContract(cs, r.ID)
 					pushed, err := b.Publish(ctx, c, r.State, registry, nil)
 					r.Pushed = pushed
+					if err == nil {
+						for _, sr := range r.Sidecars {
+							if sidecarsPushed[sr.Ref] {
+								continue
+							}
+							var p []string
+							p, err = b.PublishSidecar(ctx, c, sidecarNamed(c, sr.Name), registry, nil)
+							r.Pushed = append(r.Pushed, p...)
+							if err != nil {
+								break
+							}
+							sidecarsPushed[sr.Ref] = true
+						}
+					}
 					if err != nil {
 						r.Error = err.Error()
 						g.errorf("✗ push %s [%s]: %v\n", r.ID, r.State, err)
 						continue
 					}
-					g.printf("⇧ %s [%s] pushed %s\n", r.ID, r.State, strings.Join(pushed, ", "))
+					g.printf("⇧ %s [%s] pushed %s\n", r.ID, r.State, strings.Join(r.Pushed, ", "))
 				}
 			}
 			failed := 0
@@ -419,6 +461,16 @@ func defaultJobs() int {
 		n = 1
 	}
 	return n
+}
+
+// sidecarNamed returns c's service sidecar called name.
+func sidecarNamed(c *contract.Contract, name string) contract.Sidecar {
+	for _, sc := range c.Service.Sidecars {
+		if sc.Name == name {
+			return sc
+		}
+	}
+	return contract.Sidecar{Name: name}
 }
 
 func findContract(cs []*contract.Contract, id string) *contract.Contract {
@@ -510,7 +562,11 @@ func cmdImages() *Command {
 			fmt.Fprintln(tw, "ID\tSTATE\tHASH\tREF")
 			for _, r := range refs {
 				repo, tag, _ := strings.Cut(strings.TrimPrefix(r, contract.ImageRepoPrefix+"/"), ":")
-				state, hash, _ := strings.Cut(tag, "-")
+				// <state>-<hash>, or sidecar-<name>-<hash> for a built sidecar.
+				state, hash := tag, ""
+				if i := strings.LastIndex(tag, "-"); i >= 0 {
+					state, hash = tag[:i], tag[i+1:]
+				}
 				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", repo, state, hash, r)
 			}
 			tw.Flush()

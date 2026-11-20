@@ -224,7 +224,8 @@ var (
 
 // pinning checks that every image a template runs or builds from is pinned:
 // the base (image digest / full source commit), per-state image overrides and
-// sidecar images. An unpinned ref is an error, or a warning with
+// sidecar images (a sidecar built from the template is pinned by its
+// content). An unpinned ref is an error, or a warning with
 // AllowUnpinned; an abbreviated commit is always a warning.
 func (v *Validator) pinning(c *contract.Contract) []Finding {
 	level := Error
@@ -268,7 +269,9 @@ func (v *Validator) pinning(c *contract.Contract) []Finding {
 		}
 	}
 	for _, sc := range c.Service.Sidecars {
-		if !contract.RefPinned(sc.Image, sc.Digest) {
+		// A built sidecar is pinned by construction: its tag is the hash of
+		// its context.
+		if sc.Build == nil && !contract.RefPinned(sc.Image, sc.Digest) {
 			out = append(out, Finding{level, c.ID(), "unpinned-sidecar",
 				fmt.Sprintf("sidecar %s image %s has no digest; pin it to be reproducible on another device", sc.Name, sc.Image)})
 		}
@@ -344,6 +347,34 @@ func (v *Validator) filesExist(c *contract.Contract) []Finding {
 					missing()
 				}
 			}
+		}
+	}
+	// A built sidecar's context and Dockerfile, under the same rules as a
+	// build base's (no overlay can supply a sidecar's Dockerfile).
+	for _, sc := range c.Service.Sidecars {
+		if sc.Build == nil {
+			continue
+		}
+		what := "sidecar " + sc.Name + ": build context"
+		ctx, err := c.TemplatePath(sc.Build.Context)
+		if errors.Is(err, contract.ErrPathEscapes) {
+			escapes(what, sc.Build.Context)
+			continue
+		}
+		if info, serr := os.Stat(ctx); err != nil || serr != nil || !info.IsDir() {
+			out = append(out, Finding{Error, c.ID(), "missing-context",
+				what + " " + sc.Build.Context + " not found in the template folder"})
+			continue
+		}
+		df := sc.Build.DockerfilePath()
+		p, err := contract.ConfinedPath(ctx, df)
+		if errors.Is(err, contract.ErrPathEscapes) {
+			escapes("sidecar "+sc.Name+": dockerfile", df)
+			continue
+		}
+		if info, serr := os.Stat(p); err != nil || serr != nil || !info.Mode().IsRegular() {
+			out = append(out, Finding{Error, c.ID(), "missing-dockerfile",
+				fmt.Sprintf("sidecar %s: build context %s has no %s", sc.Name, sc.Build.Context, df)})
 		}
 	}
 	for _, name := range c.DeclaredStates() {
@@ -437,10 +468,11 @@ func (v *Validator) states(c *contract.Contract) []Finding {
 		sameCmd := fmt.Sprint(vs.Command) == fmt.Sprint(ps.Command)
 		// The states also differ when a sidecar resolves to another image (the
 		// multi-node pattern: patched swaps each node to the fixed release) or
-		// when they seed different data.
+		// when they seed different data. A built sidecar is the same image in
+		// both states unless one of them overrides it.
 		sameSidecars := true
 		for _, sc := range c.Service.Sidecars {
-			if vs.SidecarRef(sc) != ps.SidecarRef(sc) {
+			if c.SidecarImage(contract.StateVulnerable, sc) != c.SidecarImage(contract.StatePatched, sc) {
 				sameSidecars = false
 			}
 		}

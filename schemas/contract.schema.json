@@ -361,12 +361,11 @@
         },
         "sidecars": {
           "type": "array",
-          "description": "Helper containers started next to the target. Pin each image with digest (`validate`: unpinned-sidecar); under emulation they run on the target's platform.",
+          "description": "Helper containers started next to the target. Each runs a prebuilt image (pin it with digest; `validate`: unpinned-sidecar) or an image built from a context in the template (build), never both; under emulation they run on the target's platform.",
           "items": {
             "type": "object",
             "required": [
-              "name",
-              "image"
+              "name"
             ],
             "additionalProperties": false,
             "properties": {
@@ -382,6 +381,32 @@
                 "type": "string",
                 "pattern": "^sha256:[0-9a-f]{64}$"
               },
+              "build": {
+                "type": "object",
+                "description": "Build the sidecar's image from a context in the template, like a kind: build base, instead of running a prebuilt image. The image is tagged vulnsuite/<id>:sidecar-<name>-<hash> by content (Dockerfile path, context, build_args), so it is pinned by construction and never rebuilt when unchanged.",
+                "required": [
+                  "context"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "context": {
+                    "type": "string",
+                    "pattern": "^(?![/\\\\]|[A-Za-z]:)(?!(.*[/\\\\])?\\.\\.([/\\\\]|$))[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]+$",
+                    "description": "Folder inside the template with the sidecar's Dockerfile and files. Relative to the template folder: not absolute, no .. segments, no control characters; a symlink must resolve inside the folder."
+                  },
+                  "dockerfile": {
+                    "type": "string",
+                    "pattern": "^(?![/\\\\]|[A-Za-z]:)(?!(.*[/\\\\])?\\.\\.([/\\\\]|$))[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]+$",
+                    "description": "Dockerfile path inside the build context (default Dockerfile). Not absolute, no .. segments, no control characters; a symlink must resolve inside the context."
+                  },
+                  "build_args": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
               "command": {
                 "type": "array",
                 "items": {
@@ -392,6 +417,39 @@
                 "type": "object",
                 "additionalProperties": {
                   "type": "string"
+                }
+              }
+            },
+            "oneOf": [
+              {
+                "required": [
+                  "image"
+                ]
+              },
+              {
+                "required": [
+                  "build"
+                ]
+              }
+            ],
+            "if": {
+              "required": [
+                "build"
+              ]
+            },
+            "then": {
+              "description": "A built sidecar takes no digest (its tag is its content hash), and its name is part of that tag.",
+              "propertyNames": {
+                "not": {
+                  "enum": [
+                    "digest"
+                  ]
+                }
+              },
+              "properties": {
+                "name": {
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+                  "maxLength": 100
                 }
               }
             }
@@ -627,7 +685,7 @@
         },
         "sidecars": {
           "type": "object",
-          "description": "Per-state sidecar image overrides, keyed by sidecar name (e.g. the patched version on every node of a multi-node target). Pin each image with digest (`validate`: unpinned-sidecar).",
+          "description": "Per-state sidecar image overrides, keyed by sidecar name (e.g. the patched version on every node of a multi-node target). An override swaps a sidecar's image, or runs an image in place of a built sidecar's build. Pin each image with digest (`validate`: unpinned-sidecar).",
           "additionalProperties": {
             "type": "object",
             "required": [

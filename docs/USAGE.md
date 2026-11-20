@@ -234,6 +234,16 @@ vulnsuite build -all -push -registry ghcr.io/you/vulnsuite
 `-registry` without `-push` is a usage error (it would do nothing), and a state
 named twice in `-state` is built once.
 
+A sidecar with a `build` (see [CONTRACT.md](CONTRACT.md#built-sidecars)) is
+built together with each state that runs it, as
+`vulnsuite/<id>:sidecar-<name>-<hash>`. Both states share that tag, so it is
+built once and reused until its context changes; `build` lists it under the
+state (`sidecar <name> built|reused <ref>`, and `sidecars` in `-json`).
+Sidecars that run a prebuilt image are not touched by `build`: `run` pulls
+them when it starts them. With `-push`, a built sidecar image is pushed next
+to the state images, as `<registry>/<id>:sidecar-<name>` and
+`<registry>/<id>:sidecar-<name>-<hash>`, once even when both states run it.
+
 Built images carry labels (`dev.vulnsuite.id`, `.state`, `.hash`,
 `.vuln_refs`) and bake the state's environment in, so a published image is
 self-contained: `docker run ghcr.io/you/vulnsuite/<id>:vulnerable` is the
@@ -340,7 +350,11 @@ alias` prints these aliases.
 **Sidecars** (a database, a cache, a second cluster node) belong to one target
 state. Each runs as `vulnsuite-<id>-<state>-<sidecar>` on a private network,
 `vulnsuite-<id>-<state>-net`, shared only with its target, where it resolves
-under its template name (e.g. `db`) in every exposure mode. Sidecars are not
+under its template name (e.g. `db`) in every exposure mode. A sidecar with a
+`build` is built (or reused) with the target's image before anything starts,
+and `run` prints its image next to the target's. Building it is not a pull,
+so `-no-pull` does not skip it (as for a `build` base); prebuilt sidecar
+images are fetched as before. Sidecars are not
 on `vulnsuite-net` and are not scan targets. The private network follows
 `-no-egress` in `internal` mode, is a plain bridge in `host` mode (the
 target's ports are published from it), and has no egress in `macvlan` mode so

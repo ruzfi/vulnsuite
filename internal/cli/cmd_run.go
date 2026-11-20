@@ -447,14 +447,10 @@ Exposure modes:
 					cancelled = true
 					break
 				}
-				verb := "reused"
-				switch {
-				case h.Image.Built:
-					verb = "built"
-				case h.Image.Pulled:
-					verb = "pulled"
+				g.printf("  image: %s (%s)\n", h.Image.Ref, resolvedVerb(h.Image))
+				for _, sr := range h.Image.Sidecars {
+					g.printf("  sidecar %s image: %s (%s)\n", sr.Sidecar, sr.Ref, resolvedVerb(sr))
 				}
-				g.printf("  image: %s (%s)\n", h.Image.Ref, verb)
 				if !h.Ready {
 					why := h.ReadyDetail
 					if why == "" {

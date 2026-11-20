@@ -849,7 +849,11 @@ func (r *Runner) startSidecars(ctx context.Context, c *contract.Contract, st *co
 	for _, sc := range c.Service.Sidecars {
 		name := SidecarContainerName(c.ID(), state, sc.Name)
 		ref := st.SidecarRef(sc)
-		if exists, _ := r.Engine.ImageExists(ctx, ref, platform); !exists {
+		if st.BuildsSidecar(sc) {
+			// Built (or reused) with the target's image by Builder.Resolve;
+			// a local tag, never pulled.
+			ref = c.SidecarTag(sc)
+		} else if exists, _ := r.Engine.ImageExists(ctx, ref, platform); !exists {
 			if err := r.Engine.ImagePull(ctx, ref, platform, nil); err != nil {
 				return names, fmt.Errorf("sidecar %s: %w", sc.Name, err)
 			}

@@ -22,7 +22,7 @@ merged key must be a field of the mapping it is merged into. Each anchor name
 may be defined once, before any alias to it, and the document with every alias
 expanded may hold at most 100,000 nodes. A required string may not be empty
 (`summary` may not be blank either): `base.image`, `base.repo`, `base.commit`,
-a sidecar's `name` and `image`, a per-state sidecar `image`, and the `run` of a
+a sidecar's `name` and `image` (or its `build.context`), a per-state sidecar `image`, and the `run` of a
 `seed` step or an `exec` probe. A base key the base kind does not allow is
 rejected even with an empty value (`context: ""` on an image base). The machine-readable form of this document is
 [`schemas/contract.schema.json`](../schemas/contract.schema.json); the loader
@@ -90,7 +90,8 @@ base: { kind: build, context: src, dockerfile: Dockerfile, build_args: {} }
   (`unpinned-state-image`, `unpinned-sidecar`; `-allow-unpinned` downgrades
   them like the base).
 - `build` points at a folder inside the template with a Dockerfile; it is
-  self-contained and therefore always considered pinned.
+  self-contained and therefore always considered pinned. So is a sidecar
+  with a `build` (see `service.sidecars`): it never raises `unpinned-sidecar`.
 
 ## `service`
 
@@ -100,7 +101,7 @@ base: { kind: build, context: src, dockerfile: Dockerfile, build_args: {} }
 | `command` | string or list; overrides the image command |
 | `environment` | map; merged with the state's environment (state wins) |
 | `healthcheck` | `{ http: { path, status }, timeout: 60s }` or `{ tcp: { port }, timeout }`; `timeout` is `<n>s|m|h`. When the target cannot be reached from the machine running vulnsuite, it is checked from inside the target: the port must be listening, and an `http` check uses `curl` if the image has it |
-| `sidecars` | helper containers `{ name, image, digest, command, environment }` (names unique) started with each target state on a private network shared only with that state's target, reachable there by `name` in every exposure mode; each state gets its own sidecars (`command` sets the container command, e.g. a `server ...` arg list for a clustered node) |
+| `sidecars` | helper containers `{ name, image, digest, command, environment }` (names unique) started with each target state on a private network shared only with that state's target, reachable there by `name` in every exposure mode; each state gets its own sidecars (`command` sets the container command, e.g. a `server ...` arg list for a clustered node). Instead of `image`/`digest` a sidecar may have a `build: { context, dockerfile, build_args }` to run an image built from the template, e.g. a driver or fake-DNS sidecar that runs the template's own scripts: exactly one of `image` and `build` is set, and a `build` takes no `digest`. See **Built sidecars** below |
 | `user` | run-as `uid` or `uid:gid` |
 | `cap_add` / `cap_drop` | Linux capabilities, e.g. `cap_drop: [ALL]` then `cap_add: [CAP_NET_BIND_SERVICE]` |
 | `sanitizer` | `{ log_dir: /var/log/asan }`: the directory a sanitizer-instrumented target writes its reports to, read by a `sequence`'s `expect_sanitizer` steps. An absolute, canonical plain path (the characters of `overlay[].dest`, no `..`, `.`, `//` or trailing `/`, not `/`). Point the runtime at it yourself (`ASAN_OPTIONS=...:log_path=/var/log/asan/asan`) and create it writable by every user in the image. Not part of the image hash |
@@ -186,7 +187,7 @@ scanner's discrimination cannot be checked). Each state:
 | `overlay` | `[{ src, dest, mode }]` files from the template baked into the image (`image` base) or written into the build context (`source`/`build` base). `src` is relative to the template folder; `dest` is an absolute path in the image for an `image` base, or a path in the build context for a `source`/`build` base. `mode` (e.g. `"0755"`) is set on the file in the build context and kept by `COPY`, so it also works on a non-root or shell-less base. See **Paths** below. |
 | `environment` | baked into built images and passed at run time. Names must match `^[A-Za-z_][A-Za-z0-9_.-]*$`; values may not contain newlines or other control characters (they become Dockerfile `ENV` lines; `$` is kept literally). |
 | `command` | per-state command override |
-| `sidecars` | per-state sidecar image overrides, `{ <name>: { image, digest } }` -- swap a sidecar to another version for this state (e.g. the fixed release on every node of a multi-node cluster, which will not form across mixed versions) |
+| `sidecars` | per-state sidecar image overrides, `{ <name>: { image, digest } }` -- swap a sidecar to another version for this state (e.g. the fixed release on every node of a multi-node cluster, which will not form across mixed versions). A built sidecar may be overridden too: the state then runs the image instead of the build. There is no per-state `build` |
 | `seed` | `[{ run: "..." }]` shell steps executed inside the container once it is ready (skipped if it never becomes ready). A step that exits non-zero stops the rest, fails verify and fails `run` |
 | `verify` | probes that prove the state; when present, at least one |
 
@@ -210,6 +211,39 @@ state image and `mode` enter the hash only when set, so templates that use
 neither keep their tags. The platform is not part of the hash: an existing
 image is reused only when it was built for the platform wanted now (the
 emulation platform, else the daemon's own), otherwise it is rebuilt.
+
+#### Built sidecars
+
+```yaml
+service:
+  sidecars:
+    - name: driver
+      build: { context: sidecars/driver, dockerfile: Dockerfile, build_args: {} }
+      command: ["sleep", "infinity"]
+```
+
+A sidecar with a `build` runs an image built from `build.context`, a folder
+in the template, with `build.dockerfile` (default `Dockerfile`) inside it and
+`build_args` passed to the build. The context follows the rules of
+`base.context` (see **Paths**) and is sent the same way: `.dockerignore`
+honoured, `.git` left out, symlinks never followed. Its name must match
+`^[A-Za-z0-9][A-Za-z0-9_.-]*$` (at most 100 characters), as it is part of
+the image tag:
+
+`vulnsuite/<id>:sidecar-<name>-<hash>`
+
+where `<hash>` covers the Dockerfile path, the context tree (hashed like a
+`build` base's, the executable bit included) and the build args; the
+sidecar's `command` and `environment` are applied when it runs and are not
+part of it. The tag is the same for every state that runs the sidecar from
+its build, so it is built once and never rebuilt while its inputs are
+unchanged; as with a state's image, it is reused only when it was built for
+the platform wanted now (the target's: under emulation the sidecar is built
+and run for the emulation platform). Adding a built sidecar does not change
+any state's image tag. `build` and `run` build it together with the state's
+image, before anything starts; a state whose `sidecars` override swaps it for
+an image runs that image and does not build it. `identical-states` treats a
+built sidecar as the same image in both states unless one overrides it.
 
 ## `verify` probes
 
@@ -401,8 +435,9 @@ The core guarantees:
 Templates are untrusted input, so every file a template references must be its
 own:
 
-- `overlay[].src`, `patch`, `base.context` and `base.dockerfile` are relative
-  paths inside the template folder (`base.dockerfile` inside the context).
+- `overlay[].src`, `patch`, `base.context`, `base.dockerfile` and a sidecar's
+  `build.context` and `build.dockerfile` are relative paths inside the
+  template folder (a `dockerfile` inside its context).
   Absolute paths (`/etc/x`, `C:/x`), `..` segments and control characters are
   schema errors. A symlink is allowed only when its target is inside the template
   folder too; one pointing elsewhere is refused at build time and reported by
@@ -435,10 +470,10 @@ rather than failed; use `-expose host` or scan from a container.
 | --- | --- | --- |
 | `unpinned-base` | error (warning with `-allow-unpinned`) | image has no digest / source has no commit, or a commit that is not a commit id (a branch or tag) |
 | `unpinned-state-image` | error (warning with `-allow-unpinned`) | a state's `image` override has no digest |
-| `unpinned-sidecar` | error (warning with `-allow-unpinned`) | a sidecar image, or a state's sidecar override, has no digest |
+| `unpinned-sidecar` | error (warning with `-allow-unpinned`) | a sidecar image, or a state's sidecar override, has no digest (a sidecar with a `build` is pinned by its content) |
 | `short-commit` | warning | `base.commit` is an abbreviated commit id; use the full SHA |
-| `missing-context`, `missing-dockerfile`, `missing-patch`, `missing-overlay` | error | a referenced file is not in the template (`missing-dockerfile`: the build context has no Dockerfile and a state does not overlay one) |
-| `path-escapes-template` | error | a referenced path resolves (through a symlink) outside the template folder |
+| `missing-context`, `missing-dockerfile`, `missing-patch`, `missing-overlay` | error | a referenced file is not in the template (`missing-dockerfile`: the build context has no Dockerfile and a state does not overlay one). A sidecar's `build.context` and its Dockerfile are checked the same way, the message naming the sidecar |
+| `path-escapes-template` | error | a referenced path resolves (through a symlink) outside the template folder (a sidecar's build context or Dockerfile included, named by the sidecar) |
 | `patch-needs-source` | error | a patch on an `image` base |
 | `empty-verify` | error | an http probe asserts nothing |
 | `bad-regex`, `bad-timeout` | error | malformed values (`bad-regex` covers every regexp, a `sequence`'s `frame` and `expect_log` included) |
