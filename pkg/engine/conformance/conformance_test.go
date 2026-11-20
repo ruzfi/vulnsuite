@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io/fs"
 	"reflect"
 	"sort"
 	"strings"
@@ -72,6 +74,20 @@ func tarOf(t *testing.T, files map[string]string) *bytes.Buffer {
 	}
 	tw.Close()
 	return &buf
+}
+
+// files formats a ContainerReadDir result readably.
+func files(m map[string]engine.FileContent) string {
+	names := make([]string, 0, len(m))
+	for n := range m {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	for _, n := range names {
+		fmt.Fprintf(&b, "%s(size %d)=%q ", n, m[n].Size, m[n].Data)
+	}
+	return "{" + strings.TrimSpace(b.String()) + "}"
 }
 
 func mustExist(t *testing.T, h *harness, ref, platform string, want bool) {
@@ -590,6 +606,181 @@ var cases = []conformanceCase{
 		}
 	}},
 
+	// -- pause (optional engine.Pauser) ------------------------------------------------
+	{"container_pause_blocks_exec", func(t *testing.T, h *harness) {
+		p := h.pauser(t)
+		run(t, h, engine.ContainerSpec{Name: "vs-a"})
+		h.onExec(t, func(string, string) (int, string) { return 0, "ok" })
+		if err := p.ContainerPause(bg(t), "vs-a"); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := h.eng.ContainerExec(bg(t), "vs-a", "true", 5*time.Second); !contains(err, "is paused") {
+			t.Errorf("exec in a paused container = %v; want dockerd's \"is paused, unpause the container before exec\"", err)
+		}
+		if err := h.eng.ContainerStart(bg(t), "vs-a"); !contains(err, "paused") {
+			t.Errorf("starting a paused container = %v; want dockerd's \"cannot start a paused container\"", err)
+		}
+		if err := p.ContainerPause(bg(t), "vs-a"); !contains(err, "already paused") {
+			t.Errorf("pausing a paused container = %v; want dockerd's \"is already paused\"", err)
+		}
+		if d, err := h.eng.ContainerInspect(bg(t), "vs-a"); err != nil || !d.Running {
+			t.Errorf("a paused container inspects as %+v, %v; want it running (dockerd reports Running and Paused)", d, err)
+		}
+		if rows, err := h.eng.ContainerList(bg(t), false, "vs-a"); err != nil || len(rows) != 1 || rows[0].State != "paused" {
+			t.Errorf("a paused container lists as %+v, %v; want state paused", rows, err)
+		}
+		if err := p.ContainerUnpause(bg(t), "vs-a"); err != nil {
+			t.Fatal(err)
+		}
+		if code, out, err := h.eng.ContainerExec(bg(t), "vs-a", "true", 5*time.Second); err != nil || code != 0 || out != "ok" {
+			t.Errorf("exec after unpause = %d, %q, %v; want 0, ok, nil", code, out, err)
+		}
+		if err := p.ContainerUnpause(bg(t), "vs-a"); !contains(err, "not paused") {
+			t.Errorf("unpausing a running container = %v; want dockerd's \"is not paused\"", err)
+		}
+		if rows, _ := h.eng.ContainerList(bg(t), false, "vs-a"); len(rows) != 1 || rows[0].State != "running" {
+			t.Errorf("an unpaused container lists as %+v, want state running", rows)
+		}
+		if h.f != nil {
+			// The fake logs the order, for runner tests of freeze windows.
+			if want := []string{"pause vs-a", "unpause vs-a", "exec vs-a: true"}; !reflect.DeepEqual(h.f.Calls, want) {
+				t.Errorf("fake call log = %q, want %q", h.f.Calls, want)
+			}
+		}
+	}},
+	{"container_pause_errors", func(t *testing.T, h *harness) {
+		p := h.pauser(t)
+		if err := p.ContainerPause(bg(t), "vs-missing"); err == nil {
+			t.Error("pausing a missing container must fail")
+		}
+		if err := p.ContainerUnpause(bg(t), "vs-missing"); err == nil {
+			t.Error("unpausing a missing container must fail")
+		}
+		create(t, h, engine.ContainerSpec{Name: "vs-created"})
+		if err := p.ContainerPause(bg(t), "vs-created"); !contains(err, "not running") {
+			t.Errorf("pausing a container that never ran = %v; want dockerd's \"is not running\"", err)
+		}
+		run(t, h, engine.ContainerSpec{Name: "vs-exited"})
+		h.exit("vs-exited", 0)
+		if err := p.ContainerPause(bg(t), "vs-exited"); !contains(err, "not running") {
+			t.Errorf("pausing an exited container = %v; want dockerd's \"is not running\"", err)
+		}
+	}},
+	{"container_remove_while_paused", func(t *testing.T, h *harness) {
+		p := h.pauser(t)
+		run(t, h, engine.ContainerSpec{Name: "vs-a"})
+		if err := p.ContainerPause(bg(t), "vs-a"); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.eng.ContainerRemove(bg(t), "vs-a"); err != nil {
+			t.Fatalf("removing a paused container: %v, want nil (force)", err)
+		}
+		if _, err := h.eng.ContainerInspect(bg(t), "vs-a"); err == nil {
+			t.Fatal("the removed paused container still inspects")
+		}
+	}},
+
+	// -- archive reads (optional engine.FileReader) ---------------------------------------
+	{"container_stat_path", func(t *testing.T, h *harness) {
+		r := h.fileReader(t)
+		run(t, h, engine.ContainerSpec{Name: "vs-a"})
+		h.seedFile(t, "vs-a", "/var/log/asan", fs.ModeDir|fs.ModeSticky|0o777, "")
+		h.seedFile(t, "vs-a", "/var/log/private", fs.ModeDir|0o755, "")
+		h.seedFile(t, "vs-a", "/etc/app.conf", 0o640, "x=1\n")
+		h.seedFile(t, "vs-a", "/etc/link", fs.ModeSymlink|0o777, "/etc/app.conf")
+		check := func(p string, want fs.FileMode) {
+			t.Helper()
+			if got, err := r.ContainerStatPath(bg(t), "vs-a", p); err != nil || got != want {
+				t.Errorf("ContainerStatPath(%s) = %v, %v; want %v, nil", p, got, err, want)
+			}
+		}
+		check("/var/log/asan", fs.ModeDir|fs.ModeSticky|0o777)
+		check("/var/log/asan/", fs.ModeDir|fs.ModeSticky|0o777)
+		check("/var/log/private", fs.ModeDir|0o755)
+		check("/etc/app.conf", 0o640)
+		check("/etc/link", fs.ModeSymlink|0o777) // the link itself, not its target
+		// It works on a paused and on an exited container too.
+		if err := h.pauser(t).ContainerPause(bg(t), "vs-a"); err != nil {
+			t.Fatal(err)
+		}
+		check("/var/log/asan", fs.ModeDir|fs.ModeSticky|0o777)
+		h.exit("vs-a", 1)
+		check("/var/log/asan", fs.ModeDir|fs.ModeSticky|0o777)
+
+		if _, err := r.ContainerStatPath(bg(t), "vs-a", "/var/log/missing"); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("stat of a missing path = %v; want an error satisfying fs.ErrNotExist", err)
+		}
+		if _, err := r.ContainerStatPath(bg(t), "vs-missing", "/var/log/asan"); err == nil || errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("stat in a missing container = %v; want an error that is not fs.ErrNotExist", err)
+		}
+		if _, err := r.ContainerStatPath(bg(t), "vs-a", "var/log/asan"); err == nil {
+			t.Error("stat of a relative path must fail")
+		}
+	}},
+	{"container_read_dir", func(t *testing.T, h *harness) {
+		r := h.fileReader(t)
+		run(t, h, engine.ContainerSpec{Name: "vs-a"})
+		big := strings.Repeat("A", 100)
+		h.seedFile(t, "vs-a", "/var/log/asan", fs.ModeDir|fs.ModeSticky|0o777, "")
+		h.seedFile(t, "vs-a", "/var/log/asan/asan.12", 0o644, "ERROR: AddressSanitizer\n")
+		h.seedFile(t, "vs-a", "/var/log/asan/asan.13", 0o600, big)
+		h.seedFile(t, "vs-a", "/var/log/asan/empty", 0o644, "")
+		h.seedFile(t, "vs-a", "/var/log/asan/sub", fs.ModeDir|0o755, "")
+		h.seedFile(t, "vs-a", "/var/log/asan/sub/nested", 0o644, "nested")
+		h.seedFile(t, "vs-a", "/var/log/asan/passwd", fs.ModeSymlink|0o777, "/etc/passwd")
+		h.seedFile(t, "vs-a", "/var/log/asandir", fs.ModeSymlink|0o777, "/var/log/asan")
+		h.seedFile(t, "vs-a", "/etc/passwd", 0o644, "root:x:0:0\n")
+		h.seedFile(t, "vs-a", "/top", 0o644, "top")
+
+		got, err := r.ContainerReadDir(bg(t), "vs-a", "/var/log/asan", 32)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]engine.FileContent{
+			"asan.12": {Size: 24, Data: []byte("ERROR: AddressSanitizer\n")},
+			"asan.13": {Size: 100, Data: []byte(big[:32])},
+			"empty":   {Size: 0, Data: []byte{}},
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("ContainerReadDir = %s; want the three regular files, asan.13 cut to 32 bytes, and no subdirectory, nested file or symlink", files(got))
+		}
+		if !got["asan.13"].Truncated() || got["asan.12"].Truncated() {
+			t.Error("Truncated() does not tell the cut file from the whole one")
+		}
+		// maxBytes 0 lists names and sizes only.
+		got, err = r.ContainerReadDir(bg(t), "vs-a", "/var/log/asan", 0)
+		if err != nil || len(got) != 3 || got["asan.13"].Size != 100 || len(got["asan.13"].Data) != 0 {
+			t.Fatalf("ContainerReadDir with maxBytes 0 = %s, %v; want three names with sizes and no data", files(got), err)
+		}
+		// The root directory names its entries "/<name>".
+		if got, err := r.ContainerReadDir(bg(t), "vs-a", "/", 8); err != nil || string(got["top"].Data) != "top" || len(got) != 1 {
+			t.Errorf("ContainerReadDir(/) = %s, %v; want just top", files(got), err)
+		}
+		// It works on a paused and on an exited container.
+		if err := h.pauser(t).ContainerPause(bg(t), "vs-a"); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := r.ContainerReadDir(bg(t), "vs-a", "/var/log/asan", 32); err != nil || len(got) != 3 {
+			t.Errorf("ContainerReadDir in a paused container = %s, %v", files(got), err)
+		}
+		h.exit("vs-a", 1)
+		if got, err := r.ContainerReadDir(bg(t), "vs-a", "/var/log/asan", 32); err != nil || len(got) != 3 {
+			t.Errorf("ContainerReadDir in an exited container = %s, %v", files(got), err)
+		}
+
+		if _, err := r.ContainerReadDir(bg(t), "vs-a", "/var/log/missing", 32); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("reading a missing dir = %v; want an error satisfying fs.ErrNotExist", err)
+		}
+		if _, err := r.ContainerReadDir(bg(t), "vs-missing", "/var/log/asan", 32); err == nil || errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("reading a dir in a missing container = %v; want an error that is not fs.ErrNotExist", err)
+		}
+		for _, p := range []string{"/etc/passwd", "/var/log/asandir", "/var/log/asandir/"} {
+			if _, err := r.ContainerReadDir(bg(t), "vs-a", p, 32); err == nil || errors.Is(err, fs.ErrNotExist) {
+				t.Errorf("reading %s, which is not a directory = %v; want an error", p, err)
+			}
+		}
+	}},
+
 	// -- networks -------------------------------------------------------------------
 	{"network_ensure_creates", func(t *testing.T, h *harness) {
 		spec := engine.NetworkSpec{Name: "vs-new", Internal: true, Subnet: "10.77.0.0/24", Gateway: "10.77.0.1"}
@@ -752,6 +943,16 @@ var cases = []conformanceCase{
 			"NetworkExists":    func() error { _, err := h.eng.NetworkExists(ctx, "vs-net"); return err },
 			"NetworkRemove":    func() error { return h.eng.NetworkRemove(ctx, "vs-other") },
 			"NetworkConnect":   func() error { return h.eng.NetworkConnect(ctx, "vs-other", "vs-b", nil) },
+			"ContainerPause":   func() error { return h.pauser(t).ContainerPause(ctx, "vs-a") },
+			"ContainerUnpause": func() error { return h.pauser(t).ContainerUnpause(ctx, "vs-a") },
+			"ContainerStatPath": func() error {
+				_, err := h.fileReader(t).ContainerStatPath(ctx, "vs-b", "/")
+				return err
+			},
+			"ContainerReadDir": func() error {
+				_, err := h.fileReader(t).ContainerReadDir(ctx, "vs-b", "/", 1)
+				return err
+			},
 		}
 		names := make([]string, 0, len(calls))
 		for n := range calls {
