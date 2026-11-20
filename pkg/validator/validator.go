@@ -10,6 +10,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -75,6 +76,45 @@ func (v *Validator) Check(c *contract.Contract) []Finding {
 	out = append(out, v.requires(c)...)
 	out = append(out, v.hostAccess(c)...)
 	out = append(out, v.sequences(c)...)
+	out = append(out, v.verification(c)...)
+	return out
+}
+
+// verification checks metadata.verification against its evidence. It never
+// relaxes another rule: an unverified contract needs every static check.
+func (v *Validator) verification(c *contract.Contract) []Finding {
+	var out []Finding
+	m := c.Metadata
+	if c.IsUnverified() {
+		out = append(out, Finding{Warning, c.ID(), "unverified-target",
+			"verification: unverified -- no one has run this target's states yet; run `vulnsuite stamp -t " + c.ID() +
+				"` on a host that meets its requires to verify it and record the evidence"})
+	}
+	hostSpecific := len(c.Requires.CPUFlags) > 0 || c.Requires.Probe != nil
+	if m.Verification == contract.VerificationVerified && hostSpecific && m.VerifiedOn == nil {
+		out = append(out, Finding{Warning, c.ID(), "verified-no-evidence",
+			"verification: verified, but requires needs specific hardware and verified_on records no run; " +
+				"run `vulnsuite stamp` on such a host, or set verification: unverified"})
+	}
+	if vo := m.VerifiedOn; vo != nil {
+		for _, st := range vo.States {
+			if !c.HasState(st) {
+				out = append(out, Finding{Warning, c.ID(), "verified-on-stale",
+					fmt.Sprintf("verified_on lists state %q, which the template no longer declares; re-run `vulnsuite stamp`", st)})
+			}
+		}
+		var unchecked []string
+		for _, f := range c.Requires.CPUFlags {
+			if !slices.Contains(vo.CPUFlags, f) {
+				unchecked = append(unchecked, f)
+			}
+		}
+		if len(unchecked) > 0 && !c.IsUnverified() {
+			out = append(out, Finding{Warning, c.ID(), "verified-on-stale",
+				fmt.Sprintf("requires.cpu_flags %s were not part of the verified_on run; re-run `vulnsuite stamp` on a host that has them",
+					strings.Join(unchecked, ", "))})
+		}
+	}
 	return out
 }
 

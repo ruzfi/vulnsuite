@@ -27,6 +27,7 @@ vulnsuite info <selector>                                        states, build k
 vulnsuite validate [-t SEL]... [-strict] [-allow-unpinned]       structure + semantic lint
 vulnsuite build [vulnerable|patched] -t SEL... | -f FILE | <filters> | -all [-variants] [-j N] [-push -registry REG]
 vulnsuite run [vulnerable|patched] -t SEL... | -f FILE | <filters> | -all [-variants] [-expose MODE] [-detach]
+vulnsuite stamp -t SEL... | -f FILE | <filters> | -all [-dry-run]  run every state; record metadata.verified_on when all verify ok
 vulnsuite ps                                                     running targets (id, state, ip)
 vulnsuite targets [-file FILE] [-by auto|ip|alias|host]          scannable URLs, right port per template
 vulnsuite stop [-t SEL]... [-variants] [-prune-net]              tear down (targets, their sidecars and sidecar networks; alias: down)
@@ -37,8 +38,8 @@ vulnsuite version                                                version and tem
 ```
 
 `<filters>` is any of `-ref`, `-class`, `-category`/`-product`, `-tag`,
-`-cve`/`-no-cve`, `-kev`/`-no-kev`, `-year`, `-since`, `-fidelity` and `-arch`
-(see [Finding the right target](#finding-the-right-target)).
+`-cve`/`-no-cve`, `-kev`/`-no-kev`, `-verified`/`-unverified`, `-year`,
+`-since`, `-fidelity` and `-arch` (see [Finding the right target](#finding-the-right-target)).
 `vulnsuite help <command>` prints every flag of a command.
 
 `-json` on any command gives machine-readable output (progress goes to stderr).
@@ -122,6 +123,10 @@ vulnsuite list -since 2023-01-01                # disclosed on or after a date
 - `-category` / `-product`: the product surface (top directory level).
 - `-cve` / `-no-cve`: has (not) any `CVE-…` in `vuln_refs` (boolean; use
   `-ref` for a specific id).
+- `-verified` / `-unverified`: `metadata.verification`. An unverified target
+  is statically valid but nobody has run its states yet. `list` shows it in
+  the VERIFIED column (`no`; a date is the last `stamp` run, `yes` a verified
+  target with no recorded run) and as `verification`/`verified_on` in `-json`.
 - `-kev` / `-no-kev`: on (not on) the CISA **Known Exploited Vulnerabilities**
   catalog — derived by cross-referencing the target's CVEs. The catalog is read
   from the templates checkout's `data/cisa-kev.txt`; `-refresh-kev` fetches the
@@ -174,7 +179,7 @@ unpinned base is allowed there, as while authoring.
 
 `run` and `build` take the same filters as `list` — `-class`, `-tag`,
 `-category`/`-product`, `-cve`/`-no-cve`, `-year`, `-since`, `-fidelity`, `-ref`,
-`-kev`/`-no-kev`. Every `-t`, every filter, and every line of a `-f` file selects
+`-kev`/`-no-kev`, `-verified`/`-unverified`. Every `-t`, every filter, and every line of a `-f` file selects
 a set of targets; the run stands up their **union**, de-duplicated:
 
 ```text
@@ -535,6 +540,37 @@ non-zero. `host -json` prints the same as one object (`engine`, `os`, `arch`,
 by the same preflight `run` uses. It connects to the daemon (a plain `list`
 does not), reads the CPU flags only if a listed template sets `cpu_flags`, and
 does not evaluate `requires.probe` (that needs the target's image).
+
+## Recording that a target was verified: `stamp`
+
+A contract can pass `validate` and still never have run on a host that meets
+its `requires` (an AVX-512 VBMI target, say, when no maintainer has such a
+machine). Mark it `verification: unverified` in `metadata`: `validate` then
+warns (`unverified-target`, an error under `-strict`), and `list -unverified`
+finds it. In a suite file, a `-unverified` line keeps a `needs-validation`
+suite in step with the corpus.
+
+Whoever has a suitable host turns that into evidence with `stamp`:
+
+```text
+vulnsuite stamp -t java4shell            # one target (or a group, -f, a filter, -all)
+vulnsuite stamp -unverified              # everything still waiting for a run
+vulnsuite stamp -t java4shell -dry-run   # run and verify, write nothing
+```
+
+For each target, `stamp` runs every declared state in turn (build, start,
+verify, tear down). Only when every state ends in `verify: ok` does it write
+`metadata.verified_on` (date, vulnsuite version, the daemon's `os/arch`, the
+emulated `platform` if any, the `requires.cpu_flags` it checked, the states)
+and set `verification: verified`. Only those lines of the contract change. A
+failing state leaves the file untouched and fails the command. A host that does
+not meet `requires` skips the target. There is no `-ignore-requires`: the point
+is evidence from a host that qualifies. Commit the stamped contract with the
+run's output in the PR.
+
+`stamp -json` prints one object per target: `id`, `path`, `outcome`
+(`stamped`, `verified` under `-dry-run`, `failed` or `skipped`), `detail`,
+`states` (`state`, `ok`, `detail`) and the `verified_on` it wrote.
 
 ## Container hardening
 

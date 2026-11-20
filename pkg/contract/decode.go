@@ -114,9 +114,12 @@ var (
 		"smtp": true, "redis": true, "mysql": true, "postgres": true}
 	detections = map[string]bool{"scanner": true, "custom-only": true}
 	fidelities = map[string]bool{"real": true, "simulated": true}
-	classes    = map[string]bool{"vuln": true, "misconfig": true, "exposure": true, "default-login": true, "weak-crypto": true}
-	hostOSes   = map[string]bool{"linux": true, "windows": true}
-	arches     = map[string]bool{"amd64": true, "arm64": true, "386": true, "arm": true, "ppc64le": true, "s390x": true, "riscv64": true}
+	// platformRe is an os/arch[/variant] platform, as verified_on records it.
+	platformRe    = regexp.MustCompile(`^[a-z0-9]+/[a-z0-9_]+(/[a-z0-9]+)?$`)
+	verifications = map[string]bool{VerificationVerified: true, VerificationUnverified: true}
+	classes       = map[string]bool{"vuln": true, "misconfig": true, "exposure": true, "default-login": true, "weak-crypto": true}
+	hostOSes      = map[string]bool{"linux": true, "windows": true}
+	arches        = map[string]bool{"amd64": true, "arm64": true, "386": true, "arm": true, "ppc64le": true, "s390x": true, "riscv64": true}
 )
 
 // Parse decodes and structurally validates a contract document. Semantic lint
@@ -199,6 +202,47 @@ func Parse(data []byte) (*Contract, error) {
 	return c, nil
 }
 
+// check enforces metadata.verified_on's schema rules.
+func (v *VerifiedOn) check() error {
+	const loc = "metadata/verified_on"
+	if _, err := time.Parse(time.DateOnly, v.Date); err != nil || len(v.Date) != len(time.DateOnly) {
+		return se(loc+"/date", "%q must be an ISO date (YYYY-MM-DD)", v.Date)
+	}
+	if strings.TrimSpace(v.Vulnsuite) == "" {
+		return se(loc+"/vulnsuite", "is required")
+	}
+	if !platformRe.MatchString(v.Host) {
+		return se(loc+"/host", "%q must be an os/arch platform such as linux/amd64", v.Host)
+	}
+	if v.Platform != "" && !platformRe.MatchString(v.Platform) {
+		return se(loc+"/platform", "%q must be an os/arch platform such as linux/amd64", v.Platform)
+	}
+	seen := map[string]bool{}
+	for i, f := range v.CPUFlags {
+		if !cpuFlagRe.MatchString(f) {
+			return se(fmt.Sprintf("%s/cpu_flags/%d", loc, i), "%q must match %s", f, cpuFlagRe)
+		}
+		if seen[f] {
+			return se(fmt.Sprintf("%s/cpu_flags/%d", loc, i), "%q is listed more than once", f)
+		}
+		seen[f] = true
+	}
+	if len(v.States) == 0 {
+		return se(loc+"/states", "must name at least one state")
+	}
+	seen = map[string]bool{}
+	for i, st := range v.States {
+		if st != StateVulnerable && st != StatePatched {
+			return se(fmt.Sprintf("%s/states/%d", loc, i), "%q is not one of vulnerable, patched", st)
+		}
+		if seen[st] {
+			return se(fmt.Sprintf("%s/states/%d", loc, i), "%q is listed more than once", st)
+		}
+		seen[st] = true
+	}
+	return nil
+}
+
 func se(loc, format string, args ...any) error {
 	return &SchemaError{Loc: loc, Message: fmt.Sprintf(format, args...)}
 }
@@ -245,6 +289,14 @@ func (c *Contract) checkStructure(present map[string]any, sidecarKeys []map[stri
 	}
 	if m.Fidelity != "" && !fidelities[m.Fidelity] {
 		return se("metadata/fidelity", "%q is not one of real, simulated", m.Fidelity)
+	}
+	if m.Verification != "" && !verifications[m.Verification] {
+		return se("metadata/verification", "%q is not one of verified, unverified", m.Verification)
+	}
+	if m.VerifiedOn != nil {
+		if err := m.VerifiedOn.check(); err != nil {
+			return err
+		}
 	}
 	seenClass := map[string]bool{}
 	for i, cl := range m.Class {

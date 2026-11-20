@@ -1,0 +1,24 @@
+# want: metadata/verified_on/states
+apiVersion: vulnsuite/v1
+kind: Target
+metadata:
+  id: demo-verification
+  summary: demo
+  verified_on:
+    date: "2026-11-21"
+    vulnsuite: v0.4.0
+    host: linux/amd64
+    states: [patched, patched]
+base:
+  kind: image
+  image: eclipse-temurin:21-jre
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+service:
+  ports: [ { container: 8080, protocol: http } ]
+states:
+  vulnerable:
+    verify:
+      - http: { path: /, status: 200 }
+  patched:
+    verify:
+      - http: { path: /, status: 404 }
