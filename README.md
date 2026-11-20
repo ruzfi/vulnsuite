@@ -134,6 +134,7 @@ schema for editors and CI is [schemas/contract.schema.json](schemas/contract.sch
 | `validate` | structure and semantic lint for template contracts |
 | `build` | build (or pull) images, content-addressed, in parallel; `-push` publishes them |
 | `run` | build if needed, run targets in a state and verify them |
+| `stamp` | run every state of a target and record `metadata.verified_on` when all verify ok |
 | `ps` | running targets (id, state, ip) |
 | `targets` | scannable URLs of the running targets, right port per template |
 | `stop` (`down`) | tear down targets, their sidecars and sidecar networks |

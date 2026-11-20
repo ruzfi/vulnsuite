@@ -31,6 +31,8 @@ type filters struct {
 	noKEV      bool
 	cve        bool
 	noCVE      bool
+	verified   bool
+	unverified bool
 	refreshKEV bool
 }
 
@@ -48,6 +50,8 @@ func (f *filters) register(fs *flag.FlagSet) {
 	fs.Var(&f.ref, "ref", "only templates whose vuln_refs contains this id (repeatable; match any; case-insensitive): CVE-, GHSA-, GO-, VS-...")
 	fs.BoolVar(&f.onlyKEV, "kev", false, "only templates on the CISA KEV catalog")
 	fs.BoolVar(&f.noKEV, "no-kev", false, "only templates not on the CISA KEV catalog")
+	fs.BoolVar(&f.verified, "verified", false, "only templates whose states have been verified (metadata.verification, default verified)")
+	fs.BoolVar(&f.unverified, "unverified", false, "only templates marked verification: unverified (nobody has run them yet)")
 	fs.StringVar(&f.year, "year", "", "only templates disclosed in this year (YYYY)")
 	fs.StringVar(&f.since, "since", "", "only templates disclosed on or after this ISO date (YYYY-MM-DD)")
 	fs.BoolVar(&f.refreshKEV, "refresh-kev", false, "fetch the live CISA KEV feed and refresh the local cache before filtering")
@@ -58,7 +62,7 @@ func (f *filters) register(fs *flag.FlagSet) {
 func (f *filters) active() bool {
 	return f.tag != "" || f.fidelity != "" || f.arch != "" || f.category != "" ||
 		f.year != "" || f.since != "" || len(f.class) > 0 || len(f.ref) > 0 ||
-		f.onlyKEV || f.noKEV || f.cve || f.noCVE
+		f.onlyKEV || f.noKEV || f.cve || f.noCVE || f.verified || f.unverified
 }
 
 // needsKEV reports whether evaluating the filter requires the KEV catalog.
@@ -95,6 +99,9 @@ func (f *filters) validate() error {
 	}
 	if f.onlyKEV && f.noKEV {
 		return usageError{"-kev and -no-kev are mutually exclusive"}
+	}
+	if f.verified && f.unverified {
+		return usageError{"-verified and -unverified are mutually exclusive"}
 	}
 	for _, cl := range f.class {
 		if !has(contract.Classes, cl) {
@@ -155,6 +162,12 @@ func (f *filters) match(store *loader.Store, c *contract.Contract, path string, 
 		return false
 	}
 	if f.noCVE && c.IsCVETracked() {
+		return false
+	}
+	if f.verified && c.IsUnverified() {
+		return false
+	}
+	if f.unverified && !c.IsUnverified() {
 		return false
 	}
 	if f.onlyKEV || f.noKEV {

@@ -19,7 +19,9 @@ import (
 
 type infoOut struct {
 	*contract.Contract
-	Scanners scanners.Report `json:"scanners"`
+	// Verification is metadata.verification with its default applied.
+	Verification string          `json:"verification"`
+	Scanners     scanners.Report `json:"scanners"`
 }
 
 func cmdInfo() *Command {
@@ -65,7 +67,7 @@ writing a template and contributing it upstream.`,
 			}
 			rep := scanners.Match(c, idx)
 			if g.JSON {
-				return g.emitJSON(infoOut{c, rep})
+				return g.emitJSON(infoOut{c, c.Verification(), rep})
 			}
 			m := c.Metadata
 			fmt.Fprintf(g.Stdout, "%s\n  %s\n\n", c.ID(), m.Summary)
@@ -77,6 +79,7 @@ writing a template and contributing it upstream.`,
 			kv("severity", m.Severity)
 			kv("class", strings.Join(m.Class, ", "))
 			kv("fidelity", c.Fidelity())
+			kv("verified", verifiedText(c))
 			kv("vuln refs", strings.Join(m.VulnRefs, ", "))
 			kv("disclosed", m.Disclosed)
 			kv("cwe", strings.Join(m.CWE, ", "))

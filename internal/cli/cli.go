@@ -147,7 +147,7 @@ func (g *Global) emitJSON(v any) error {
 // Commands in display order.
 func Commands() []*Command {
 	return []*Command{
-		cmdList(), cmdInfo(), cmdValidate(), cmdBuild(), cmdRun(), cmdStop(), cmdPS(), cmdTargets(),
+		cmdList(), cmdInfo(), cmdValidate(), cmdBuild(), cmdRun(), cmdStamp(), cmdStop(), cmdPS(), cmdTargets(),
 		cmdImages(), cmdHost(), cmdUpdateTemplates(), cmdVersion(),
 	}
 }

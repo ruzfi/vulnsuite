@@ -55,6 +55,16 @@ const (
 // Fidelities lists the allowed fidelity values.
 var Fidelities = []string{FidelityReal, FidelitySimulated}
 
+// Verification values: whether a target's states have been proven on a host
+// that can run them.
+const (
+	VerificationVerified   = "verified"   // someone ran every state and verify passed (the default)
+	VerificationUnverified = "unverified" // statically valid, but nobody has run it yet
+)
+
+// Verifications lists the allowed verification values.
+var Verifications = []string{VerificationVerified, VerificationUnverified}
+
 // Finding-class values. A target may carry one or more (taxonomy v2): the class
 // is the *kind* of finding, orthogonal to the product surface it lives on (the
 // top directory level).
@@ -701,6 +711,32 @@ type Metadata struct {
 	//   custom-only  no public template exists; validate with your own probes
 	Detection  string   `yaml:"detection,omitempty" json:"detection,omitempty"`
 	DetectedBy []string `yaml:"detected_by,omitempty" json:"detected_by,omitempty"`
+	// Verification says whether the target's states have been proven on a
+	// host that can run them: verified (the default) or unverified, for a
+	// contract that is statically sound but that nobody has run yet (it
+	// needs hardware no maintainer has, say). validate warns on unverified.
+	Verification string `yaml:"verification,omitempty" json:"verification,omitempty"`
+	// VerifiedOn is the evidence of the last run that verified every state.
+	// `vulnsuite stamp` writes it; it is not meant to be edited by hand.
+	VerifiedOn *VerifiedOn `yaml:"verified_on,omitempty" json:"verified_on,omitempty"`
+}
+
+// VerifiedOn records when, with which vulnsuite and on what host every state
+// of a target last verified ok: metadata.verified_on.
+type VerifiedOn struct {
+	// Date is the day of the run (YYYY-MM-DD).
+	Date string `yaml:"date" json:"date"`
+	// Vulnsuite is the version of the vulnsuite that ran it.
+	Vulnsuite string `yaml:"vulnsuite" json:"vulnsuite"`
+	// Host is the daemon's os/arch, e.g. linux/amd64.
+	Host string `yaml:"host" json:"host"`
+	// Platform is the image platform when it differed from Host (the target
+	// ran under emulation).
+	Platform string `yaml:"platform,omitempty" json:"platform,omitempty"`
+	// CPUFlags are the requires.cpu_flags the host was checked to have.
+	CPUFlags []string `yaml:"cpu_flags,omitempty" json:"cpu_flags,omitempty"`
+	// States are the states that verified ok, in canonical order.
+	States []string `yaml:"states" json:"states"`
 }
 
 // Requires declares what the container host must provide for a target to run.
@@ -795,6 +831,17 @@ func (c *Contract) Fidelity() string {
 	}
 	return c.Metadata.Fidelity
 }
+
+// Verification returns the declared verification, defaulting to verified.
+func (c *Contract) Verification() string {
+	if c.Metadata.Verification == "" {
+		return VerificationVerified
+	}
+	return c.Metadata.Verification
+}
+
+// IsUnverified reports whether the target is marked as never run.
+func (c *Contract) IsUnverified() bool { return c.Verification() == VerificationUnverified }
 
 // IsSimulated reports whether the target is a stand-in rather than the real software.
 func (c *Contract) IsSimulated() bool { return c.Fidelity() == FidelitySimulated }

@@ -67,6 +67,8 @@ directories once.
 | `updated` | | ISO date of the last change to this target's metadata or states (`YYYY-MM-DD`); bump it whenever CVE facts, versions, or probes change. Defaults to `added` when never updated. |
 | `fidelity` | | `real` = runs the genuine affected software (the default and strongly preferred); `simulated` = a hand-written stand-in that reproduces the behaviour. Only use `simulated` when no public image or buildable upstream source reproduces the flaw (bare-OS/device/protocol sims). |
 | `detected_by` | | the scanner templates/scripts that detect this target, as `<scanner>:<id>`. Known scanners: `nuclei:` (template id, e.g. `nuclei:CVE-2021-41773`, `nuclei:laravel-env`) and `nmap:` (NSE script, e.g. `nmap:http-aspnet-debug`). Declaring one means "this should fire on vulnerable and stay silent on patched". A bare id (no `scanner:`) defaults to nuclei. |
+| `verification` | | `verified` (the default): someone ran every state on a host that can run it and verify passed. `unverified`: the contract is statically sound but nobody has run it yet, e.g. it needs hardware no maintainer has. `validate` warns (`unverified-target`; an error under `-strict`) and still runs every other rule; `list -unverified` selects such targets, and works as a suite filter line. |
+| `verified_on` | | evidence of the last run in which every listed state verified ok: `date` (`YYYY-MM-DD`), `vulnsuite` (version), `host` (the daemon's `os/arch`), optional `platform` (when the image ran under emulation) and `cpu_flags` (the `requires.cpu_flags` the host was checked to have), and `states`. Written by [`vulnsuite stamp`](USAGE.md#recording-that-a-target-was-verified-stamp), not by hand: a hand-edited stamp shows up in review as one with no run output behind it. |
 | `detection` | | `scanner`: the `detected_by` entries are **verified** (you ran the scanner against both states); `custom-only`: no public scanner template exists, the target tests your own detection. Unset with `detected_by` present = declared, not yet verified. Unset with nothing declared = a detection gap (`validate` warns; write a template and contribute it upstream). |
 
 ## `base`
@@ -499,6 +501,9 @@ rather than failed; use `-expose host` or scan from a container.
 | `no-healthcheck`, `no-vuln-ref`, `no-references`, `scanner-unnamed` | warning | missing provenance |
 | `no-detected-by` | warning | no scanner template linked and `detection` unset |
 | `fidelity-unset` | warning | metadata.fidelity is not set (real or simulated) |
+| `unverified-target` | warning | `verification: unverified`: nobody has run the target's states yet (`vulnsuite stamp` records a run) |
+| `verified-no-evidence` | warning | `verification: verified` is set, `requires` needs specific hardware (`cpu_flags` or `probe`), and `verified_on` records no run |
+| `verified-on-stale` | warning | `verified_on` names a state the template no longer declares, or misses a `requires.cpu_flags` entry added since the run |
 | `simulated-on-image-base` | warning | fidelity: simulated but the base is a prebuilt image |
 | `kvm-without-requires` | warning | service.devices has /dev/kvm but requires.kvm is not set |
 | `cpu-flags-with-emulation` | warning | requires.emulation is true but requires.cpu_flags is set, which rules emulation out |
