@@ -71,14 +71,16 @@ type listRow struct {
 	BuildKind string         `json:"build_kind"`
 	Fidelity  string         `json:"fidelity"`
 	// Verification is verified or unverified (metadata.verification, with
-	// its default), and VerifiedOn the evidence of the last verifying run.
-	Verification string               `json:"verification"`
-	VerifiedOn   *contract.VerifiedOn `json:"verified_on,omitempty"`
-	VulnRefs     []string             `json:"vuln_refs"`
-	Detection    string               `json:"detection,omitempty"`
-	DetectedBy   []string             `json:"detected_by,omitempty"`
-	Tags         []string             `json:"tags,omitempty"`
-	HostAccess   bool                 `json:"host_access,omitempty"`
+	// its default), and VerifiedOn the evidence of the last verifying run on
+	// each host, shaped as in the contract: an object for one run, an array
+	// for several.
+	Verification string                `json:"verification"`
+	VerifiedOn   contract.VerifiedRuns `json:"verified_on,omitempty"`
+	VulnRefs     []string              `json:"vuln_refs"`
+	Detection    string                `json:"detection,omitempty"`
+	DetectedBy   []string              `json:"detected_by,omitempty"`
+	Tags         []string              `json:"tags,omitempty"`
+	HostAccess   bool                  `json:"host_access,omitempty"`
 	// Requires is the template's requires block (absent when it has none).
 	Requires *contract.Requires `json:"requires,omitempty"`
 	Summary  string             `json:"summary"`
@@ -420,39 +422,43 @@ func yesNo(b bool) string {
 }
 
 // verifiedCell renders the VERIFIED column: "no" for an unverified target,
-// else the date of its last stamped run, or "yes" when none is recorded.
-func verifiedCell(verification string, on *contract.VerifiedOn) string {
-	switch {
-	case verification == contract.VerificationUnverified:
+// else the date of its latest stamped run, or "yes" when none is recorded.
+func verifiedCell(verification string, runs contract.VerifiedRuns) string {
+	if verification == contract.VerificationUnverified {
 		return "no"
-	case on != nil:
-		return on.Date
+	}
+	if latest := runs.Latest(); latest != nil {
+		return latest.Date
 	}
 	return "yes"
 }
 
 // verifiedText is the info line for a target's verification.
 func verifiedText(c *contract.Contract) string {
-	vo := c.Metadata.VerifiedOn
+	runs := c.Metadata.VerifiedOn
 	var out string
 	if c.IsUnverified() {
 		out = "no -- nobody has run this target's states yet (verification: unverified)"
 	} else {
 		out = "yes"
 	}
-	if vo != nil {
-		host := vo.Host
-		if vo.Platform != "" {
-			host += " running " + vo.Platform
-		}
+	prefix := "last run"
+	if len(runs) > 1 {
+		prefix = "last runs"
+	}
+	if c.IsUnverified() && len(runs) > 0 {
+		prefix += " (before it was marked unverified)"
+	}
+	for i, vo := range runs {
+		host := vo.RanOn()
 		if len(vo.CPUFlags) > 0 {
 			host += " with " + strings.Join(vo.CPUFlags, ",")
 		}
-		prefix := "last run"
-		if c.IsUnverified() {
-			prefix += " (before it was marked unverified)"
+		lead := "; " + prefix + " "
+		if i > 0 {
+			lead = "; "
 		}
-		out += fmt.Sprintf("; %s %s: %s verified ok on %s, vulnsuite %s", prefix, vo.Date,
+		out += fmt.Sprintf("%s%s: %s verified ok on %s, vulnsuite %s", lead, vo.Date,
 			strings.Join(vo.States, "+"), host, vo.Vulnsuite)
 	}
 	return out

@@ -562,7 +562,31 @@ For each target, `stamp` runs every declared state in turn (build, start,
 verify, tear down). Only when every state ends in `verify: ok` does it write
 `metadata.verified_on` (date, vulnsuite version, the daemon's `os/arch`, the
 emulated `platform` if any, the `requires.cpu_flags` it checked, the states)
-and set `verification: verified`. Only those lines of the contract change. A
+and set `verification: verified`. Only those lines of the contract change.
+
+`verified_on` keeps one run per host and image platform. Stamping on another
+host adds its run next to the ones already recorded, and stamping again on
+the same host replaces only that host's run. Native `linux/arm64` and
+`linux/amd64` emulated on an arm64 host count as different runs. A single run
+is written as a mapping, which vulnsuite v0.5.0 also reads; runs on several
+hosts become a list:
+
+```yaml
+verified_on:
+  - date: "2026-10-02"
+    vulnsuite: v0.6.0
+    host: linux/arm64
+    states: [vulnerable, patched]
+  - date: "2026-11-21"
+    vulnsuite: v0.6.0
+    host: linux/amd64
+    cpu_flags: [avx512vbmi]
+    states: [vulnerable, patched]
+```
+
+`list` shows the date of the latest run; `info` lists every run, and
+`list -json` gives `verified_on` the same shape as the contract (an object for
+one run, an array for several). A
 failing state leaves the file untouched and fails the command. A host that does
 not meet `requires` skips the target. There is no `-ignore-requires`: the point
 is evidence from a host that qualifies. Commit the stamped contract with the

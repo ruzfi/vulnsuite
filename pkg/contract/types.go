@@ -168,6 +168,7 @@ type checker struct {
 var (
 	commandType         = reflect.TypeOf(Command(nil))
 	expectSanitizerType = reflect.TypeOf(ExpectSanitizer{})
+	verifiedRunsType    = reflect.TypeOf(VerifiedRuns(nil))
 )
 
 // probeTypes are the verify-probe structs whose port, timeout and counts the
@@ -341,6 +342,16 @@ func (c checker) checkNodeType(n ast.Node, t reflect.Type, loc string) error {
 			return typeErr(loc, "none or a mapping", n)
 		}
 		return c.checkNodeType(n, reflect.TypeOf(rawExpectSanitizer{}), loc)
+	}
+	if t == verifiedRunsType {
+		// One run as a mapping, or a list of them.
+		if _, ok := n.(*ast.SequenceNode); ok {
+			return c.checkNodeType(n, reflect.TypeOf([]VerifiedOn(nil)), loc)
+		}
+		if _, ok := mappingEntries(n); !ok {
+			return typeErr(loc, "a mapping or a list of mappings", n)
+		}
+		return c.checkNodeType(n, reflect.TypeOf(VerifiedOn{}), loc)
 	}
 	switch t.Kind() {
 	case reflect.String:

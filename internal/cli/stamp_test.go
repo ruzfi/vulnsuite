@@ -110,7 +110,7 @@ func TestStampWritesEvidenceWhenEveryStateVerifies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	vo := c.Metadata.VerifiedOn
+	vo := c.Metadata.VerifiedOn.Latest()
 	if c.IsUnverified() || vo == nil || vo.Host != "linux/amd64" || strings.Join(vo.States, ",") != "vulnerable,patched" ||
 		strings.Join(vo.CPUFlags, ",") != "avx512vbmi" || vo.Vulnsuite == "" || vo.Date == "" {
 		t.Fatalf("stamped metadata: %+v %+v\n%s", c.Metadata, vo, data)
@@ -202,5 +202,59 @@ func TestListAndInfoShowVerification(t *testing.T) {
 	code, out, _ = run(t, nil, "-T", root, "-json", "info", "plain-demo")
 	if code != ExitOK || !strings.Contains(out, `"verification": "verified"`) {
 		t.Fatalf("info -json: %d\n%s", code, out)
+	}
+}
+
+// Stamping on a second host keeps the first host's run; list, info and
+// list -json show both.
+func TestStampOnSecondHostKeepsFirst(t *testing.T) {
+	root, path := stampRoot(t)
+	if code, out, errOut := run(t, stampEngine(t), "-T", root, "stamp", "-expose", "host", "-t", "stamp-demo"); code != ExitOK ||
+		!strings.Contains(out, "stamped stamp-demo on linux/amd64") {
+		t.Fatalf("stamp on amd64: %d\n%s\n%s", code, out, errOut)
+	}
+	arm := stampEngine(t)
+	arm.HostInfo.Arch = "arm64"
+	if code, out, errOut := run(t, arm, "-T", root, "stamp", "-expose", "host", "-t", "stamp-demo"); code != ExitOK ||
+		!strings.Contains(out, "stamped stamp-demo on linux/arm64") {
+		t.Fatalf("stamp on arm64: %d\n%s\n%s", code, out, errOut)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := contract.Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hosts []string
+	for _, r := range c.Metadata.VerifiedOn {
+		hosts = append(hosts, r.Host)
+	}
+	if strings.Join(hosts, ",") != "linux/amd64,linux/arm64" {
+		t.Fatalf("runs on %v:\n%s", hosts, data)
+	}
+	code, out, _ := run(t, nil, "-T", root, "info", "stamp-demo")
+	if code != ExitOK || !strings.Contains(out, "last runs") || !strings.Contains(out, "on linux/amd64 with avx512vbmi") ||
+		!strings.Contains(out, "on linux/arm64 with avx512vbmi") {
+		t.Fatalf("info: %d\n%s", code, out)
+	}
+	code, out, _ = run(t, nil, "-T", root, "-json", "list", "-verified")
+	var rows []struct {
+		ID         string                `json:"id"`
+		VerifiedOn []contract.VerifiedOn `json:"verified_on"`
+	}
+	if code != ExitOK || json.Unmarshal([]byte(out), &rows) != nil {
+		t.Fatalf("list -json: %d\n%s", code, out)
+	}
+	found := false
+	for _, r := range rows {
+		found = found || r.ID == "stamp-demo" && len(r.VerifiedOn) == 2
+	}
+	if !found {
+		t.Fatalf("list -json must carry both runs of stamp-demo as an array:\n%s", out)
+	}
+	if _, vout, _ := run(t, nil, "-T", root, "validate", "-t", "stamp-demo"); strings.Contains(vout, "verified-on") {
+		t.Fatalf("validate after two stamps:\n%s", vout)
 	}
 }

@@ -65,8 +65,11 @@ metadata.verified_on into the contract file:
     cpu_flags: [avx512vbmi]      # the requires.cpu_flags the host was checked to have
     states: [vulnerable, patched]
 
-and sets verification: verified. Only those lines change; comments and the
-rest of the file are kept. When any state fails, or the host does not meet
+and sets verification: verified. verified_on keeps one run per host and
+image platform: a stamp replaces the run recorded on the same host and keeps
+the others, so a target run on linux/arm64 and then on linux/amd64 records
+both (as a list; a single run stays a mapping). Only those lines change;
+comments and the rest of the file are kept. When any state fails, or the host does not meet
 the template's requires, the file is left untouched.
 
 A stamp is evidence that a host meeting the requires ran the target, so there
@@ -151,7 +154,7 @@ Targets run one at a time, and each state is torn down before the next.`,
 				results = append(results, res)
 				switch res.Outcome {
 				case stampStamped:
-					g.printf("stamped %s: %s\n", c.ID(), c.SourcePath)
+					g.printf("stamped %s on %s: %s\n", c.ID(), res.VerifiedOn.RanOn(), c.SourcePath)
 				case stampVerified:
 					g.printf("verified %s (-dry-run: %s not written)\n", c.ID(), c.SourcePath)
 				case stampSkipped:
