@@ -506,12 +506,25 @@ type State struct {
 }
 
 // SidecarRef is the image ref to run for sc in this state: a per-state override
-// if present, otherwise the sidecar's own image.
+// if present, otherwise the sidecar's own image. A built sidecar has no image
+// of its own, so without an override this is ""; Contract.SidecarImage also
+// knows the built image's tag.
 func (s State) SidecarRef(sc Sidecar) string {
 	if ov, ok := s.Sidecars[sc.Name]; ok && ov.Image != "" {
 		return pinRef(ov.Image, ov.Digest)
 	}
 	return sc.Ref()
+}
+
+// BuildsSidecar reports whether this state runs sc from the image built from
+// its build context: sc has a build and the state does not swap it for an
+// image.
+func (s State) BuildsSidecar(sc Sidecar) bool {
+	if sc.Build == nil {
+		return false
+	}
+	ov, ok := s.Sidecars[sc.Name]
+	return !ok || ov.Image == ""
 }
 
 // EffectiveImage is the image ref for this state if it is image-based (a
@@ -547,17 +560,42 @@ type TCPHealth struct {
 // Empty reports whether no healthcheck is declared.
 func (h Healthcheck) Empty() bool { return h.HTTP == nil && h.TCP == nil && h.Timeout == "" }
 
-// Sidecar is a helper container started next to the target.
+// Sidecar is a helper container started next to the target. It runs either a
+// prebuilt image (Image, pinned with Digest) or an image built from a context
+// in the template (Build); exactly one of the two is set.
 type Sidecar struct {
-	Name        string            `yaml:"name" json:"name"`
-	Image       string            `yaml:"image" json:"image"`
-	Digest      string            `yaml:"digest,omitempty" json:"digest,omitempty"`
+	Name   string `yaml:"name" json:"name"`
+	Image  string `yaml:"image" json:"image,omitempty"`
+	Digest string `yaml:"digest,omitempty" json:"digest,omitempty"`
+	// Build builds the sidecar's image from a context in the template, like a
+	// kind: build base. The image is tagged by content (SidecarTag), so it is
+	// pinned by construction.
+	Build       *SidecarBuild     `yaml:"build,omitempty" json:"build,omitempty"`
 	Command     []string          `yaml:"command,omitempty" json:"command,omitempty"`
 	Environment map[string]string `yaml:"environment,omitempty" json:"environment,omitempty"`
 }
 
-// Ref is the sidecar's pinned image reference.
+// Ref is the sidecar's pinned image reference ("" for a built sidecar).
 func (s Sidecar) Ref() string { return pinRef(s.Image, s.Digest) }
+
+// SidecarBuild is a sidecar's build: a Dockerfile and its context, inside the
+// template folder, under the same path rules as a kind: build base.
+type SidecarBuild struct {
+	// Context is the build context, relative to the template folder.
+	Context string `yaml:"context" json:"context"`
+	// Dockerfile is the Dockerfile's path inside the context (default
+	// Dockerfile).
+	Dockerfile string            `yaml:"dockerfile,omitempty" json:"dockerfile,omitempty"`
+	BuildArgs  map[string]string `yaml:"build_args,omitempty" json:"build_args,omitempty"`
+}
+
+// DockerfilePath is Dockerfile, defaulted.
+func (b SidecarBuild) DockerfilePath() string {
+	if b.Dockerfile == "" {
+		return "Dockerfile"
+	}
+	return b.Dockerfile
+}
 
 // SidecarOverride lets a state swap a sidecar's image (e.g. the patched state
 // of a multi-node target running the fixed version on every node).
@@ -955,6 +993,53 @@ func (c *Contract) ContentHash(stateName string) string {
 // ImageTag is the local tag a built image of this state gets.
 func (c *Contract) ImageTag(stateName string) string {
 	return fmt.Sprintf("%s/%s:%s-%s", ImageRepoPrefix, c.ID(), stateName, c.ContentHash(stateName))
+}
+
+// SidecarTagPrefix starts the tag of every built sidecar image.
+const SidecarTagPrefix = "sidecar-"
+
+// SidecarHash is the content-addressed hash of a built sidecar's image: its
+// Dockerfile path, its context (hashed as a base build context is) and its
+// build args. Its command and environment are applied when it runs and are
+// not part of it. "" for an image sidecar.
+func (c *Contract) SidecarHash(sc Sidecar) string {
+	if sc.Build == nil {
+		return ""
+	}
+	parts := []string{
+		"sidecar-build:" + sc.Build.DockerfilePath(),
+		"context/v2:" + hashTree(c.hashPath(sc.Build.Context)),
+	}
+	if len(sc.Build.BuildArgs) > 0 {
+		b, _ := json.Marshal(sortedMap(sc.Build.BuildArgs))
+		parts = append(parts, "args:"+string(b))
+	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "|")))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
+// SidecarTag is the local tag of a built sidecar's image,
+// vulnsuite/<id>:sidecar-<name>-<hash>. It is the same for every state that
+// runs the sidecar from its build. "" for an image sidecar.
+func (c *Contract) SidecarTag(sc Sidecar) string {
+	if sc.Build == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s/%s:%s%s-%s", ImageRepoPrefix, c.ID(), SidecarTagPrefix, sc.Name, c.SidecarHash(sc))
+}
+
+// SidecarImage is the image the named state runs sc from: the state's image
+// override when it has one, else the built tag of a built sidecar, else the
+// sidecar's own pinned image.
+func (c *Contract) SidecarImage(stateName string, sc Sidecar) string {
+	st := c.States[stateName]
+	if st == nil {
+		st = &State{}
+	}
+	if st.BuildsSidecar(sc) {
+		return c.SidecarTag(sc)
+	}
+	return st.SidecarRef(sc)
 }
 
 // ImageRef is the image a state runs: the built tag when a build happens,
