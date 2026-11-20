@@ -10,7 +10,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
+	"net/http"
 	"net/netip"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +31,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/ruzfi/vulnsuite/pkg/engine"
+	"github.com/ruzfi/vulnsuite/pkg/engine/docker"
 	"github.com/ruzfi/vulnsuite/pkg/engine/registryauth"
 )
 
@@ -36,18 +41,59 @@ type Engine struct {
 	host string
 }
 
-// New connects to host (empty = DOCKER_HOST / the local socket), negotiating
-// the API version with the daemon.
+// New connects to host, negotiating the API version with the daemon. An
+// empty host resolves like the docker CLI and the built-in api engine:
+// DOCKER_HOST (with DOCKER_TLS_VERIFY / DOCKER_CERT_PATH), then the context
+// named by DOCKER_CONTEXT or currentContext, then the local socket defaults
+// (including the Docker Desktop, OrbStack and Colima per-user sockets).
 func New(host string) (*Engine, error) {
 	opts := []client.Opt{client.FromEnv, client.WithAPIVersionNegotiation()}
-	if host != "" {
+	switch {
+	case host != "":
 		opts = append(opts, client.WithHost(host))
+	case os.Getenv("DOCKER_HOST") == "":
+		// FromEnv has nothing to go on: resolve the context / socket the
+		// way the docker CLI does.
+		ep, err := docker.ResolveEndpoint()
+		if err != nil {
+			return nil, err
+		}
+		epOpts, err := endpointOpts(ep)
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts, epOpts...)
 	}
 	cli, err := client.New(opts...)
 	if err != nil {
 		return nil, err
 	}
 	return &Engine{cli: cli, host: cli.DaemonHost()}, nil
+}
+
+// endpointOpts turns a resolved endpoint into SDK options. Its TLS settings
+// apply to a tcp:// host only, as in the api engine; a socket ignores them.
+func endpointOpts(ep docker.Endpoint) ([]client.Opt, error) {
+	u, err := url.Parse(ep.Host)
+	if err != nil {
+		return nil, fmt.Errorf("docker endpoint %q: %w", ep.Host, err)
+	}
+	files := ep.TLS
+	if files == nil || u.Scheme != "tcp" {
+		return []client.Opt{client.WithHost(ep.Host)}, nil
+	}
+	cfg, err := files.TLSConfig(u.Hostname())
+	if err != nil {
+		return nil, fmt.Errorf("TLS for %s: %w", ep.Host, err)
+	}
+	// WithHost configures the dialer on the transport WithHTTPClient sets,
+	// so it must come second.
+	hc := &http.Client{Transport: &http.Transport{
+		TLSClientConfig: cfg,
+		MaxIdleConns:    6,
+		IdleConnTimeout: 30 * time.Second,
+	}, CheckRedirect: client.CheckRedirect}
+	return []client.Opt{client.WithHTTPClient(hc), client.WithHost(ep.Host)}, nil
 }
 
 // Client exposes the underlying SDK client.
@@ -94,15 +140,21 @@ func (e *Engine) ImageExists(ctx context.Context, ref, platform string) (bool, e
 	if err != nil {
 		return false, err
 	}
+	if !apiAtLeast(e.cli.ClientVersion(), 1, 49) {
+		return false, nil
+	}
 	img, err = e.cli.ImageInspect(ctx, ref, client.ImageInspectWithPlatform(&p))
 	if err != nil {
-		return false, nil
+		if cerrdefs.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
 	}
 	return engine.PlatformMatches(platform, img.Os, img.Architecture, img.Variant), nil
 }
 
 func (e *Engine) ImagePull(ctx context.Context, ref, platform string, out io.Writer) error {
-	po := client.ImagePullOptions{RegistryAuth: registryauth.For(ref)}
+	po := client.ImagePullOptions{RegistryAuth: registryauth.ForContext(ctx, ref)}
 	if platform != "" {
 		p, err := parsePlatform(platform)
 		if err != nil {
@@ -114,7 +166,7 @@ func (e *Engine) ImagePull(ctx context.Context, ref, platform string, out io.Wri
 	if err != nil {
 		return fmt.Errorf("pull %s: %w", ref, err)
 	}
-	if err := drain(ctx, resp.JSONMessages(ctx), out); err != nil {
+	if err := drain(ctx, messages(ctx, resp), out); err != nil {
 		return fmt.Errorf("pull %s: %w", ref, err)
 	}
 	return nil
@@ -136,7 +188,7 @@ func (e *Engine) ImageBuild(ctx context.Context, opts engine.BuildOptions, out i
 		Remove:      true,
 		ForceRemove: true,
 		Version:     build.BuilderV1,
-		AuthConfigs: authConfigs(),
+		AuthConfigs: authConfigs(ctx),
 	}
 	if opts.Platform != "" {
 		p, err := parsePlatform(opts.Platform)
@@ -159,7 +211,7 @@ func (e *Engine) ImageTag(ctx context.Context, source, target string) error {
 }
 
 func (e *Engine) ImagePush(ctx context.Context, ref string, out io.Writer) error {
-	auth := registryauth.ForPush(ref)
+	auth := registryauth.ForPushContext(ctx, ref)
 	if auth == "" {
 		auth, _ = authconfig.Encode(registry.AuthConfig{})
 	}
@@ -167,7 +219,7 @@ func (e *Engine) ImagePush(ctx context.Context, ref string, out io.Writer) error
 	if err != nil {
 		return fmt.Errorf("push %s: %w", ref, err)
 	}
-	if err := drain(ctx, resp.JSONMessages(ctx), out); err != nil {
+	if err := drain(ctx, messages(ctx, resp), out); err != nil {
 		return fmt.Errorf("push %s: %w", ref, err)
 	}
 	return nil
@@ -200,7 +252,7 @@ func (e *Engine) ImageList(ctx context.Context, repoPrefix string) ([]string, er
 // -- containers -----------------------------------------------------------------
 
 func (e *Engine) ContainerCreate(ctx context.Context, spec engine.ContainerSpec) (string, error) {
-	cfg := &container.Config{Image: spec.Image, Cmd: spec.Cmd, Env: spec.Env, User: spec.User, Labels: spec.Labels}
+	cfg := &container.Config{Image: spec.Image, Entrypoint: spec.Entrypoint, Cmd: spec.Cmd, Env: spec.Env, User: spec.User, Labels: spec.Labels}
 	hc := &container.HostConfig{
 		CapAdd:      spec.CapAdd,
 		CapDrop:     spec.CapDrop,
@@ -438,11 +490,13 @@ func (e *Engine) NetworkExists(ctx context.Context, name string) (bool, error) {
 	return false, err
 }
 
-func (e *Engine) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (string, error) {
+// NetworkEnsure creates the network when missing and returns it as the
+// daemon reports it; an existing network is returned with its own settings.
+func (e *Engine) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (engine.Network, error) {
 	if res, err := e.cli.NetworkInspect(ctx, spec.Name, client.NetworkInspectOptions{}); err == nil {
-		return res.Network.ID, nil
+		return toNetwork(res.Network), nil
 	} else if !cerrdefs.IsNotFound(err) {
-		return "", err
+		return engine.Network{}, err
 	}
 	driver := spec.Driver
 	if driver == "" {
@@ -453,30 +507,49 @@ func (e *Engine) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (st
 	if spec.Subnet != "" {
 		prefix, err := netip.ParsePrefix(spec.Subnet)
 		if err != nil {
-			return "", fmt.Errorf("subnet %q: %w", spec.Subnet, err)
+			return engine.Network{}, fmt.Errorf("subnet %q: %w", spec.Subnet, err)
 		}
 		cfg := network.IPAMConfig{Subnet: prefix}
 		if spec.Gateway != "" {
 			gw, err := netip.ParseAddr(spec.Gateway)
 			if err != nil {
-				return "", fmt.Errorf("gateway %q: %w", spec.Gateway, err)
+				return engine.Network{}, fmt.Errorf("gateway %q: %w", spec.Gateway, err)
 			}
 			cfg.Gateway = gw
 		}
 		opts.IPAM = &network.IPAM{Driver: "default", Config: []network.IPAMConfig{cfg}}
 	}
-	res, err := e.cli.NetworkCreate(ctx, spec.Name, opts)
-	if err != nil {
+	if _, err := e.cli.NetworkCreate(ctx, spec.Name, opts); err != nil {
 		// A concurrent run created it between our inspect and create: use
-		// that one.
+		// that one (the caller checks its settings).
 		if cerrdefs.IsConflict(err) {
 			if again, ierr := e.cli.NetworkInspect(ctx, spec.Name, client.NetworkInspectOptions{}); ierr == nil {
-				return again.Network.ID, nil
+				return toNetwork(again.Network), nil
 			}
 		}
-		return "", err
+		return engine.Network{}, err
 	}
-	return res.ID, nil
+	// Read back what the daemon made, so the caller sees the same fields for
+	// a new network as for an existing one.
+	res, err := e.cli.NetworkInspect(ctx, spec.Name, client.NetworkInspectOptions{})
+	if err != nil {
+		return engine.Network{}, fmt.Errorf("inspect new network %s: %w", spec.Name, err)
+	}
+	return toNetwork(res.Network), nil
+}
+
+func toNetwork(n network.Inspect) engine.Network {
+	out := engine.Network{ID: n.ID, Driver: n.Driver, Internal: n.Internal, Options: n.Options}
+	if len(n.IPAM.Config) > 0 {
+		c := n.IPAM.Config[0]
+		if c.Subnet.IsValid() {
+			out.Subnet = c.Subnet.String()
+		}
+		if c.Gateway.IsValid() {
+			out.Gateway = c.Gateway.String()
+		}
+	}
+	return out
 }
 
 func (e *Engine) NetworkRemove(ctx context.Context, name string) error {
@@ -497,12 +570,28 @@ func (e *Engine) NetworkConnect(ctx context.Context, networkName, container stri
 
 // -- helpers --------------------------------------------------------------------
 
-func authConfigs() map[string]registry.AuthConfig {
+func authConfigs(ctx context.Context) map[string]registry.AuthConfig {
 	out := map[string]registry.AuthConfig{}
-	for k, c := range registryauth.Configs() {
+	for k, c := range registryauth.ConfigsContext(ctx) {
 		out[k] = registry.AuthConfig{Username: c.Username, Password: c.Password, ServerAddress: c.ServerAddress, IdentityToken: c.IdentityToken}
 	}
 	return out
+}
+
+// apiAtLeast reports whether the negotiated API version v ("1.51") is at least
+// major.minor. An empty or unparsable version (negotiation not done) counts
+// as recent enough: the SDK then checks the requirement itself.
+func apiAtLeast(v string, major, minor int) bool {
+	a, b, ok := strings.Cut(v, ".")
+	if !ok {
+		return true
+	}
+	ma, err1 := strconv.Atoi(a)
+	mi, err2 := strconv.Atoi(b)
+	if err1 != nil || err2 != nil {
+		return true
+	}
+	return ma > major || (ma == major && mi >= minor)
 }
 
 func parsePlatform(s string) (ocispec.Platform, error) {
@@ -517,17 +606,74 @@ func parsePlatform(s string) (ocispec.Platform, error) {
 	return p, nil
 }
 
+// streamMessage is one line of a JSON progress stream (build, pull, push).
+// Daemons have reported failures in two forms, an "errorDetail" object and a
+// top-level "error" string (dockerd sends both). The Moby API module's
+// jsonstream.Message dropped "error", so it is decoded here too: a daemon or
+// proxy that sends only that form must not have its failure read as success.
+type streamMessage struct {
+	jsonstream.Message
+	ErrorMessage string `json:"error,omitempty"`
+}
+
+// err returns the failure m reports, or nil.
+func (m streamMessage) err() error {
+	if m.Error == nil && m.ErrorMessage == "" {
+		return nil
+	}
+	msg := m.ErrorMessage
+	if m.Error != nil && strings.TrimSpace(m.Error.Message) != "" {
+		msg = m.Error.Message
+	}
+	if msg = strings.TrimSpace(msg); msg == "" {
+		msg = "the daemon reported an error with no message"
+	}
+	return errors.New(msg)
+}
+
+// messages decodes a pull/push response as a sequence of streamMessage, like
+// the SDK's JSONMessages (which would drop the "error" form): rc is closed
+// when the sequence ends or ctx is cancelled.
+func messages(ctx context.Context, rc io.ReadCloser) iter.Seq2[streamMessage, error] {
+	return func(yield func(streamMessage, error) bool) {
+		stop := context.AfterFunc(ctx, func() { _ = rc.Close() })
+		defer func() {
+			stop()
+			_ = rc.Close()
+		}()
+		dec := json.NewDecoder(rc)
+		for {
+			var m streamMessage
+			if err := dec.Decode(&m); err != nil {
+				if errors.Is(err, io.EOF) {
+					return
+				}
+				// A read cut short by cancellation reports the cancellation,
+				// not the closed body.
+				if cerr := ctx.Err(); cerr != nil {
+					err = cerr
+				}
+				yield(streamMessage{}, err)
+				return
+			}
+			if !yield(m, nil) {
+				return
+			}
+		}
+	}
+}
+
 // drain consumes a pull/push message stream, writing status changes to out.
-func drain(ctx context.Context, msgs func(func(jsonstream.Message, error) bool), out io.Writer) error {
+func drain(ctx context.Context, msgs iter.Seq2[streamMessage, error], out io.Writer) error {
 	var last string
 	var failed error
-	msgs(func(m jsonstream.Message, err error) bool {
+	msgs(func(m streamMessage, err error) bool {
 		if err != nil {
 			failed = err
 			return false
 		}
-		if m.Error != nil {
-			failed = errors.New(strings.TrimSpace(m.Error.Message))
+		if err := m.err(); err != nil {
+			failed = err
 			return false
 		}
 		if out != nil && m.Status != "" && m.Progress == nil {
@@ -554,15 +700,15 @@ func drain(ctx context.Context, msgs func(func(jsonstream.Message, error) bool),
 func drainReader(r io.Reader, out io.Writer) error {
 	dec := json.NewDecoder(r)
 	for {
-		var m jsonstream.Message
+		var m streamMessage
 		if err := dec.Decode(&m); err != nil {
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return fmt.Errorf("reading build stream: %w", err)
 		}
-		if m.Error != nil {
-			return errors.New(strings.TrimSpace(m.Error.Message))
+		if err := m.err(); err != nil {
+			return err
 		}
 		if out != nil && m.Stream != "" {
 			io.WriteString(out, m.Stream)

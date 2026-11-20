@@ -59,12 +59,23 @@ func (s *Store) All() ([]string, error) {
 
 // Find resolves a selector (a folder, a file, a path relative to the root, or
 // an id) to contract files.
+//
+// A selector is read as a path relative to the working directory only when it
+// looks like one (see IsPathSelector); a bare name such as "grafana" is always
+// resolved within the templates root, so a file or folder of that name in the
+// working directory never shadows a template.
 func (s *Store) Find(selector string) ([]string, error) {
 	selector = strings.TrimSpace(selector)
 	if selector == "" {
 		return nil, &Error{Path: selector, Message: "empty selector"}
 	}
-	candidates := []string{selector, filepath.Join(s.Root, selector), filepath.Join(s.Root, "templates", selector)}
+	var candidates []string
+	if IsPathSelector(selector) {
+		candidates = append(candidates, expandHome(selector))
+	}
+	if !filepath.IsAbs(selector) {
+		candidates = append(candidates, filepath.Join(s.Root, selector), filepath.Join(s.Root, "templates", selector))
+	}
 	for _, c := range candidates {
 		info, err := os.Stat(c)
 		if err != nil {
@@ -156,6 +167,37 @@ func (s *Store) Find(selector string) ([]string, error) {
 			len(unreadable), strings.Join(unreadable, "\n  "))
 	}
 	return nil, &Error{Path: selector, Message: msg}
+}
+
+// IsPathSelector reports whether a selector names a filesystem path rather
+// than a template id, group or category: it contains a path separator, starts
+// with "." or "~", is absolute, or ends in a contract-file extension (.yaml,
+// .yml).
+func IsPathSelector(selector string) bool {
+	if strings.ContainsRune(selector, '/') || strings.ContainsRune(selector, filepath.Separator) {
+		return true
+	}
+	if strings.HasPrefix(selector, ".") || strings.HasPrefix(selector, "~") {
+		return true
+	}
+	if filepath.IsAbs(selector) || filepath.VolumeName(selector) != "" {
+		return true
+	}
+	switch strings.ToLower(filepath.Ext(selector)) {
+	case ".yaml", ".yml":
+		return true
+	}
+	return false
+}
+
+// expandHome expands a leading "~/" (a quoted selector the shell left alone).
+func expandHome(p string) string {
+	if rest, ok := strings.CutPrefix(p, "~"); ok && (rest == "" || rest[0] == '/' || rest[0] == filepath.Separator) {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, rest)
+		}
+	}
+	return p
 }
 
 // FindMany resolves several selectors, de-duplicated, preserving order.

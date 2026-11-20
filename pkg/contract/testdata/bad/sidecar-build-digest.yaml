@@ -1,0 +1,18 @@
+# want: service/sidecars/0/digest
+apiVersion: vulnsuite/v1
+kind: Target
+metadata:
+  id: demo-sidecar-build
+  summary: a target whose sidecars are built from contexts in the template
+base:
+  kind: image
+  image: nginx:1.27
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+service:
+  ports: [ { container: 80, protocol: http } ]
+  sidecars:
+    - { name: driver, digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111", build: { context: sidecars/driver } }
+states:
+  vulnerable:
+    verify:
+      - http: { path: /, status: 200 }

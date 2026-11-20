@@ -289,3 +289,52 @@ func TestStopReportsRemovalErrors(t *testing.T) {
 		t.Fatal("StopAll swallowed the removal error")
 	}
 }
+
+// A sidecar network left by an earlier run is replaced, not reused with its old
+// settings, even when a sidecar the template has since renamed still holds it:
+// an internal network from a -no-egress run cannot publish ports in host mode.
+func TestStaleSidecarNetworkIsReplaced(t *testing.T) {
+	fe, r := lifecycleRunner()
+	scNet := SidecarNetworkName("sc-demo", "vulnerable")
+	noEgress := DefaultExposure()
+	noEgress.Internal = true
+	mustRun(t, r, sidecarContract("sc-demo", "db"), "vulnerable", noEgress)
+	if !fe.Networks[scNet].Internal {
+		t.Fatal("setup: the -no-egress run's sidecar network should be internal")
+	}
+	oldDB := SidecarContainerName("sc-demo", "vulnerable", "db")
+
+	// The template renamed its sidecar db -> postgres; the old one is left running.
+	h := mustRun(t, r, sidecarContract("sc-demo", "postgres"), "vulnerable", Exposure{Mode: ModeHost, Bind: "127.0.0.1"})
+	if fe.Networks[scNet].Internal {
+		t.Fatal("the stale internal sidecar network was reused: host mode cannot publish from it")
+	}
+	if _, ok := fe.Containers[oldDB]; ok {
+		t.Fatalf("the renamed-away sidecar %s leaked", oldDB)
+	}
+	if h.EndpointPort == 0 {
+		t.Fatalf("no host port published: %+v", h.PublishedPorts)
+	}
+	if got := fe.Resolve(h.Container, "postgres"); len(got) != 1 {
+		t.Fatalf("target resolves postgres to %v", got)
+	}
+}
+
+// A sidecar network that cannot be removed (a container vulnsuite did not start
+// is attached) fails the run instead of being reused with its old settings.
+func TestStaleSidecarNetworkRemovalErrorIsReported(t *testing.T) {
+	fe, r := lifecycleRunner()
+	scNet := SidecarNetworkName("sc-demo", "vulnerable")
+	if _, err := fe.NetworkEnsure(context.Background(), engine.NetworkSpec{Name: scNet, Internal: true}); err != nil {
+		t.Fatal(err)
+	}
+	fe.Containers["debug-shell"] = &enginetest.Container{ID: "x1", Running: true,
+		Spec: engine.ContainerSpec{Name: "debug-shell", Network: &engine.NetworkAttachment{Name: scNet}}}
+	_, err := r.Run(context.Background(), sidecarContract("sc-demo", "db"), "vulnerable", Exposure{Mode: ModeHost, Bind: "127.0.0.1"}, pullOpts)
+	if err == nil || !strings.Contains(err.Error(), scNet) {
+		t.Fatalf("want an error naming %s, got %v", scNet, err)
+	}
+	if _, ok := fe.Containers["debug-shell"]; !ok {
+		t.Fatal("removed a container vulnsuite does not manage")
+	}
+}

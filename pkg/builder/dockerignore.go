@@ -22,7 +22,7 @@ type dockerignore struct {
 }
 
 type ignoreRule struct {
-	re        *regexp.Regexp
+	match     func(name string) bool
 	exception bool
 }
 
@@ -51,25 +51,38 @@ func parseDockerignore(data []byte) (*dockerignore, error) {
 	d := &dockerignore{}
 	sc := bufio.NewScanner(bytes.NewReader(bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))))
 	for n := 1; sc.Scan(); n++ {
+		// As in Docker, only a line starting with "#" is a comment: the
+		// check comes before trimming, so "  # x" is a pattern.
+		if strings.HasPrefix(sc.Text(), "#") {
+			continue
+		}
 		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
+		if line == "" {
 			continue
 		}
 		exception := strings.HasPrefix(line, "!")
 		if exception {
 			line = strings.TrimSpace(line[1:])
+			if line == "" {
+				// Docker refuses it rather than reading it as "everything".
+				return nil, fmt.Errorf(`.dockerignore line %d: illegal exclusion pattern: "!"`, n)
+			}
 		}
+		// As in Docker, "/x" is "x", but "/" stays "/" and "." stays ".":
+		// neither matches a context path, so they exclude nothing.
 		line = path.Clean(filepath.ToSlash(line))
-		line = strings.TrimPrefix(line, "/")
-		if line == "" || line == "." {
-			// "/" or "." matches the whole context.
-			line = "**"
+		if exception && line == "/" {
+			// Docker cleans "!/" to "!" and refuses it like a bare "!".
+			return nil, fmt.Errorf(`.dockerignore line %d: illegal exclusion pattern: "!"`, n)
 		}
-		re, err := ignorePattern(line)
+		if len(line) > 1 && line[0] == '/' {
+			line = line[1:]
+		}
+		match, err := ignorePattern(line)
 		if err != nil {
 			return nil, fmt.Errorf(".dockerignore line %d: %w", n, err)
 		}
-		d.rules = append(d.rules, ignoreRule{re: re, exception: exception})
+		d.rules = append(d.rules, ignoreRule{match: match, exception: exception})
 		d.hasExceptions = d.hasExceptions || exception
 	}
 	return d, sc.Err()
@@ -93,7 +106,7 @@ func (d *dockerignore) excludes(name string) bool {
 // ("vendor" excludes vendor/a/b).
 func (r ignoreRule) matches(name string) bool {
 	for p := name; ; {
-		if r.re.MatchString(p) {
+		if r.match(p) {
 			return true
 		}
 		i := strings.LastIndexByte(p, '/')
@@ -104,67 +117,96 @@ func (r ignoreRule) matches(name string) bool {
 	}
 }
 
-// ignorePattern compiles a .dockerignore pattern: filepath.Match syntax per
-// path segment ("*", "?", "[...]", "\\" escapes) plus "**" for any number of
-// segments.
-func ignorePattern(p string) (*regexp.Regexp, error) {
+// ignorePattern compiles one cleaned .dockerignore pattern into a matcher for
+// a slash-separated context path. It is a port of Pattern.compile and
+// Pattern.match from github.com/moby/patternmatcher v0.6.0 (what the Docker
+// CLI uses; Apache-2.0), with "/" as the separator, so a context holds what
+// `docker build` would send:
+//
+//   - "*" is any run of characters but "/", "?" any one character but "/";
+//   - "**" is any number of whole directories, wherever it stands: "a/**/b"
+//     and "a**b" both match "a/b" and "a/x/b", and "a**b" does not match
+//     "axb"; a trailing "**" matches anything;
+//   - "[...]" is a regexp character class: "^" negates it and "!" is a
+//     literal ("[!a]*" matches "abc" and "!x", not "bcd");
+//   - "\" escapes the next character, as in a regexp;
+//   - a pattern made only of literal characters matches its exact path; one
+//     literal up to a trailing "**" matches by prefix, and one that is "**"
+//     followed by literal characters matches by suffix ("**foo" matches
+//     "barfoo").
+//
+// The pattern is checked first with path.Match, as Docker does with
+// filepath.Match, so a malformed one ("[", "a\") is an error.
+func ignorePattern(p string) (func(string) bool, error) {
+	if _, err := path.Match(p, "."); err != nil {
+		return nil, fmt.Errorf("pattern %q: %w", p, err)
+	}
+	const (
+		exact = iota
+		prefix
+		suffix
+		re
+	)
+	kind := exact
 	var b strings.Builder
 	b.WriteString("^")
-	for i := 0; i < len(p); i++ {
-		c := p[i]
-		switch c {
-		case '*':
-			if i+1 < len(p) && p[i+1] == '*' {
-				i++
-				switch {
-				case i+1 < len(p) && p[i+1] == '/':
-					i++
-					b.WriteString("(?:.*/)?") // "**/" : zero or more directories
-				default:
-					b.WriteString(".*")
-				}
-				continue
-			}
-			b.WriteString("[^/]*")
-		case '?':
-			b.WriteString("[^/]")
-		case '[':
-			j := i + 1
-			if j < len(p) && (p[j] == '!' || p[j] == '^') {
-				j++
-			}
-			if j < len(p) && p[j] == ']' {
-				j++
-			}
-			for j < len(p) && p[j] != ']' {
-				if p[j] == '\\' {
-					j++
-				}
-				j++
-			}
-			if j >= len(p) {
-				return nil, fmt.Errorf("pattern %q: unterminated [", p)
-			}
-			class := p[i+1 : j]
-			if strings.HasPrefix(class, "!") {
-				class = "^" + class[1:]
-			}
-			b.WriteString("[" + class + "]")
-			i = j
-		case '\\':
-			if i+1 >= len(p) {
-				return nil, fmt.Errorf("pattern %q: trailing \\", p)
-			}
+	rs := []rune(p)
+	for i := 0; i < len(rs); i++ {
+		first := i == 0
+		switch ch := rs[i]; {
+		case ch == '*' && i+1 < len(rs) && rs[i+1] == '*':
 			i++
-			b.WriteString(regexp.QuoteMeta(string(p[i])))
+			if i+1 < len(rs) && rs[i+1] == '/' {
+				i++ // "**/" is "**"
+			}
+			switch {
+			case i+1 < len(rs):
+				b.WriteString("(.*/)?")
+				kind = re
+			case kind == exact:
+				kind = prefix
+			default:
+				b.WriteString(".*")
+				kind = re
+			}
+			if first {
+				kind = suffix
+			}
+		case ch == '*':
+			b.WriteString("[^/]*")
+			kind = re
+		case ch == '?':
+			b.WriteString("[^/]")
+			kind = re
+		case strings.ContainsRune(`.+()|{}$`, ch):
+			b.WriteString(`\` + string(ch))
+		case ch == '\\':
+			// path.Match has refused a trailing "\".
+			i++
+			b.WriteString(`\` + string(rs[i]))
+			kind = re
+		case ch == '[' || ch == ']':
+			b.WriteRune(ch)
+			kind = re
 		default:
-			b.WriteString(regexp.QuoteMeta(string(c)))
+			b.WriteRune(ch)
 		}
 	}
-	b.WriteString("$")
-	re, err := regexp.Compile(b.String())
+	switch kind {
+	case exact:
+		return func(name string) bool { return name == p }, nil
+	case prefix:
+		lit := p[:len(p)-2]
+		return func(name string) bool { return strings.HasPrefix(name, lit) }, nil
+	case suffix:
+		lit := p[2:]
+		return func(name string) bool {
+			return strings.HasSuffix(name, lit) || (strings.HasPrefix(lit, "/") && name == lit[1:])
+		}, nil
+	}
+	rx, err := regexp.Compile(b.String() + "$")
 	if err != nil {
 		return nil, fmt.Errorf("pattern %q: %w", p, err)
 	}
-	return re, nil
+	return rx.MatchString, nil
 }

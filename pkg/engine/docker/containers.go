@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,6 +23,7 @@ type portBinding struct {
 
 type createBody struct {
 	Image        string              `json:"Image"`
+	Entrypoint   []string            `json:"Entrypoint,omitempty"`
 	Cmd          []string            `json:"Cmd,omitempty"`
 	Env          []string            `json:"Env,omitempty"`
 	User         string              `json:"User,omitempty"`
@@ -59,7 +61,7 @@ type networkingConfig struct {
 
 // ContainerCreate creates (but does not start) a container.
 func (c *Client) ContainerCreate(ctx context.Context, spec engine.ContainerSpec) (string, error) {
-	body := createBody{Image: spec.Image, Cmd: spec.Cmd, Env: spec.Env, User: spec.User, Labels: spec.Labels}
+	body := createBody{Image: spec.Image, Entrypoint: spec.Entrypoint, Cmd: spec.Cmd, Env: spec.Env, User: spec.User, Labels: spec.Labels}
 	hc := &body.HostConfig
 	hc.CapAdd, hc.CapDrop, hc.SecurityOpt, hc.Binds, hc.AutoRemove = spec.CapAdd, spec.CapDrop, spec.SecurityOpt, spec.Binds, spec.AutoRemove
 	for _, d := range spec.Devices {
@@ -312,9 +314,17 @@ func (c *Client) ContainerLogs(ctx context.Context, id string, tail int) (string
 func (c *Client) ContainerWait(ctx context.Context, id string) (int, error) {
 	var out struct {
 		StatusCode int `json:"StatusCode"`
+		Error      *struct {
+			Message string `json:"Message"`
+		} `json:"Error"`
 	}
 	if err := c.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(id)+"/wait", nil, nil, &out); err != nil {
 		return -1, err
+	}
+	// The daemon reports a failure while waiting (e.g. removing the
+	// container) in Error, next to the status code; the SDK engine returns it.
+	if out.Error != nil {
+		return out.StatusCode, errors.New(out.Error.Message)
 	}
 	return out.StatusCode, nil
 }

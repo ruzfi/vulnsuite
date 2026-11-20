@@ -32,7 +32,7 @@ var supportedKeywords = map[string]bool{
 	"items": true, "minItems": true, "uniqueItems": true,
 	"pattern": true, "minLength": true, "maxLength": true, "propertyNames": true,
 	"minimum": true, "maximum": true, "exclusiveMinimum": true,
-	"oneOf": true, "$ref": true, "$defs": true,
+	"oneOf": true, "not": true, "if": true, "then": true, "$ref": true, "$defs": true,
 	// annotations
 	"$schema": true, "$id": true, "title": true, "description": true,
 }
@@ -46,6 +46,10 @@ var decoderOnly = map[string]string{
 	"port-float.yaml": "80.0 is an integer to JSON Schema (draft 2020-12 ignores a zero fraction), " +
 		"but the decoder requires a YAML integer, as `container: 80.0` is almost certainly a mistake",
 	"sidecar-duplicate.yaml": "uniqueItems compares whole objects; sidecar names being unique cannot be expressed",
+	"disclosed-feb-30.yaml": "the pattern bounds month 01-12 and day 01-31, but whether a day exists in its month " +
+		"(Feb 30, Apr 31, Feb 29 outside a leap year) needs a calendar; the decoder parses the date",
+	"sequence-min-hits-over-attempts.yaml": "min_hits must not exceed attempts, a comparison of two sibling values " +
+		"that JSON Schema has no keyword for",
 }
 
 func loadSchema(t *testing.T) map[string]any {
@@ -193,8 +197,19 @@ func TestSchemaChecker(t *testing.T) {
 		{`{"exclusiveMinimum":0}`, 0.5, true},
 		{`{"oneOf":[{"const":1},{"type":"number"}]}`, 1.0, false},
 		{`{"oneOf":[{"const":1},{"type":"string"}]}`, 1.0, true},
+		{`{"not":{"enum":["a"]}}`, "a", false},
+		{`{"not":{"enum":["a"]}}`, "b", true},
+		{`{"if":{"const":1},"then":{"type":"string"}}`, 1.0, false},
+		{`{"if":{"const":1},"then":{"type":"string"}}`, 2.0, true},
 		{`{"$ref":"#/$defs/n"}`, 0.0, false},
 		{`{"$ref":"#/$defs/n"}`, 2.0, true},
+		// a leading negative lookahead, as the template-path patterns use
+		{`{"pattern":"^(?![/\\\\])(?!(.*/)?\\.\\.(/|$))[a-z./]+$"}`, "a/b", true},
+		{`{"pattern":"^(?![/\\\\])(?!(.*/)?\\.\\.(/|$))[a-z./]+$"}`, "a/..b", true},
+		{`{"pattern":"^(?![/\\\\])(?!(.*/)?\\.\\.(/|$))[a-z./]+$"}`, "/a", false},
+		{`{"pattern":"^(?![/\\\\])(?!(.*/)?\\.\\.(/|$))[a-z./]+$"}`, "../a", false},
+		{`{"pattern":"^(?![/\\\\])(?!(.*/)?\\.\\.(/|$))[a-z./]+$"}`, "a/../b", false},
+		{`{"pattern":"^(?![/\\\\])(?!(.*/)?\\.\\.(/|$))[a-z./]+$"}`, "a/..", false},
 	}
 	for _, tc := range cases {
 		var s map[string]any
@@ -331,6 +346,14 @@ func schemaCheck(root, s map[string]any, v any, loc string) []string {
 			fail("matches %d of oneOf's %d schemas, want exactly 1", n, len(one))
 		}
 	}
+	if not, ok := s["not"].(map[string]any); ok && len(schemaCheck(root, not, v, loc)) == 0 {
+		fail("matches a schema it must not match")
+	}
+	if cond, ok := s["if"].(map[string]any); ok && len(schemaCheck(root, cond, v, loc)) == 0 {
+		if then, ok := s["then"].(map[string]any); ok {
+			errs = append(errs, schemaCheck(root, then, v, loc)...)
+		}
+	}
 	switch x := v.(type) {
 	case map[string]any:
 		props, _ := s["properties"].(map[string]any)
@@ -389,7 +412,7 @@ func schemaCheck(root, s map[string]any, v any, loc string) []string {
 		}
 	case string:
 		if p, ok := s["pattern"].(string); ok {
-			if re := schemaRegexp(p); re != nil && !re.MatchString(x) {
+			if match := schemaPattern(p); match != nil && !match(x) {
 				fail("%q does not match %s", x, p)
 			}
 		}
@@ -437,17 +460,99 @@ func resolveRef(root map[string]any, ref string) map[string]any {
 	return m
 }
 
-// schemaRegexp compiles a JSON-Schema (ECMA-262) pattern with Go's regexp,
-// rewriting the \uXXXX escapes ECMA-262 allows into Go's \x{XXXX}. It returns
-// nil for a pattern RE2 cannot express (the template-path patterns use
-// lookaheads); those rules are enforced and tested on the decoder side
-// (TestParseRejectsEscapingPaths, TestConfinedPath), so this checker skips them.
-func schemaRegexp(p string) *regexp.Regexp {
-	re, err := regexp.Compile(ecmaUnicodeEscape.ReplaceAllString(p, `\x{$1}`))
-	if err != nil {
+// TestSchemaPatternsCompile makes sure the checker enforces every pattern in
+// the schema rather than skipping one it cannot compile.
+func TestSchemaPatternsCompile(t *testing.T) {
+	var walk func(node any, loc string, inProps bool)
+	walk = func(node any, loc string, inProps bool) {
+		switch n := node.(type) {
+		case map[string]any:
+			for k, v := range n {
+				if p, ok := v.(string); ok && k == "pattern" && !inProps && schemaPattern(p) == nil {
+					t.Errorf("%s: the checker cannot compile pattern %q", loc, p)
+				}
+				walk(v, loc+"/"+k, !inProps && (k == "properties" || k == "$defs"))
+			}
+		case []any:
+			for i, v := range n {
+				walk(v, fmt.Sprintf("%s/%d", loc, i), false)
+			}
+		}
+	}
+	walk(loadSchema(t), "#", false)
+}
+
+// schemaPattern compiles a JSON-Schema (ECMA-262) pattern with Go's regexp,
+// rewriting the \uXXXX escapes ECMA-262 allows into Go's \x{XXXX}. RE2 has
+// no lookaheads, which the template-path patterns open with: a pattern of the
+// form ^(?!A)(?!B)...REST is matched as "REST matches from the start, and
+// neither A nor B matches a prefix", which is what a negative lookahead at
+// the start of the string means. It returns nil for any other pattern RE2
+// cannot express, which fails TestSchemaPatternsCompile.
+func schemaPattern(p string) func(string) bool {
+	compile := func(p string) *regexp.Regexp {
+		re, err := regexp.Compile(ecmaUnicodeEscape.ReplaceAllString(p, `\x{$1}`))
+		if err != nil {
+			return nil
+		}
+		return re
+	}
+	if re := compile(p); re != nil {
+		return re.MatchString
+	}
+	rest, ok := strings.CutPrefix(p, "^")
+	if !ok {
 		return nil
 	}
-	return re
+	var not []*regexp.Regexp
+	for strings.HasPrefix(rest, "(?!") {
+		end := groupEnd(rest)
+		if end < 0 {
+			return nil
+		}
+		re := compile("^(?:" + rest[len("(?!"):end] + ")")
+		if re == nil {
+			return nil
+		}
+		not = append(not, re)
+		rest = rest[end+1:]
+	}
+	re := compile("^(?:" + rest + ")")
+	if len(not) == 0 || re == nil {
+		return nil
+	}
+	return func(s string) bool {
+		for _, n := range not {
+			if n.MatchString(s) {
+				return false
+			}
+		}
+		return re.MatchString(s)
+	}
+}
+
+// groupEnd returns the index of the ")" closing the group p opens with,
+// skipping escapes and character classes, or -1.
+func groupEnd(p string) int {
+	depth, class := 0, false
+	for i := 0; i < len(p); i++ {
+		switch c := p[i]; {
+		case c == '\\':
+			i++
+		case class:
+			class = c != ']'
+		case c == '[':
+			class = true
+		case c == '(':
+			depth++
+		case c == ')':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 var ecmaUnicodeEscape = regexp.MustCompile(`\\u([0-9A-Fa-f]{4})`)

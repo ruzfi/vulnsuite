@@ -13,18 +13,25 @@
 //     user chose with -registry), never for pulls.
 //
 // Credentials from ~/.docker/config.json and credential helpers are keyed by
-// registry already and are used as before.
+// registry already and are used as before. Their keys are compared the way the
+// docker CLI does (scheme and path ignored, so "https://reg.example.com/v2/"
+// is reg.example.com). A credential helper runs at most once per server per
+// process (its answer is cached) and is killed after helperTimeout, or when the
+// caller's context ends.
 package registryauth
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/distribution/reference"
 )
@@ -38,10 +45,29 @@ type Config struct {
 }
 
 type dockerConfig struct {
-	Auths       map[string]struct{ Auth string } `json:"auths"`
-	CredsStore  string                           `json:"credsStore"`
-	CredHelpers map[string]string                `json:"credHelpers"`
+	Auths       map[string]authEntry `json:"auths"`
+	CredsStore  string               `json:"credsStore"`
+	CredHelpers map[string]string    `json:"credHelpers"`
+
+	// helpers caches credential helper answers for this config, keyed by
+	// helper and server.
+	helpersMu sync.Mutex
+	helpers   map[[2]string]*helperResult
 }
+
+// helperResult is one credential helper answer; done is closed once it is
+// known. A result is shared only when cached is set: an answer cut short by
+// its caller's context is not.
+type helperResult struct {
+	done   chan struct{}
+	cfg    Config
+	ok     bool
+	cached bool
+}
+
+// helperTimeout bounds one credential helper run, so a helper that hangs (a
+// keychain waiting for an unlock prompt, say) cannot block a build forever.
+var helperTimeout = 10 * time.Second
 
 var (
 	cfgOnce sync.Once
@@ -96,6 +122,45 @@ func registryOf(ref string) string {
 	return domain
 }
 
+// normalizeKey maps a docker config key (an auths or credHelpers entry) to the
+// form registryOf returns, like the docker CLI's ConvertToHostname: the scheme
+// and everything after the first "/" are dropped ("https://reg.example.com/v2/"
+// -> "reg.example.com"), and every Docker Hub spelling ("docker.io",
+// "index.docker.io", "https://index.docker.io/v1/", ...) is hubAddress.
+func normalizeKey(key string) string {
+	h := strings.TrimSpace(key)
+	if _, rest, ok := strings.Cut(h, "://"); ok {
+		h = rest
+	}
+	h, _, _ = strings.Cut(h, "/")
+	switch strings.ToLower(h) {
+	case "docker.io", "index.docker.io", "registry-1.docker.io":
+		return hubAddress
+	}
+	return h
+}
+
+// sameRegistry reports whether config key matches reg, a key returned by
+// registryOf.
+func sameRegistry(key, reg string) bool {
+	return strings.EqualFold(normalizeKey(key), reg)
+}
+
+// helperFor returns the credential helper for config key or registry reg: its
+// credHelpers entry (matched like an auths key), else credsStore.
+func (c *dockerConfig) helperFor(key string) string {
+	if h, ok := c.CredHelpers[key]; ok {
+		return h
+	}
+	reg := normalizeKey(key)
+	for _, k := range sortedKeys(c.CredHelpers) {
+		if sameRegistry(k, reg) {
+			return c.CredHelpers[k]
+		}
+	}
+	return c.CredsStore
+}
+
 // scopeRegistry is the credential key (as registryOf returns it) of the
 // registry VULNSUITE_REGISTRY names, or "" when it is unset. It accepts a bare
 // host ("ghcr.io", "localhost:5000", "docker.io"), a repository prefix as
@@ -126,8 +191,11 @@ func envAllowed(reg string, push bool) bool {
 
 // For returns the base64 X-Registry-Auth value for pulling an image ref, or ""
 // when no credentials are known.
-func For(ref string) string {
-	a, ok := Lookup(ref)
+func For(ref string) string { return ForContext(context.Background(), ref) }
+
+// ForContext is For with a context that bounds any credential helper run.
+func ForContext(ctx context.Context, ref string) string {
+	a, ok := lookup(ctx, ref, false)
 	if !ok {
 		return ""
 	}
@@ -135,8 +203,11 @@ func For(ref string) string {
 }
 
 // ForPush is For for pushing ref to the registry the user chose to publish to.
-func ForPush(ref string) string {
-	a, ok := LookupPush(ref)
+func ForPush(ref string) string { return ForPushContext(context.Background(), ref) }
+
+// ForPushContext is ForPush with a context that bounds any credential helper run.
+func ForPushContext(ctx context.Context, ref string) string {
+	a, ok := lookup(ctx, ref, true)
 	if !ok {
 		return ""
 	}
@@ -146,12 +217,12 @@ func ForPush(ref string) string {
 // Lookup resolves the credential for pulling an image ref. The
 // VULNSUITE_REGISTRY_USER/TOKEN pair is used only when VULNSUITE_REGISTRY
 // names ref's registry.
-func Lookup(ref string) (Config, bool) { return lookup(ref, false) }
+func Lookup(ref string) (Config, bool) { return lookup(context.Background(), ref, false) }
 
 // LookupPush resolves the credential for pushing ref.
-func LookupPush(ref string) (Config, bool) { return lookup(ref, true) }
+func LookupPush(ref string) (Config, bool) { return lookup(context.Background(), ref, true) }
 
-func lookup(ref string, push bool) (Config, bool) {
+func lookup(ctx context.Context, ref string, push bool) (Config, bool) {
 	reg := registryOf(ref)
 	if u, t := os.Getenv("VULNSUITE_REGISTRY_USER"), os.Getenv("VULNSUITE_REGISTRY_TOKEN"); u != "" && t != "" && envAllowed(reg, push) {
 		return Config{Username: u, Password: t, ServerAddress: reg}, true
@@ -160,43 +231,130 @@ func lookup(ref string, push bool) (Config, bool) {
 	if conf == nil {
 		return Config{}, false
 	}
-	helper := conf.CredsStore
-	if h, ok := conf.CredHelpers[reg]; ok {
-		helper = h
-	}
-	if helper != "" {
-		if a, ok := fromHelper(helper, reg); ok {
+	if helper := conf.helperFor(reg); helper != "" {
+		if a, ok := conf.fromHelper(ctx, helper, reg); ok {
+			a.ServerAddress = reg
 			return a, true
 		}
 	}
-	for key, entry := range conf.Auths {
-		if key == reg || strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(key, "https://"), "http://"), "/") == reg {
-			if entry.Auth == "" {
-				continue
-			}
-			raw, err := base64.StdEncoding.DecodeString(entry.Auth)
-			if err != nil {
-				continue
-			}
-			u, p, ok := strings.Cut(string(raw), ":")
-			if !ok {
-				continue
-			}
-			return Config{Username: u, Password: p, ServerAddress: reg}, true
+	for _, key := range sortedKeys(conf.Auths) {
+		if !sameRegistry(key, reg) {
+			continue
+		}
+		if a, ok := conf.Auths[key].config(reg); ok {
+			return a, true
 		}
 	}
 	return Config{}, false
 }
 
-func fromHelper(helper, reg string) (Config, bool) {
+// authEntry is one entry of a docker config's auths, in any of the forms the
+// docker CLI writes and reads: a base64 "user:password" auth, separate
+// username and password fields, and an identity (OAuth refresh) token, which
+// e.g. az acr login stores beside a placeholder auth.
+type authEntry struct {
+	Auth          string `json:"auth"`
+	Username      string `json:"username"`
+	Password      string `json:"password"`
+	IdentityToken string `json:"identitytoken"`
+}
+
+// config resolves e the way the docker CLI does: auth, when set, supplies the
+// username and password, otherwise the separate fields do; an identity token
+// is carried alongside. ok is false for an entry that holds no credential or
+// whose auth is not base64 "user:password".
+func (e authEntry) config(server string) (Config, bool) {
+	u, p := e.Username, e.Password
+	if e.Auth != "" {
+		var ok bool
+		if u, p, ok = plainAuth(e.Auth); !ok {
+			return Config{}, false
+		}
+	}
+	if u == "" && p == "" && e.IdentityToken == "" {
+		return Config{}, false
+	}
+	return Config{Username: u, Password: p, IdentityToken: e.IdentityToken, ServerAddress: server}, true
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// plainAuth decodes an auths entry's base64 "user:password".
+func plainAuth(auth string) (user, pass string, ok bool) {
+	if auth == "" {
+		return "", "", false
+	}
+	raw, err := base64.StdEncoding.DecodeString(auth)
+	if err != nil {
+		return "", "", false
+	}
+	return strings.Cut(string(raw), ":")
+}
+
+// fromHelper asks credential helper for server's credential. Each (helper,
+// server) runs once per config: concurrent callers wait for the first run and
+// later ones reuse its answer, unless that run was cut short by its caller's
+// context, in which case the next caller runs the helper again.
+func (c *dockerConfig) fromHelper(ctx context.Context, helper, server string) (Config, bool) {
+	key := [2]string{helper, server}
+	for {
+		c.helpersMu.Lock()
+		r := c.helpers[key]
+		if r == nil {
+			r = &helperResult{done: make(chan struct{})}
+			if c.helpers == nil {
+				c.helpers = map[[2]string]*helperResult{}
+			}
+			c.helpers[key] = r
+			c.helpersMu.Unlock()
+			r.cfg, r.ok = runHelper(ctx, helper, server)
+			r.cached = ctx.Err() == nil
+			if !r.cached {
+				c.helpersMu.Lock()
+				delete(c.helpers, key)
+				c.helpersMu.Unlock()
+			}
+			close(r.done)
+			return r.cfg, r.ok
+		}
+		c.helpersMu.Unlock()
+		select {
+		case <-r.done:
+			if r.cached {
+				return r.cfg, r.ok
+			}
+			if ctx.Err() != nil {
+				return Config{}, false
+			}
+		case <-ctx.Done():
+			return Config{}, false
+		}
+	}
+}
+
+// runHelper runs docker-credential-<helper> get for server, bounded by ctx and
+// helperTimeout.
+func runHelper(ctx context.Context, helper, server string) (Config, bool) {
 	bin := "docker-credential-" + helper
 	if _, err := exec.LookPath(bin); err != nil {
 		return Config{}, false
 	}
-	cmd := exec.Command(bin, "get")
-	cmd.Stdin = strings.NewReader(reg)
+	ctx, cancel := context.WithTimeout(ctx, helperTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "get")
+	cmd.Stdin = strings.NewReader(server)
 	var out bytes.Buffer
 	cmd.Stdout = &out
+	// Do not wait on output pipes held open by the helper's own children
+	// once it has been killed.
+	cmd.WaitDelay = time.Second
 	if err := cmd.Run(); err != nil {
 		return Config{}, false
 	}
@@ -207,9 +365,9 @@ func fromHelper(helper, reg string) (Config, bool) {
 	if json.Unmarshal(out.Bytes(), &r) != nil || r.Secret == "" {
 		return Config{}, false
 	}
-	a := Config{Username: r.Username, Password: r.Secret, ServerAddress: reg}
+	a := Config{Username: r.Username, Password: r.Secret, ServerAddress: server}
 	if r.Username == "<token>" {
-		a = Config{IdentityToken: r.Secret, ServerAddress: reg}
+		a = Config{IdentityToken: r.Secret, ServerAddress: server}
 	}
 	return a, true
 }
@@ -226,50 +384,60 @@ func Empty() string { return Encode(Config{}) }
 // Configs returns every credential the docker config knows about, keyed by
 // registry, for builds that pull from private registries. Each registry named
 // in auths or credHelpers is resolved through its credential helper (the
-// per-registry credHelpers entry, else credsStore) and falls back to the plain
-// base64 auth stored in auths.
-func Configs() map[string]Config {
+// per-registry credHelpers entry, else credsStore) and falls back to the
+// credential stored in auths (auth, username/password, identitytoken). Keys are normalised the way registryOf names a
+// registry (hubAddress for Docker Hub, host[:port] otherwise); when several
+// config keys name one registry, the first that resolves (in sorted order)
+// wins.
+func Configs() map[string]Config { return ConfigsContext(context.Background()) }
+
+// ConfigsContext is Configs with a context that bounds credential helper runs.
+func ConfigsContext(ctx context.Context) map[string]Config {
 	conf := loadConfig()
 	m := map[string]Config{}
 	if conf == nil {
 		return m
 	}
-	keys := map[string]bool{}
-	for key := range conf.Auths {
-		keys[key] = true
-	}
-	for key := range conf.CredHelpers {
-		keys[key] = true
-	}
-	for key := range keys {
-		helper := conf.CredsStore
-		if h, ok := conf.CredHelpers[key]; ok {
-			helper = h
+	seen := map[string]bool{}
+	var keys []string
+	for _, k := range append(sortedKeys(conf.Auths), sortedKeys(conf.CredHelpers)...) {
+		if !seen[k] {
+			seen[k] = true
+			keys = append(keys, k)
 		}
-		if helper != "" {
-			if a, ok := fromHelper(helper, key); ok {
-				m[key] = a
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		reg := normalizeKey(key)
+		if reg == "" {
+			continue
+		}
+		if _, done := m[reg]; done {
+			continue
+		}
+		// Ask the helper for the registry as docker login stores it (and
+		// as lookup asks), so both share one cached answer.
+		if helper := conf.helperFor(key); helper != "" {
+			if a, ok := conf.fromHelper(ctx, helper, reg); ok {
+				a.ServerAddress = reg
+				m[reg] = a
 				continue
 			}
 		}
-		entry, ok := conf.Auths[key]
-		if !ok || entry.Auth == "" {
-			continue
-		}
-		raw, err := base64.StdEncoding.DecodeString(entry.Auth)
-		if err != nil {
-			continue
-		}
-		if u, p, ok := strings.Cut(string(raw), ":"); ok {
-			m[key] = Config{Username: u, Password: p, ServerAddress: key}
+		if a, ok := conf.Auths[key].config(reg); ok {
+			m[reg] = a
 		}
 	}
 	return m
 }
 
 // ConfigsHeader renders Configs as the X-Registry-Config header value ("" when empty).
-func ConfigsHeader() string {
-	m := Configs()
+func ConfigsHeader() string { return ConfigsHeaderContext(context.Background()) }
+
+// ConfigsHeaderContext is ConfigsHeader with a context that bounds credential
+// helper runs.
+func ConfigsHeaderContext(ctx context.Context) string {
+	m := ConfigsContext(ctx)
 	if len(m) == 0 {
 		return ""
 	}

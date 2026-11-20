@@ -42,6 +42,10 @@ const (
 	LabelHash     = "dev.vulnsuite.hash"
 	LabelVulnRefs = "dev.vulnsuite.vuln_refs"
 	LabelKind     = "dev.vulnsuite.build_kind"
+	// LabelSidecar names the sidecar a built sidecar image is for. Such an
+	// image carries no LabelState: every state that runs the sidecar from its
+	// build shares it.
+	LabelSidecar = "dev.vulnsuite.sidecar"
 )
 
 // Resolved is the outcome of resolving a state's image.
@@ -53,6 +57,13 @@ type Resolved struct {
 	Built     bool          `json:"built"`      // a build happened (vs reused/pulled)
 	Pulled    bool          `json:"pulled"`
 	Elapsed   time.Duration `json:"elapsed"`
+	// Sidecar names the sidecar this image is for ("" for the target).
+	Sidecar string `json:"sidecar,omitempty"`
+	// Sidecars are the images of the state's built sidecars (BuildKind
+	// build), resolved together with the target, in declared order. A
+	// sidecar that runs a prebuilt image is not listed: the runner pulls it
+	// when it starts the sidecar.
+	Sidecars []*Resolved `json:"sidecars,omitempty"`
 }
 
 // Options tune a build.
@@ -76,14 +87,66 @@ type Builder struct {
 	Engine engine.Engine
 	// Git is the git binary used for source bases (default "git").
 	Git string
+
+	// pullLocks serialises the exists-or-pull step per image and platform,
+	// so parallel jobs sharing a base (ResolveAll) pull it once instead of
+	// each seeing it missing and pulling it again.
+	pullLocks sync.Map // ref + "\x00" + platform -> *sync.Mutex
+	// buildLocks serialises the build of a built sidecar's tag, which every
+	// state running the sidecar shares, so parallel jobs build it once.
+	buildLocks sync.Map // tag + "\x00" + platform -> *sync.Mutex
+	// forcedTags are the sidecar tags rebuilt under Options.Force, so the
+	// other state reuses the fresh build instead of forcing another one.
+	forcedTags sync.Map // tag + "\x00" + platform -> true
+}
+
+// pullIfMissing pulls ref for platform unless it is already present,
+// reporting whether it pulled. Concurrent calls for the same image wait for
+// each other, and the later ones find it present.
+func (b *Builder) pullIfMissing(ctx context.Context, ref, platform string, out io.Writer) (bool, error) {
+	l, _ := b.pullLocks.LoadOrStore(ref+"\x00"+platform, &sync.Mutex{})
+	mu := l.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+	exists, err := b.Engine.ImageExists(ctx, ref, platform)
+	if err != nil || exists {
+		return false, err
+	}
+	if err := b.Engine.ImagePull(ctx, ref, platform, out); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // New returns a Builder on eng.
 func New(eng engine.Engine) *Builder { return &Builder{Engine: eng, Git: "git"} }
 
 // Resolve makes sure the image for c/state exists locally, building or
-// pulling as needed, and returns what to run.
+// pulling as needed, and returns what to run. The images of the state's
+// built sidecars are built (or reused) with it, in Resolved.Sidecars.
 func (b *Builder) Resolve(ctx context.Context, c *contract.Contract, state string, opts Options) (*Resolved, error) {
+	started := time.Now()
+	res, err := b.resolveTarget(ctx, c, state, opts)
+	if err != nil {
+		return nil, err
+	}
+	st := c.States[state]
+	for _, sc := range c.Service.Sidecars {
+		if !st.BuildsSidecar(sc) {
+			continue
+		}
+		sr, err := b.resolveSidecar(ctx, c, state, sc, opts)
+		if err != nil {
+			return nil, fmt.Errorf("%s/%s: sidecar %s (build): %w", c.ID(), state, sc.Name, err)
+		}
+		res.Sidecars = append(res.Sidecars, sr)
+	}
+	res.Elapsed = time.Since(started)
+	return res, nil
+}
+
+// resolveTarget is Resolve for the target's own image.
+func (b *Builder) resolveTarget(ctx context.Context, c *contract.Contract, state string, opts Options) (*Resolved, error) {
 	started := time.Now()
 	st, err := c.State(state)
 	if err != nil {
@@ -99,18 +162,20 @@ func (b *Builder) Resolve(ctx context.Context, c *contract.Contract, state strin
 			return nil, fmt.Errorf("%s/%s: cannot resolve an image", c.ID(), state)
 		}
 		res.Ref = ref
+		if opts.Pull {
+			pulled, err := b.pullIfMissing(ctx, ref, opts.Platform, opts.Output)
+			if err != nil {
+				return nil, err
+			}
+			res.Pulled = pulled
+			return res, nil
+		}
 		exists, err := b.Engine.ImageExists(ctx, ref, opts.Platform)
 		if err != nil {
 			return nil, err
 		}
 		if !exists {
-			if !opts.Pull {
-				return nil, fmt.Errorf("%s/%s: image %s%s is not present and pulling is disabled", c.ID(), state, ref, forPlatform(opts.Platform))
-			}
-			if err := b.Engine.ImagePull(ctx, ref, opts.Platform, opts.Output); err != nil {
-				return nil, err
-			}
-			res.Pulled = true
+			return nil, fmt.Errorf("%s/%s: image %s%s is not present and pulling is disabled", c.ID(), state, ref, forPlatform(opts.Platform))
 		}
 		return res, nil
 	}
@@ -145,6 +210,77 @@ func (b *Builder) Resolve(ctx context.Context, c *contract.Contract, state strin
 	}
 	res.Built = true
 	return res, nil
+}
+
+// resolveSidecar makes sure the image of a built sidecar exists, building it
+// from its context unless its content-addressed tag is already there for the
+// platform wanted. States that run the sidecar from its build share the tag;
+// concurrent resolutions of it (ResolveAll, both states) build it once.
+func (b *Builder) resolveSidecar(ctx context.Context, c *contract.Contract, state string, sc contract.Sidecar, opts Options) (*Resolved, error) {
+	started := time.Now()
+	tag := c.SidecarTag(sc)
+	res := &Resolved{ID: c.ID(), State: state, Sidecar: sc.Name, Ref: tag, BuildKind: contract.BuildKindBuild}
+	defer func() { res.Elapsed = time.Since(started) }()
+
+	l, _ := b.buildLocks.LoadOrStore(tag+"\x00"+opts.Platform, &sync.Mutex{})
+	mu := l.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+	if !opts.Force || b.forced(tag, opts.Platform) {
+		// As for a state's built tag: reuse it only when it was built for
+		// the platform wanted now.
+		exists, err := b.Engine.ImageExists(ctx, tag, b.reusePlatform(ctx, opts.Platform))
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			return res, nil
+		}
+	}
+	ctxDir, err := c.TemplatePath(sc.Build.Context)
+	if errors.Is(err, contract.ErrPathEscapes) {
+		return nil, fmt.Errorf("build context: %w", err)
+	}
+	if info, serr := os.Stat(ctxDir); err != nil || serr != nil || !info.IsDir() {
+		return nil, fmt.Errorf("build context %s not found", sc.Build.Context)
+	}
+	dockerfile := sc.Build.DockerfilePath()
+	stream := newBuildContext(ctxDir).stream(dockerfile)
+	err = b.Engine.ImageBuild(ctx, engine.BuildOptions{
+		Context:    stream,
+		Tags:       []string{tag},
+		Dockerfile: dockerfile,
+		BuildArgs:  sc.Build.BuildArgs,
+		NoCache:    opts.NoCache,
+		Labels: map[string]string{
+			LabelID:                                c.ID(),
+			LabelSidecar:                           sc.Name,
+			LabelHash:                              c.SidecarHash(sc),
+			LabelKind:                              contract.BuildKindBuild,
+			"org.opencontainers.image.title":       c.ID() + " (sidecar " + sc.Name + ")",
+			"org.opencontainers.image.description": c.Metadata.Summary,
+		},
+		Platform: opts.Platform,
+	}, opts.Output)
+	if cerr := stream.Close(); cerr != nil {
+		return nil, fmt.Errorf("build context: %w", cerr)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if opts.Force {
+		b.forcedTags.Store(tag+"\x00"+opts.Platform, true)
+	}
+	res.Built = true
+	return res, nil
+}
+
+// forced reports whether tag was already rebuilt for platform by this
+// Builder under Force, so the other state that shares a built sidecar reuses
+// that build instead of rebuilding it again.
+func (b *Builder) forced(tag, platform string) bool {
+	_, ok := b.forcedTags.Load(tag + "\x00" + platform)
+	return ok
 }
 
 // reusePlatform is the platform an existing built image must match: the
@@ -212,14 +348,8 @@ func (b *Builder) buildOverlay(ctx context.Context, c *contract.Contract, st *co
 		return errors.New("overlay needs an image base")
 	}
 	if opts.Pull {
-		exists, err := b.Engine.ImageExists(ctx, baseRef, opts.Platform)
-		if err != nil {
+		if _, err := b.pullIfMissing(ctx, baseRef, opts.Platform, opts.Output); err != nil {
 			return err
-		}
-		if !exists {
-			if err := b.Engine.ImagePull(ctx, baseRef, opts.Platform, opts.Output); err != nil {
-				return err
-			}
 		}
 	}
 	mc := newBuildContext("")
@@ -409,20 +539,43 @@ func (b *Builder) applyPatch(ctx context.Context, dir, patch string) error {
 	if err := patchStaysInTree(patch); err != nil {
 		return fmt.Errorf("apply %s: %w", filepath.Base(patch), err)
 	}
-	// No --unsafe-paths: git apply then refuses paths outside the working tree.
-	if out, err := b.git(ctx, dir, 2*time.Minute, "apply", "--directory", dir, "--", patch); err == nil {
+	// git apply resolves the patch's paths against the repository containing
+	// the working directory. cmd.Dir is already dir; capping repository
+	// discovery at dir keeps a copied build context (which is not itself a
+	// repository) from being read as part of an enclosing one, such as a
+	// TMPDIR inside a checkout. Without --unsafe-paths, git apply refuses
+	// absolute paths, ".." and writes beyond a symlink.
+	// core.autocrlf=false: the context is built into a Linux image, so a
+	// Windows host's git must not write the patched lines with CRLF.
+	ceiling := "GIT_CEILING_DIRECTORIES=" + filepath.Dir(dir)
+	out, err := b.gitEnv(ctx, dir, 2*time.Minute, []string{ceiling}, "-c", "core.autocrlf=false", "apply", "--", patch)
+	if err == nil {
 		return nil
-	} else if _, perr := exec.LookPath("patch"); perr != nil {
-		return fmt.Errorf("apply %s: %s", filepath.Base(patch), tail(out))
 	}
-	// Fallback: GNU patch, refusing absolute targets and never creating files
-	// outside dir (the patchStaysInTree check above already bars "..").
-	cmd := exec.CommandContext(ctx, "patch", "-p1", "--no-absolute-filenames", "--forward", "-d", dir, "-i", patch)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("apply %s: %s", filepath.Base(patch), tail(string(out)))
+	gitErr := fmt.Errorf("apply %s: %s", filepath.Base(patch), tail(out))
+	// Fallback for patches git apply will not take (it allows no fuzz): GNU
+	// patch only, because the safety flags below are GNU options. Any other
+	// patch (BSD patch on macOS) fails closed with git's error.
+	if !isGNUPatch(ctx) {
+		return gitErr
+	}
+	cmd := exec.CommandContext(ctx, "patch", "-p1", "--no-absolute-filenames", "--forward", "--batch", "-d", dir, "-i", patch)
+	pout, perr := cmd.CombinedOutput()
+	if perr != nil {
+		return fmt.Errorf("%w; patch fallback: %s", gitErr, tail(string(pout)))
 	}
 	return nil
+}
+
+// isGNUPatch reports whether the patch on PATH is GNU patch.
+func isGNUPatch(ctx context.Context) bool {
+	if _, err := exec.LookPath("patch"); err != nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "patch", "--version").CombinedOutput()
+	return err == nil && strings.Contains(string(out), "GNU patch")
 }
 
 // patchStaysInTree rejects a unified diff whose target paths are absolute or
@@ -457,6 +610,10 @@ func patchStaysInTree(patch string) error {
 }
 
 func (b *Builder) git(ctx context.Context, dir string, timeout time.Duration, args ...string) (string, error) {
+	return b.gitEnv(ctx, dir, timeout, nil, args...)
+}
+
+func (b *Builder) gitEnv(ctx context.Context, dir string, timeout time.Duration, env []string, args ...string) (string, error) {
 	git := b.Git
 	if git == "" {
 		git = "git"
@@ -478,6 +635,7 @@ func (b *Builder) git(ctx context.Context, dir string, timeout time.Duration, ar
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_PROTOCOL_FROM_USER=0",
 	)
+	cmd.Env = append(cmd.Env, env...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -540,6 +698,9 @@ func modeOf(mode string) (int64, error) {
 
 // copyTree copies a build context so a patch can be applied to it. Symlinks
 // are copied as symlinks (never followed: they may point outside the folder).
+// Permission bits are kept (the context's tar headers carry them) rather than
+// left to the umask; only owner rwx is added to directories, so the patch can
+// still be applied and the copy removed.
 func copyTree(src, dst string) error {
 	return filepath.Walk(src, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -548,7 +709,10 @@ func copyTree(src, dst string) error {
 		rel, _ := filepath.Rel(src, p)
 		target := filepath.Join(dst, rel)
 		if info.IsDir() {
-			return os.MkdirAll(target, 0o755)
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+			return os.Chmod(target, info.Mode().Perm()|0o700)
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
 			link, err := os.Readlink(p)
@@ -564,7 +728,10 @@ func copyTree(src, dst string) error {
 		if err != nil {
 			return err
 		}
-		return os.WriteFile(target, data, info.Mode().Perm())
+		if err := os.WriteFile(target, data, info.Mode().Perm()); err != nil {
+			return err
+		}
+		return os.Chmod(target, info.Mode().Perm())
 	})
 }
 
@@ -640,6 +807,30 @@ func (b *Builder) Publish(ctx context.Context, c *contract.Contract, state, regi
 	local := c.ImageRef(state)
 	moving := PublishRef(registry, c.ID(), state)
 	immutable := moving + "-" + c.ContentHash(state)
+	var pushed []string
+	for _, ref := range []string{immutable, moving} {
+		if err := b.Engine.ImageTag(ctx, local, ref); err != nil {
+			return pushed, fmt.Errorf("tag %s: %w", ref, err)
+		}
+		if err := b.Engine.ImagePush(ctx, ref, out); err != nil {
+			return pushed, err
+		}
+		pushed = append(pushed, ref)
+	}
+	return pushed, nil
+}
+
+// PublishSidecar pushes a built sidecar's image like Publish pushes a
+// state's: tagged <registry>/<id>:sidecar-<name>-<hash> (immutable) and
+// <registry>/<id>:sidecar-<name> (moving). A sidecar that runs a prebuilt
+// image has nothing of vulnsuite's to push and is refused.
+func (b *Builder) PublishSidecar(ctx context.Context, c *contract.Contract, sc contract.Sidecar, registry string, out io.Writer) ([]string, error) {
+	if sc.Build == nil {
+		return nil, fmt.Errorf("sidecar %s runs a prebuilt image; only built sidecars are published", sc.Name)
+	}
+	local := c.SidecarTag(sc)
+	moving := PublishRef(registry, c.ID(), contract.SidecarTagPrefix+sc.Name)
+	immutable := moving + "-" + c.SidecarHash(sc)
 	var pushed []string
 	for _, ref := range []string{immutable, moving} {
 		if err := b.Engine.ImageTag(ctx, local, ref); err != nil {

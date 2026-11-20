@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -34,6 +35,20 @@ func gather(store *loader.Store, selectors []string, all, variants bool) ([]*con
 	return cs, errs, nil
 }
 
+// fallbackID names a template that failed to load: its metadata.id when
+// that much can be read, else its folder (or file) name.
+func fallbackID(path string) string {
+	if id := loader.PeekID(path); id != "" {
+		return id
+	}
+	for _, n := range loader.ContractNames {
+		if filepath.Base(path) == n {
+			return filepath.Base(filepath.Dir(path))
+		}
+	}
+	return filepath.Base(path)
+}
+
 // -- list ---------------------------------------------------------------------
 
 type listRow struct {
@@ -60,9 +75,11 @@ type listRow struct {
 	DetectedBy []string       `json:"detected_by,omitempty"`
 	Tags       []string       `json:"tags,omitempty"`
 	HostAccess bool           `json:"host_access,omitempty"`
-	Summary    string         `json:"summary"`
-	Path       string         `json:"path"`
-	Error      string         `json:"error,omitempty"`
+	// Requires is the template's requires block (absent when it has none).
+	Requires *contract.Requires `json:"requires,omitempty"`
+	Summary  string             `json:"summary"`
+	Path     string             `json:"path"`
+	Error    string             `json:"error,omitempty"`
 }
 
 // kevSourceInfo is the KEV data's provenance and age, for list -json.
@@ -106,7 +123,7 @@ func kevAgeNote(src kev.Source, now time.Time) string {
 func cmdList() *Command {
 	var f filters
 	var groupFilter string
-	var variants bool
+	var variants, runnable bool
 	return &Command{
 		Name: "list", Aliases: []string{"ls", "search"},
 		Short: "list and filter templates by class, KEV, product surface, CVE and year",
@@ -136,8 +153,9 @@ from contract metadata (taxonomy v2) and shown as columns:
 
 KEV membership is derived by cross-referencing a target's CVEs against the CISA
 KEV catalog. The catalog is read from the templates checkout's data/cisa-kev.txt
-(kept fresh upstream); -refresh-kev fetches the live CISA feed and caches it at
-` + "`~/.cache/vulnsuite/cisa-kev.json`" + `, and that cache is used instead
+(kept fresh upstream); -refresh-kev fetches the live CISA feed and caches it as
+vulnsuite/cisa-kev.json in the user cache directory (~/.cache on Linux,
+~/Library/Caches on macOS, %LocalAppData% on Windows), and that cache is used instead
 whenever it holds a newer catalog than the checkout. The status line (and
 kev_source in -json) gives the source and its age; data more than 30 days old
 gets a warning. Offline with neither present, KEV is shown as "?" and
@@ -146,6 +164,7 @@ gets a warning. Offline with neither present, KEV is shown as "?" and
 			f.register(fs)
 			fs.StringVar(&groupFilter, "group", "", "only members of this variant group (shows the whole family)")
 			fs.BoolVar(&variants, "variants", false, "expand variant groups to all members (default: collapse each group to its primary)")
+			fs.BoolVar(&runnable, "runnable", false, "only templates whose requires the current daemon meets (asks the daemon; see `vulnsuite host`)")
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
 			if err := f.validate(); err != nil {
@@ -153,6 +172,9 @@ gets a warning. Offline with neither present, KEV is shown as "?" and
 			}
 			store, err := g.Store()
 			if err != nil {
+				return err
+			}
+			if err := checkCategory(store, f.category); err != nil {
 				return err
 			}
 			// Resolve the KEV set always, to populate the column; -kev/-no-kev
@@ -211,14 +233,41 @@ gets a warning. Offline with neither present, KEV is shown as "?" and
 			if err != nil {
 				return err
 			}
+			// -runnable preflights each template's requires against the
+			// daemon, as run does (CPU flags read once, only if needed).
+			var pf *preflighter
+			if runnable {
+				eng, err := g.Engine(ctx)
+				if err != nil {
+					return err
+				}
+				host, err := eng.Info(ctx)
+				if err != nil {
+					return err
+				}
+				pf = &preflighter{ctx: ctx, g: g, eng: eng, host: host}
+			}
+			hidden := 0
 			rows := []listRow{} // -json prints [] (not null) when nothing matches
+			unloadable := 0
 			for _, p := range paths {
 				c, err := store.Load(p)
 				if err != nil {
-					rows = append(rows, listRow{ID: loader.PeekID(p), Path: p, Error: err.Error()})
+					// An unloadable template cannot be filtered, so it is
+					// always shown, and the command fails after printing, as
+					// validate does. Its row keeps the documented shape: an
+					// id (the folder name when even that cannot be read) and
+					// arrays, not null.
+					unloadable++
+					rows = append(rows, listRow{ID: fallbackID(p), Path: p, Error: err.Error(),
+						States: []string{}, VulnRefs: []string{}})
 					continue
 				}
 				if !f.match(store, c, p, kevSet, kevKnown) {
+					continue
+				}
+				if pf != nil && !c.Requires.Empty() && pf.decide(c.Requires).Skip() {
+					hidden++
 					continue
 				}
 				onKEV := kevSet.Any(c.CVEs())
@@ -233,6 +282,10 @@ gets a warning. Offline with neither present, KEV is shown as "?" and
 					HostAccess: runner.HostAccessReason(c) != "",
 					Summary:    c.Metadata.Summary, Path: p,
 				}
+				if !c.Requires.Empty() {
+					req := c.Requires
+					row.Requires = &req
+				}
 				if kevKnown {
 					v := onKEV
 					row.KEV = &v
@@ -240,18 +293,27 @@ gets a warning. Offline with neither present, KEV is shown as "?" and
 				}
 				rows = append(rows, row)
 			}
+			loadErr := func() error {
+				if unloadable == 0 {
+					return nil
+				}
+				return fmt.Errorf("%d template(s) failed to load; see `vulnsuite validate`", unloadable)
+			}
 			if g.JSON {
-				return g.emitJSON(rows)
+				if err := g.emitJSON(rows); err != nil {
+					return err
+				}
+				return loadErr()
 			}
 			if len(rows) == 0 {
 				g.printf("no templates found in %s\n", store.Root)
 				return nil
 			}
 			tw := tabwriter.NewWriter(g.Stdout, 2, 4, 2, ' ', 0)
-			fmt.Fprintln(tw, "ID\tCATEGORY\tGROUP\tSEV\tCLASS\tCVE\tKEV\tFIDELITY\tKIND\tREFS\tDETECTED BY")
+			fmt.Fprintln(tw, "ID\tCATEGORY\tGROUP\tSEV\tCLASS\tCVE\tKEV\tFIDELITY\tKIND\tREQUIRES\tREFS\tDETECTED BY")
 			for _, r := range rows {
 				if r.Error != "" {
-					fmt.Fprintf(tw, "%s\t-\t-\t-\t-\t-\t-\t-\t-\t-\t(unloadable: %s)\n", r.ID, r.Error)
+					fmt.Fprintf(tw, "%s\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t(unloadable: %s)\n", r.ID, r.Error)
 					continue
 				}
 				det := strings.Join(r.DetectedBy, ",")
@@ -267,17 +329,24 @@ gets a warning. Offline with neither present, KEV is shown as "?" and
 				if r.HostAccess {
 					kind += "*"
 				}
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				req := "-"
+				if r.Requires != nil {
+					req = requiresText(*r.Requires)
+				}
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 					r.ID, dash(r.Category), groupCell(r, expanded), r.Severity, dash(strings.Join(r.Class, ",")),
-					yesNo(r.CVE), kevCell(r.KEV), r.Fidelity, kind, strings.Join(r.VulnRefs, ","), det)
+					yesNo(r.CVE), kevCell(r.KEV), r.Fidelity, kind, req, strings.Join(r.VulnRefs, ","), det)
 			}
 			tw.Flush()
 			g.printf("\n%d templates in %s\n", len(rows), store.Root)
+			if runnable {
+				g.printf("-runnable: %d hidden that this daemon cannot run (requires.probe is not evaluated: it needs the image)\n", hidden)
+			}
 			g.printf("KEV source: %s%s\n", kevSrc, kevAgeNote(kevSrc, now))
 			if anyHostAccess(rows) {
 				g.printf("* needs host access (device/elevated capability); run with -allow-host-access, and only for templates you trust.\n")
 			}
-			return nil
+			return loadErr()
 		},
 	}
 }
@@ -376,6 +445,12 @@ func cmdValidate() *Command {
 			fs.StringVar(&nmapDir, "nmap-scripts", "", "nmap NSE scripts dir to cross-check nmap: detected_by refs against (default: $NMAPDIR or the system nmap scripts dir)")
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
+			if err := checkScannerDir("-nuclei-templates", nucleiDir); err != nil {
+				return err
+			}
+			if err := checkScannerDir("-nmap-scripts", nmapDir); err != nil {
+				return err
+			}
 			store, err := g.Store()
 			if err != nil {
 				return err
@@ -395,7 +470,7 @@ func cmdValidate() *Command {
 				CategoryOf:    func(c *contract.Contract) string { return store.Category(c.SourcePath) },
 			}
 			if dir := scanners.ResolveDir(nucleiDir); dir != "" {
-				idx, err := scanners.Load(dir)
+				idx, err := loadNucleiIndex(dir)
 				if err != nil {
 					return err
 				}
@@ -480,6 +555,7 @@ update-templates before; pass -force to replace any other directory.`,
 			fs.StringVar(&ref, "ref", "", "branch, tag or commit (default: pull a checkout's branch, or "+templates.DefaultBranch+")")
 			fs.BoolVar(&force, "force", false, "replace a non-empty directory update-templates did not install")
 		},
+		NoArgs: true,
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
 			dir, err := templates.Resolve(g.TemplatesDir)
 			if err != nil {
@@ -492,7 +568,7 @@ update-templates before; pass -force to replace any other directory.`,
 			if g.Quiet {
 				progress = io.Discard
 			}
-			dir, version, err := templates.Update(ctx, templates.UpdateOptions{Dir: dir, Repo: repo, Ref: ref, Force: force, Output: progress})
+			dir, version, err := templates.Update(ctx, templates.UpdateOptions{Dir: dir, Repo: repo, Ref: ref, Force: force, Output: progress, Warn: g.Stderr})
 			if err != nil {
 				return err
 			}
@@ -510,6 +586,7 @@ update-templates before; pass -force to replace any other directory.`,
 func cmdVersion() *Command {
 	return &Command{
 		Name: "version", Short: "print version information", Usage: "",
+		NoArgs: true,
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
 			dir, _ := templates.Resolve(g.TemplatesDir)
 			if g.JSON {

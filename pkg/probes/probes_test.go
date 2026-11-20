@@ -148,22 +148,10 @@ func TestHTTPProbePortOverrideAndTCPClosed(t *testing.T) {
 	closedPort := l.Addr().(*net.TCPAddr).Port
 	l.Close()
 
-	// a plain TCP listener that just accepts, for the "open" assertion
-	openL, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer openL.Close()
-	go func() {
-		for {
-			c, err := openL.Accept()
-			if err != nil {
-				return
-			}
-			c.Close()
-		}
-	}()
-	openPort := openL.Addr().(*net.TCPAddr).Port
+	// a plain TCP listener that accepts and waits for the client, for the
+	// "open" assertion (one that closes at once looks like a port proxy with
+	// nothing behind it; see TestPortProxyWithoutListener)
+	openPort := silentServer(t)
 
 	tgt := Target{Host: host, Port: closedPort, Scheme: "http"}
 
@@ -346,5 +334,111 @@ func TestNetProbe(t *testing.T) {
 	r = Run(context.Background(), contract.Probe{Net: &contract.NetProbe{Steps: steps2}}, Target{Host: host, Port: port})
 	if !r.OK {
 		t.Fatalf("expect_absent should pass on patched: %s", r.Detail)
+	}
+}
+
+// A regex that does not compile must fail its probe. matchDotAll treats it as
+// "no match", so an *_absent check used to pass, and a patched state verified
+// OK against a target that was still vulnerable.
+func TestInvalidRegexFailsProbe(t *testing.T) {
+	host, port, _ := rawServer(t)
+	tgt := Target{Host: host, Port: port, Container: "c",
+		Exec: func(ctx context.Context, container, command string, timeout time.Duration) (int, string, error) {
+			return 0, "uid=0(root)", nil
+		}}
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			io.WriteString(c, "220 banner\r\n")
+			c.Close()
+		}
+	}()
+	tcpPort := l.Addr().(*net.TCPAddr).Port
+	bad := "root:x:0:0(" // unbalanced paren
+	cases := map[string]contract.Probe{
+		"http body_absent":   {HTTP: &contract.HTTPProbe{Path: "/etc/passwd", BodyAbsent: bad}},
+		"http body_matches":  {HTTP: &contract.HTTPProbe{Path: "/etc/passwd", BodyMatches: bad}},
+		"http header":        {HTTP: &contract.HTTPProbe{Path: "/etc/passwd", HeaderMatches: map[string]string{"X-Served": "("}}},
+		"exec stdout":        {Exec: &contract.ExecProbe{Run: "id", StdoutMatches: "("}},
+		"tcp banner":         {TCP: &contract.TCPProbe{Port: tcpPort, BannerMatches: "("}},
+		"net expect_absent":  {Net: &contract.NetProbe{Port: tcpPort, Steps: []contract.NetStep{{ExpectAbsent: bad}}}},
+		"net expect (later)": {Net: &contract.NetProbe{Port: tcpPort, Steps: []contract.NetStep{{Expect: "220"}, {Expect: "["}}}},
+	}
+	for name, p := range cases {
+		t.Run(name, func(t *testing.T) {
+			tt := tgt
+			if p.TCP != nil || p.Net != nil {
+				tt.Port = tcpPort
+			}
+			r := Run(context.Background(), p, tt)
+			if r.OK {
+				t.Fatalf("probe with an invalid regex passed: %s", r.Detail)
+			}
+			if !strings.Contains(r.Detail, "invalid regex") || r.Transport {
+				t.Fatalf("want a non-transport invalid regex failure, got transport=%v %q", r.Transport, r.Detail)
+			}
+		})
+	}
+	// Valid patterns still pass.
+	if r := Run(context.Background(), contract.Probe{HTTP: &contract.HTTPProbe{Path: "/etc/passwd", BodyMatches: `root:x:0:0`, BodyAbsent: `nobody\(`}}, tgt); !r.OK {
+		t.Fatalf("valid patterns: %s", r.Detail)
+	}
+}
+
+// Without an executor a sequence probe fails with a clear detail and never
+// touches the target; with one, Run hands it the sequence and fills in the
+// kind and elapsed time.
+func TestRunSequence(t *testing.T) {
+	called := false
+	tgt := Target{Container: "c", Exec: func(context.Context, string, string, time.Duration) (int, string, error) {
+		called = true
+		return 0, "", nil
+	}}
+	p := contract.Probe{Sequence: &contract.SequenceProbe{Steps: []contract.SequenceStep{
+		{Exec: &contract.SequenceExec{ExecProbe: contract.ExecProbe{Run: "true", ExpectExit: new(int)}}},
+	}}}
+	r := Run(context.Background(), p, tgt)
+	if r.OK || r.Kind != "sequence" || r.Detail != SequenceUnsupported || r.Transport || called {
+		t.Fatalf("result = %+v, exec called %v", r, called)
+	}
+	ok, rs := RunAll(context.Background(), []contract.Probe{p}, tgt)
+	if ok || FormatResults(rs) != "FAIL "+SequenceUnsupported {
+		t.Fatalf("RunAll = %v %q", ok, FormatResults(rs))
+	}
+
+	var got *contract.SequenceProbe
+	tgt.Sequence = func(_ context.Context, s *contract.SequenceProbe) Result {
+		got = s
+		time.Sleep(time.Millisecond)
+		return Result{OK: true, Detail: "sequence: 1/1 passed, 0 failed: #1 pass: ok",
+			Attempts: []SequenceAttempt{{Attempt: 1, Outcome: OutcomePass, Detail: "ok"}}}
+	}
+	r = Run(context.Background(), p, tgt)
+	if got != p.Sequence || !r.OK || r.Kind != "sequence" || r.Elapsed < time.Millisecond || len(r.Attempts) != 1 {
+		t.Fatalf("result = %+v", r)
+	}
+}
+
+// A sequence step's bad regexp is reported like any other probe's.
+func TestRunSequenceBadRegex(t *testing.T) {
+	bad := "("
+	for _, st := range []contract.SequenceStep{
+		{ExpectLog: &bad},
+		{ExpectSanitizer: &contract.ExpectSanitizer{Kind: "heap-use-after-free", Frame: bad}},
+		{Exec: &contract.SequenceExec{ExecProbe: contract.ExecProbe{Run: "x", StdoutMatches: bad}}},
+		{Net: &contract.NetProbe{Steps: []contract.NetStep{{Expect: bad}}}},
+	} {
+		r := Run(context.Background(), contract.Probe{Sequence: &contract.SequenceProbe{Steps: []contract.SequenceStep{st}}}, Target{})
+		if r.OK || !strings.Contains(r.Detail, "invalid regex in sequence probe steps[0]") {
+			t.Errorf("%s: %+v", st.Kind(), r)
+		}
 	}
 }

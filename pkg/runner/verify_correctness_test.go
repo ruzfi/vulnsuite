@@ -118,7 +118,12 @@ func TestSeedFailureIsRecordedAndFailsVerify(t *testing.T) {
 // reported in the detail and as a problem.
 func TestSeedFailureReportedWhenVerifyCannotRun(t *testing.T) {
 	fe := enginetest.New()
-	fe.ExecFn = func(string, string) (int, string, error) { return 1, "", nil }
+	fe.ExecFn = func(_, cmd string) (int, string, error) { // the seed fails; the in-container healthcheck passes
+		if cmd == "false" {
+			return 1, "", nil
+		}
+		return 0, "", nil
+	}
 	r := New(fe)
 	r.Reach = func(string, int, time.Duration) probes.Reach { return probes.Unreachable }
 	c := load(t, "redis-unauthenticated-access")

@@ -18,6 +18,7 @@ package contract
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -189,13 +190,14 @@ type NetProbe struct {
 // Probe proves a target is genuinely in its declared state. Exactly one of the
 // kinds is set.
 type Probe struct {
-	HTTP *HTTPProbe `yaml:"http,omitempty" json:"http,omitempty"`
-	Exec *ExecProbe `yaml:"exec,omitempty" json:"exec,omitempty"`
-	TCP  *TCPProbe  `yaml:"tcp,omitempty" json:"tcp,omitempty"`
-	Net  *NetProbe  `yaml:"net,omitempty" json:"net,omitempty"`
+	HTTP     *HTTPProbe     `yaml:"http,omitempty" json:"http,omitempty"`
+	Exec     *ExecProbe     `yaml:"exec,omitempty" json:"exec,omitempty"`
+	TCP      *TCPProbe      `yaml:"tcp,omitempty" json:"tcp,omitempty"`
+	Net      *NetProbe      `yaml:"net,omitempty" json:"net,omitempty"`
+	Sequence *SequenceProbe `yaml:"sequence,omitempty" json:"sequence,omitempty"`
 }
 
-// Kind returns "http", "exec", "tcp" or "" when nothing is set.
+// Kind returns "http", "exec", "tcp", "net", "sequence" or "" when nothing is set.
 func (p Probe) Kind() string {
 	switch {
 	case p.HTTP != nil:
@@ -206,8 +208,204 @@ func (p Probe) Kind() string {
 		return "tcp"
 	case p.Net != nil:
 		return "net"
+	case p.Sequence != nil:
+		return "sequence"
 	}
 	return ""
+}
+
+// Sequence limits and defaults.
+const (
+	DefaultSequenceAttempts = 1
+	MaxSequenceAttempts     = 10
+	DefaultSequenceMinHits  = 1
+	DefaultSequenceTimeout  = 60 * time.Second
+	MaxSleepMS              = 10000
+)
+
+// SequenceProbe is an ordered list of steps run as one attempt, repeated up to
+// Attempts times, for targets whose flaw is a race: the core freezes and
+// resumes the target between steps and reads sanitizer reports and logs
+// written during the attempt. Zero values mean the defaults.
+type SequenceProbe struct {
+	Attempts int            `yaml:"attempts,omitempty" json:"attempts,omitempty"` // 1..10, default 1
+	MinHits  int            `yaml:"min_hits,omitempty" json:"min_hits,omitempty"` // 1..attempts, default 1
+	Timeout  float64        `yaml:"timeout,omitempty" json:"timeout,omitempty"`   // seconds per attempt, default 60
+	Steps    []SequenceStep `yaml:"steps" json:"steps"`
+}
+
+// AttemptCount is Attempts, defaulted.
+func (s SequenceProbe) AttemptCount() int {
+	if s.Attempts <= 0 {
+		return DefaultSequenceAttempts
+	}
+	return s.Attempts
+}
+
+// MinHitCount is MinHits, defaulted.
+func (s SequenceProbe) MinHitCount() int {
+	if s.MinHits <= 0 {
+		return DefaultSequenceMinHits
+	}
+	return s.MinHits
+}
+
+// TimeoutDuration is the bound on one attempt, defaulted.
+func (s SequenceProbe) TimeoutDuration() time.Duration {
+	if s.Timeout <= 0 {
+		return DefaultSequenceTimeout
+	}
+	return time.Duration(s.Timeout * float64(time.Second))
+}
+
+// SequenceStep is one step of a sequence. Exactly one of the kinds is set.
+type SequenceStep struct {
+	Exec            *SequenceExec    `yaml:"exec,omitempty" json:"exec,omitempty"`
+	Freeze          *FreezeStep      `yaml:"freeze,omitempty" json:"freeze,omitempty"`
+	Resume          *ResumeStep      `yaml:"resume,omitempty" json:"resume,omitempty"`
+	Sleep           *SleepStep       `yaml:"sleep,omitempty" json:"sleep,omitempty"`
+	ExpectSanitizer *ExpectSanitizer `yaml:"expect_sanitizer,omitempty" json:"expect_sanitizer,omitempty"`
+	ExpectLog       *string          `yaml:"expect_log,omitempty" json:"expect_log,omitempty"` // Go regexp
+	HTTP            *HTTPProbe       `yaml:"http,omitempty" json:"http,omitempty"`
+	TCP             *TCPProbe        `yaml:"tcp,omitempty" json:"tcp,omitempty"`
+	Net             *NetProbe        `yaml:"net,omitempty" json:"net,omitempty"`
+}
+
+// Kind returns the step's kind ("exec", "freeze", "resume", "sleep",
+// "expect_sanitizer", "expect_log", "http", "tcp", "net"), or "" when nothing
+// is set.
+func (s SequenceStep) Kind() string {
+	switch {
+	case s.Exec != nil:
+		return "exec"
+	case s.Freeze != nil:
+		return "freeze"
+	case s.Resume != nil:
+		return "resume"
+	case s.Sleep != nil:
+		return "sleep"
+	case s.ExpectSanitizer != nil:
+		return "expect_sanitizer"
+	case s.ExpectLog != nil:
+		return "expect_log"
+	case s.HTTP != nil:
+		return "http"
+	case s.TCP != nil:
+		return "tcp"
+	case s.Net != nil:
+		return "net"
+	}
+	return ""
+}
+
+// kinds counts the kinds set on the step (exactly one is valid).
+func (s SequenceStep) kinds() int {
+	n := 0
+	for _, set := range []bool{s.Exec != nil, s.Freeze != nil, s.Resume != nil, s.Sleep != nil,
+		s.ExpectSanitizer != nil, s.ExpectLog != nil, s.HTTP != nil, s.TCP != nil, s.Net != nil} {
+		if set {
+			n++
+		}
+	}
+	return n
+}
+
+// IsNetwork reports whether the step reaches the target over the network.
+func (s SequenceStep) IsNetwork() bool { return s.HTTP != nil || s.TCP != nil || s.Net != nil }
+
+// SequenceExec is an exec step: an exec probe, run in the target or, with
+// Container, in the named sidecar.
+type SequenceExec struct {
+	ExecProbe `yaml:",inline"`
+	Container string `yaml:"container,omitempty" json:"container,omitempty"` // a sidecar name; empty = the target
+}
+
+// InTarget reports whether the command runs in the target container.
+func (e SequenceExec) InTarget() bool { return e.Container == "" }
+
+// Asserts reports whether the step states an expectation of its own (an exit
+// code or an stdout match), as opposed to only driving the target.
+func (e SequenceExec) Asserts() bool { return e.ExpectExit != nil || e.StdoutMatches != "" }
+
+// FreezeStep pauses the target container (never a sidecar). No options in v1.
+type FreezeStep struct{}
+
+// ResumeStep unpauses the target container. No options in v1.
+type ResumeStep struct{}
+
+// SleepStep waits a fixed time.
+type SleepStep struct {
+	MS int `yaml:"ms" json:"ms"` // 1..MaxSleepMS
+}
+
+// SanitizerNone is the scalar form of expect_sanitizer: no report expected.
+const SanitizerNone = "none"
+
+// ExpectSanitizer asserts on the sanitizer reports written during an attempt:
+// either none at all (None, written `expect_sanitizer: none`), or one of class
+// Kind whose first stack has a frame matching the Go regexp Frame.
+type ExpectSanitizer struct {
+	None  bool   `yaml:"-" json:"-"`
+	Kind  string `yaml:"kind" json:"kind"`
+	Frame string `yaml:"frame,omitempty" json:"frame,omitempty"`
+}
+
+// Positive reports whether the step expects a report (a hit), not its absence.
+func (e ExpectSanitizer) Positive() bool { return !e.None }
+
+// rawExpectSanitizer is the mapping form of expect_sanitizer.
+type rawExpectSanitizer struct {
+	Kind  string `yaml:"kind"`
+	Frame string `yaml:"frame,omitempty"`
+}
+
+// UnmarshalYAML accepts the scalar none or a {kind, frame} mapping.
+func (e *ExpectSanitizer) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var s string
+	if err := unmarshal(&s); err == nil {
+		if s != SanitizerNone {
+			return fmt.Errorf("expect_sanitizer must be %q or a mapping { kind, frame }, got %q", SanitizerNone, s)
+		}
+		*e = ExpectSanitizer{None: true}
+		return nil
+	}
+	var m map[string]any
+	if err := unmarshal(&m); err != nil {
+		return fmt.Errorf("expect_sanitizer must be %q or a mapping { kind, frame }", SanitizerNone)
+	}
+	var raw rawExpectSanitizer
+	if err := unmarshal(&raw); err != nil {
+		return fmt.Errorf("expect_sanitizer: %w", err) // e.g. an unknown key
+	}
+	*e = ExpectSanitizer{Kind: raw.Kind, Frame: raw.Frame}
+	return nil
+}
+
+// MarshalYAML writes the scalar none or the mapping.
+func (e ExpectSanitizer) MarshalYAML() (interface{}, error) {
+	if e.None {
+		return SanitizerNone, nil
+	}
+	return rawExpectSanitizer{Kind: e.Kind, Frame: e.Frame}, nil
+}
+
+// MarshalJSON writes "none" or {"kind", "frame"}.
+func (e ExpectSanitizer) MarshalJSON() ([]byte, error) {
+	if e.None {
+		return json.Marshal(SanitizerNone)
+	}
+	return json.Marshal(struct {
+		Kind  string `json:"kind"`
+		Frame string `json:"frame,omitempty"`
+	}{e.Kind, e.Frame})
+}
+
+// Sanitizer is service.sanitizer: where the target's sanitizer runtime writes
+// its reports, which a sequence's expect_sanitizer steps read.
+type Sanitizer struct {
+	// LogDir is an absolute, canonical directory in the target. The template
+	// points log_path (e.g. ASAN_OPTIONS=log_path=<LogDir>/asan) into it.
+	LogDir string `yaml:"log_dir" json:"log_dir"`
 }
 
 // OverlayFile is a file from the template folder written into the image.
@@ -308,12 +506,25 @@ type State struct {
 }
 
 // SidecarRef is the image ref to run for sc in this state: a per-state override
-// if present, otherwise the sidecar's own image.
+// if present, otherwise the sidecar's own image. A built sidecar has no image
+// of its own, so without an override this is ""; Contract.SidecarImage also
+// knows the built image's tag.
 func (s State) SidecarRef(sc Sidecar) string {
 	if ov, ok := s.Sidecars[sc.Name]; ok && ov.Image != "" {
 		return pinRef(ov.Image, ov.Digest)
 	}
 	return sc.Ref()
+}
+
+// BuildsSidecar reports whether this state runs sc from the image built from
+// its build context: sc has a build and the state does not swap it for an
+// image.
+func (s State) BuildsSidecar(sc Sidecar) bool {
+	if sc.Build == nil {
+		return false
+	}
+	ov, ok := s.Sidecars[sc.Name]
+	return !ok || ov.Image == ""
 }
 
 // EffectiveImage is the image ref for this state if it is image-based (a
@@ -349,17 +560,42 @@ type TCPHealth struct {
 // Empty reports whether no healthcheck is declared.
 func (h Healthcheck) Empty() bool { return h.HTTP == nil && h.TCP == nil && h.Timeout == "" }
 
-// Sidecar is a helper container started next to the target.
+// Sidecar is a helper container started next to the target. It runs either a
+// prebuilt image (Image, pinned with Digest) or an image built from a context
+// in the template (Build); exactly one of the two is set.
 type Sidecar struct {
-	Name        string            `yaml:"name" json:"name"`
-	Image       string            `yaml:"image" json:"image"`
-	Digest      string            `yaml:"digest,omitempty" json:"digest,omitempty"`
+	Name   string `yaml:"name" json:"name"`
+	Image  string `yaml:"image" json:"image,omitempty"`
+	Digest string `yaml:"digest,omitempty" json:"digest,omitempty"`
+	// Build builds the sidecar's image from a context in the template, like a
+	// kind: build base. The image is tagged by content (SidecarTag), so it is
+	// pinned by construction.
+	Build       *SidecarBuild     `yaml:"build,omitempty" json:"build,omitempty"`
 	Command     []string          `yaml:"command,omitempty" json:"command,omitempty"`
 	Environment map[string]string `yaml:"environment,omitempty" json:"environment,omitempty"`
 }
 
-// Ref is the sidecar's pinned image reference.
+// Ref is the sidecar's pinned image reference ("" for a built sidecar).
 func (s Sidecar) Ref() string { return pinRef(s.Image, s.Digest) }
+
+// SidecarBuild is a sidecar's build: a Dockerfile and its context, inside the
+// template folder, under the same path rules as a kind: build base.
+type SidecarBuild struct {
+	// Context is the build context, relative to the template folder.
+	Context string `yaml:"context" json:"context"`
+	// Dockerfile is the Dockerfile's path inside the context (default
+	// Dockerfile).
+	Dockerfile string            `yaml:"dockerfile,omitempty" json:"dockerfile,omitempty"`
+	BuildArgs  map[string]string `yaml:"build_args,omitempty" json:"build_args,omitempty"`
+}
+
+// DockerfilePath is Dockerfile, defaulted.
+func (b SidecarBuild) DockerfilePath() string {
+	if b.Dockerfile == "" {
+		return "Dockerfile"
+	}
+	return b.Dockerfile
+}
 
 // SidecarOverride lets a state swap a sidecar's image (e.g. the patched state
 // of a multi-node target running the fixed version on every node).
@@ -379,6 +615,10 @@ type Service struct {
 	CapAdd      []string          `yaml:"cap_add,omitempty" json:"cap_add,omitempty"`
 	CapDrop     []string          `yaml:"cap_drop,omitempty" json:"cap_drop,omitempty"`
 	Devices     []string          `yaml:"devices,omitempty" json:"devices,omitempty"`
+	// Sanitizer, when set, names the directory a sanitizer-instrumented
+	// target writes its reports to (for sequence expect_sanitizer steps). It
+	// is read at run time and is not part of any image's content hash.
+	Sanitizer *Sanitizer `yaml:"sanitizer,omitempty" json:"sanitizer,omitempty"`
 }
 
 // PrimaryPort is the port a scanner should be pointed at: the first HTTP port,
@@ -477,14 +717,48 @@ type Requires struct {
 	// KVM marks a target that needs /dev/kvm + nested virtualization (e.g. a
 	// Windows guest via dockur/windows); only a linux/amd64 host provides it.
 	KVM bool `yaml:"kvm,omitempty" json:"kvm,omitempty"`
+	// CPUFlags are CPU feature flags the daemon's machine must have, as Linux
+	// names them in /proc/cpuinfo (e.g. avx512vbmi, bmi2; "Features" on
+	// arm64). They rule out emulation: qemu does not provide them.
+	CPUFlags []string `yaml:"cpu_flags,omitempty" json:"cpu_flags,omitempty"`
+	// Probe is a host check for what no dedicated field covers (a kernel
+	// version, cgroup v2, a sysctl, a device): a shell command run in the
+	// target's image before anything starts. A non-zero exit skips the target
+	// with Reason.
+	Probe *RequiresProbe `yaml:"probe,omitempty" json:"probe,omitempty"`
 }
 
-// EmulationAllowed reports whether qemu emulation is permitted (default true).
-func (r Requires) EmulationAllowed() bool { return r.Emulation == nil || *r.Emulation }
+// DefaultRequiresProbeTimeout bounds a requires.probe without a timeout.
+const DefaultRequiresProbeTimeout = 30 * time.Second
+
+// RequiresProbe is requires.probe.
+type RequiresProbe struct {
+	// Run is a /bin/sh -c command; exit 0 means the host can run the target.
+	Run string `yaml:"run" json:"run"`
+	// Reason is the skip reason shown when Run exits non-zero.
+	Reason string `yaml:"reason" json:"reason"`
+	// Timeout bounds Run (<n>s|m|h, default 30s); running out fails the target.
+	Timeout string `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+}
+
+// TimeoutDuration is Timeout parsed (DefaultRequiresProbeTimeout when unset).
+func (p RequiresProbe) TimeoutDuration() time.Duration {
+	d, err := ParseDuration(p.Timeout, DefaultRequiresProbeTimeout)
+	if err != nil || d <= 0 {
+		return DefaultRequiresProbeTimeout
+	}
+	return d
+}
+
+// EmulationAllowed reports whether qemu emulation is permitted (default true;
+// never with CPUFlags, which emulation cannot provide).
+func (r Requires) EmulationAllowed() bool {
+	return len(r.CPUFlags) == 0 && (r.Emulation == nil || *r.Emulation)
+}
 
 // Empty reports whether no requirements are declared.
 func (r Requires) Empty() bool {
-	return len(r.HostOS) == 0 && len(r.Arch) == 0 && r.Emulation == nil && !r.KVM
+	return len(r.HostOS) == 0 && len(r.Arch) == 0 && r.Emulation == nil && !r.KVM && len(r.CPUFlags) == 0 && r.Probe == nil
 }
 
 // Contract is a fully loaded target template.
@@ -692,7 +966,7 @@ func (c *Contract) ContentHash(stateName string) string {
 		parts = append(parts, "state-image:"+st.EffectiveImage(c.Base))
 	}
 	if c.Base.Kind == BaseBuild && c.Base.Context != "" {
-		parts = append(parts, "context:"+hashTree(c.hashPath(c.Base.Context)))
+		parts = append(parts, "context/v2:"+hashTree(c.hashPath(c.Base.Context)))
 	}
 	if st.Patch != "" {
 		parts = append(parts, fmt.Sprintf("patch:%s:%s", st.Patch, hashFile(c.hashPath(st.Patch))))
@@ -719,6 +993,53 @@ func (c *Contract) ContentHash(stateName string) string {
 // ImageTag is the local tag a built image of this state gets.
 func (c *Contract) ImageTag(stateName string) string {
 	return fmt.Sprintf("%s/%s:%s-%s", ImageRepoPrefix, c.ID(), stateName, c.ContentHash(stateName))
+}
+
+// SidecarTagPrefix starts the tag of every built sidecar image.
+const SidecarTagPrefix = "sidecar-"
+
+// SidecarHash is the content-addressed hash of a built sidecar's image: its
+// Dockerfile path, its context (hashed as a base build context is) and its
+// build args. Its command and environment are applied when it runs and are
+// not part of it. "" for an image sidecar.
+func (c *Contract) SidecarHash(sc Sidecar) string {
+	if sc.Build == nil {
+		return ""
+	}
+	parts := []string{
+		"sidecar-build:" + sc.Build.DockerfilePath(),
+		"context/v2:" + hashTree(c.hashPath(sc.Build.Context)),
+	}
+	if len(sc.Build.BuildArgs) > 0 {
+		b, _ := json.Marshal(sortedMap(sc.Build.BuildArgs))
+		parts = append(parts, "args:"+string(b))
+	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "|")))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
+// SidecarTag is the local tag of a built sidecar's image,
+// vulnsuite/<id>:sidecar-<name>-<hash>. It is the same for every state that
+// runs the sidecar from its build. "" for an image sidecar.
+func (c *Contract) SidecarTag(sc Sidecar) string {
+	if sc.Build == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s/%s:%s%s-%s", ImageRepoPrefix, c.ID(), SidecarTagPrefix, sc.Name, c.SidecarHash(sc))
+}
+
+// SidecarImage is the image the named state runs sc from: the state's image
+// override when it has one, else the built tag of a built sidecar, else the
+// sidecar's own pinned image.
+func (c *Contract) SidecarImage(stateName string, sc Sidecar) string {
+	st := c.States[stateName]
+	if st == nil {
+		st = &State{}
+	}
+	if st.BuildsSidecar(sc) {
+		return c.SidecarTag(sc)
+	}
+	return st.SidecarRef(sc)
 }
 
 // ImageRef is the image a state runs: the built tag when a build happens,
@@ -789,7 +1110,18 @@ func hashFile(path string) string {
 	return hex.EncodeToString(sum[:])[:16]
 }
 
-// hashTree hashes a directory tree's relative paths and contents.
+// hashTree hashes a build context the way it travels to the daemon: every
+// directory, regular file (with whether it is executable) and symlink (by its
+// link text: it is never followed, and may point outside the folder), as an
+// unambiguous sequence of records. .git is skipped, as the build context
+// leaves it out. Only the executable bit is hashed, the one mode bit git
+// records: the rest follow the umask of whoever checked the template out, and
+// must not give one template different tags on different machines.
+//
+// Format v2. v1 hashed paths and contents only, run together with no
+// separator, so a chmod did not change the tag (a stale image was reused)
+// and {a: "bc"} hashed like {ab: "c"}. The version is part of the
+// ContentHash part, so a future format change is explicit.
 func hashTree(root string) string {
 	if root == "" {
 		return "missing"
@@ -798,27 +1130,67 @@ func hashTree(root string) string {
 	if err != nil || !info.IsDir() {
 		return "missing"
 	}
-	var files []string
+	type entry struct {
+		rel  string
+		path string
+		info fs.FileInfo
+	}
+	var entries []entry
 	filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err == nil && (d.Type().IsRegular() || d.Type()&fs.ModeSymlink != 0) {
-			files = append(files, p)
+		if err != nil || p == root {
+			return nil
 		}
+		if d.IsDir() && d.Name() == ".git" {
+			return filepath.SkipDir
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		t := info.Mode().Type()
+		if t != 0 && t != fs.ModeDir && t != fs.ModeSymlink {
+			return nil // devices, sockets, pipes are not carried
+		}
+		rel, _ := filepath.Rel(root, p)
+		entries = append(entries, entry{filepath.ToSlash(rel), p, info})
 		return nil
 	})
-	sort.Strings(files)
+	sort.Slice(entries, func(i, j int) bool { return entries[i].rel < entries[j].rel })
 	h := sha256.New()
-	for _, p := range files {
-		rel, _ := filepath.Rel(root, p)
-		h.Write([]byte(filepath.ToSlash(rel)))
-		// A symlink travels in the build context as a link (never followed:
-		// it may point outside the folder), so its target text is what counts.
-		if target, err := os.Readlink(p); err == nil {
-			h.Write([]byte("\x00symlink\x00" + filepath.ToSlash(target)))
-			continue
-		}
-		b, err := os.ReadFile(p)
-		if err == nil {
-			h.Write(b)
+	// field writes a length-prefixed field, so no two record sequences can
+	// produce the same byte stream.
+	field := func(b []byte) {
+		var n [8]byte
+		binary.BigEndian.PutUint64(n[:], uint64(len(b)))
+		h.Write(n[:])
+		h.Write(b)
+	}
+	for _, e := range entries {
+		mode := e.info.Mode()
+		switch {
+		case mode.IsDir():
+			field([]byte("dir"))
+			field([]byte(e.rel))
+		case mode&fs.ModeSymlink != 0:
+			target, err := os.Readlink(e.path)
+			if err != nil {
+				continue
+			}
+			field([]byte("symlink"))
+			field([]byte(e.rel))
+			field([]byte(filepath.ToSlash(target)))
+		default:
+			b, err := os.ReadFile(e.path)
+			if err != nil {
+				continue
+			}
+			kind := "file"
+			if mode.Perm()&0o111 != 0 {
+				kind = "exec"
+			}
+			field([]byte(kind))
+			field([]byte(e.rel))
+			field(b)
 		}
 	}
 	return hex.EncodeToString(h.Sum(nil))[:16]

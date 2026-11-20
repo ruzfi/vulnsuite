@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/url"
 
@@ -20,15 +21,43 @@ func (c *Client) NetworkExists(ctx context.Context, name string) (bool, error) {
 	return false, err
 }
 
-// NetworkEnsure creates the network when missing and returns its id.
-func (c *Client) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (string, error) {
-	var existing struct {
-		ID string `json:"Id"`
+// networkJSON is the part of a network inspect vulnsuite reads.
+type networkJSON struct {
+	ID       string            `json:"Id"`
+	Driver   string            `json:"Driver"`
+	Internal bool              `json:"Internal"`
+	Options  map[string]string `json:"Options"`
+	IPAM     struct {
+		Config []struct {
+			Subnet  string `json:"Subnet"`
+			Gateway string `json:"Gateway"`
+		} `json:"Config"`
+	} `json:"IPAM"`
+}
+
+func (n networkJSON) network() engine.Network {
+	out := engine.Network{ID: n.ID, Driver: n.Driver, Internal: n.Internal, Options: n.Options}
+	if len(n.IPAM.Config) > 0 {
+		out.Subnet, out.Gateway = n.IPAM.Config[0].Subnet, n.IPAM.Config[0].Gateway
 	}
-	if err := c.doJSON(ctx, http.MethodGet, "/networks/"+url.PathEscape(spec.Name), nil, nil, &existing); err == nil {
-		return existing.ID, nil
+	return out
+}
+
+func (c *Client) networkInspect(ctx context.Context, name string) (engine.Network, error) {
+	var n networkJSON
+	if err := c.doJSON(ctx, http.MethodGet, "/networks/"+url.PathEscape(name), nil, nil, &n); err != nil {
+		return engine.Network{}, err
+	}
+	return n.network(), nil
+}
+
+// NetworkEnsure creates the network when missing and returns it as the
+// daemon reports it; an existing network is returned with its own settings.
+func (c *Client) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (engine.Network, error) {
+	if n, err := c.networkInspect(ctx, spec.Name); err == nil {
+		return n, nil
 	} else if !IsNotFound(err) {
-		return "", err
+		return engine.Network{}, err
 	}
 	driver := spec.Driver
 	if driver == "" {
@@ -51,20 +80,23 @@ func (c *Client) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (st
 		}
 		body["IPAM"] = map[string]any{"Driver": "default", "Config": []map[string]string{cfg}}
 	}
-	var out struct {
-		ID string `json:"Id"`
-	}
-	if err := c.doJSON(ctx, http.MethodPost, "/networks/create", nil, body, &out); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, "/networks/create", nil, body, nil); err != nil {
 		// A concurrent run created it between our inspect and create: use
-		// that one.
+		// that one (the caller checks its settings).
 		if IsConflict(err) {
-			if ierr := c.doJSON(ctx, http.MethodGet, "/networks/"+url.PathEscape(spec.Name), nil, nil, &existing); ierr == nil {
-				return existing.ID, nil
+			if n, ierr := c.networkInspect(ctx, spec.Name); ierr == nil {
+				return n, nil
 			}
 		}
-		return "", err
+		return engine.Network{}, err
 	}
-	return out.ID, nil
+	// Read back what the daemon made, so the caller sees the same fields for
+	// a new network as for an existing one.
+	n, err := c.networkInspect(ctx, spec.Name)
+	if err != nil {
+		return engine.Network{}, fmt.Errorf("inspect new network %s: %w", spec.Name, err)
+	}
+	return n, nil
 }
 
 // NetworkRemove deletes a network; missing is not an error.

@@ -150,6 +150,17 @@ func TestRequiresRules(t *testing.T) {
 	if _, bad := rules(v.Check(parse(t, doc2)))["kvm-without-requires"]; bad {
 		t.Fatal("requires.kvm set should silence it")
 	}
+	// #119: cpu_flags rule emulation out, so emulation: true contradicts them.
+	flags := strings.Replace(base, "states:", "requires: { arch: [amd64], cpu_flags: [avx512vbmi], emulation: true }\nstates:", 1)
+	if rules(v.Check(parse(t, flags)))["cpu-flags-with-emulation"] != Warning {
+		t.Fatal("cpu-flags-with-emulation expected")
+	}
+	for _, req := range []string{"{ arch: [amd64], cpu_flags: [avx512vbmi] }", "{ arch: [amd64], cpu_flags: [avx512vbmi], emulation: false }", "{ emulation: true }"} {
+		doc := strings.Replace(base, "states:", "requires: "+req+"\nstates:", 1)
+		if _, bad := rules(v.Check(parse(t, doc)))["cpu-flags-with-emulation"]; bad {
+			t.Fatalf("cpu-flags-with-emulation on %s", req)
+		}
+	}
 }
 
 func TestFidelityRules(t *testing.T) {
@@ -253,9 +264,9 @@ func TestGroupChecks(t *testing.T) {
 
 	// Healthy group: one primary, unique variants, shared refs.
 	ok := []*contract.Contract{
-		groupMember(t, "php2shell-base", "php2shell", "", true, "CVE-2026-1"),
-		groupMember(t, "php2shell-waf", "php2shell", "waf-evasion", false, "CVE-2026-1"),
-		groupMember(t, "php2shell-chunked", "php2shell", "chunked", false, "CVE-2026-1"),
+		groupMember(t, "php2shell-base", "php2shell", "", true, "CVE-2026-0001"),
+		groupMember(t, "php2shell-waf", "php2shell", "waf-evasion", false, "CVE-2026-0001"),
+		groupMember(t, "php2shell-chunked", "php2shell", "chunked", false, "CVE-2026-0001"),
 	}
 	for rule := range rules(v.CheckAll(ok)) {
 		if strings.HasPrefix(rule, "group-") {
@@ -264,7 +275,7 @@ func TestGroupChecks(t *testing.T) {
 	}
 
 	// Single-member group (nickname): no primary needed, no variant needed.
-	nick := []*contract.Contract{groupMember(t, "redis-rce", "redis-nick", "", false, "CVE-2026-2")}
+	nick := []*contract.Contract{groupMember(t, "redis-rce", "redis-nick", "", false, "CVE-2026-0002")}
 	for rule := range rules(v.CheckAll(nick)) {
 		if strings.HasPrefix(rule, "group-") {
 			t.Fatalf("nickname fired %s", rule)
@@ -273,8 +284,8 @@ func TestGroupChecks(t *testing.T) {
 
 	// Zero primaries.
 	none := []*contract.Contract{
-		groupMember(t, "g-a", "g", "a", false, "CVE-2026-3"),
-		groupMember(t, "g-b", "g", "b", false, "CVE-2026-3"),
+		groupMember(t, "g-a", "g", "a", false, "CVE-2026-0003"),
+		groupMember(t, "g-b", "g", "b", false, "CVE-2026-0003"),
 	}
 	if rules(v.CheckAll(none))["group-no-primary"] != Error {
 		t.Fatal("zero primaries must be an error")
@@ -282,8 +293,8 @@ func TestGroupChecks(t *testing.T) {
 
 	// Multiple primaries.
 	two := []*contract.Contract{
-		groupMember(t, "g-a", "g", "a", true, "CVE-2026-3"),
-		groupMember(t, "g-b", "g", "b", true, "CVE-2026-3"),
+		groupMember(t, "g-a", "g", "a", true, "CVE-2026-0003"),
+		groupMember(t, "g-b", "g", "b", true, "CVE-2026-0003"),
 	}
 	if rules(v.CheckAll(two))["group-multiple-primaries"] != Error {
 		t.Fatal("two primaries must be an error")
@@ -291,8 +302,8 @@ func TestGroupChecks(t *testing.T) {
 
 	// Duplicate variant.
 	dup := []*contract.Contract{
-		groupMember(t, "g-a", "g", "same", true, "CVE-2026-3"),
-		groupMember(t, "g-b", "g", "same", false, "CVE-2026-3"),
+		groupMember(t, "g-a", "g", "same", true, "CVE-2026-0003"),
+		groupMember(t, "g-b", "g", "same", false, "CVE-2026-0003"),
 	}
 	if rules(v.CheckAll(dup))["group-duplicate-variant"] != Error {
 		t.Fatal("duplicate variant must be an error")
@@ -300,8 +311,8 @@ func TestGroupChecks(t *testing.T) {
 
 	// Non-primary member without a variant.
 	missing := []*contract.Contract{
-		groupMember(t, "g-a", "g", "", true, "CVE-2026-3"),
-		groupMember(t, "g-b", "g", "", false, "CVE-2026-3"),
+		groupMember(t, "g-a", "g", "", true, "CVE-2026-0003"),
+		groupMember(t, "g-b", "g", "", false, "CVE-2026-0003"),
 	}
 	if rules(v.CheckAll(missing))["group-variant-missing"] != Error {
 		t.Fatal("missing variant on a non-primary member must be an error")
@@ -309,8 +320,8 @@ func TestGroupChecks(t *testing.T) {
 
 	// Divergent vuln_refs: a soft warning.
 	diverge := []*contract.Contract{
-		groupMember(t, "g-a", "g", "a", true, "CVE-2026-3"),
-		groupMember(t, "g-b", "g", "b", false, "CVE-2026-9"),
+		groupMember(t, "g-a", "g", "a", true, "CVE-2026-0003"),
+		groupMember(t, "g-b", "g", "b", false, "CVE-2026-0009"),
 	}
 	if rules(v.CheckAll(diverge))["group-divergent-refs"] != Warning {
 		t.Fatal("divergent refs must warn")
@@ -318,11 +329,11 @@ func TestGroupChecks(t *testing.T) {
 
 	// group handle equal to a template id.
 	collide := []*contract.Contract{
-		groupMember(t, "php2shell", "other", "", true, "CVE-2026-3"),
-		groupMember(t, "other-a", "other", "a", false, "CVE-2026-3"),
+		groupMember(t, "php2shell", "other", "", true, "CVE-2026-0003"),
+		groupMember(t, "other-a", "other", "a", false, "CVE-2026-0003"),
 	}
 	// add a contract whose id equals the handle "other"
-	collide = append(collide, groupMember(t, "other", "solo", "", false, "CVE-2026-3"))
+	collide = append(collide, groupMember(t, "other", "solo", "", false, "CVE-2026-0003"))
 	if rules(v.CheckAll(collide))["group-id-collision"] != Error {
 		t.Fatal("group handle equal to an id must be an error")
 	}
@@ -332,8 +343,8 @@ func TestGroupMultiCategory(t *testing.T) {
 	cat := map[string]string{"web-g-a": "web-apps", "db-g-b": "databases"}
 	v := &Validator{CategoryOf: func(c *contract.Contract) string { return cat[c.ID()] }}
 	members := []*contract.Contract{
-		groupMember(t, "web-g-a", "g", "a", true, "CVE-2026-3"),
-		groupMember(t, "db-g-b", "g", "b", false, "CVE-2026-3"),
+		groupMember(t, "web-g-a", "g", "a", true, "CVE-2026-0003"),
+		groupMember(t, "db-g-b", "g", "b", false, "CVE-2026-0003"),
 	}
 	if rules(v.CheckAll(members))["group-multi-category"] != Warning {
 		t.Fatal("a group spanning two categories must warn")
@@ -417,5 +428,60 @@ func TestShadowedContract(t *testing.T) {
 	}
 	if _, ok := rules((&Validator{}).Check(c))["shadowed-contract"]; ok {
 		t.Fatal("a lone contract must not be reported as shadowed")
+	}
+}
+
+// Issue #93 item 2: on a source base, one state with a patch is enough; the
+// warning is for states that cannot differ at all.
+func TestSourceNoDiff(t *testing.T) {
+	head := pinHead + "base: { kind: source, repo: https://example.invalid/x.git, commit: 0123456789abcdef0123456789abcdef01234567 }\nstates:\n"
+	cases := []struct {
+		name, states string
+		warn         bool
+	}{
+		{"patched has the patch", "  vulnerable: {}\n  patched: { patch: patches/fix.patch }\n", false},
+		{"vulnerable has the patch", "  vulnerable: { patch: patches/vuln.patch }\n  patched: {}\n", false},
+		{"patched has an overlay", "  vulnerable: {}\n  patched: { overlay: [ { src: files/x, dest: conf/x } ] }\n", false},
+		{"no difference", "  vulnerable: {}\n  patched: {}\n", true},
+		{"no patched state", "  vulnerable: {}\n", false},
+	}
+	for _, tc := range cases {
+		got := findingsFor((&Validator{}).Check(parse(t, head+tc.states)), "source-no-diff")
+		if (len(got) > 0) != tc.warn {
+			t.Errorf("%s: source-no-diff = %v, want warning %v", tc.name, got, tc.warn)
+		}
+	}
+}
+
+// Issue #93 item 6: a build context needs no Dockerfile of its own when every
+// state overlays one into the context; the builder reads generated files first.
+func TestMissingDockerfileOverlaid(t *testing.T) {
+	doc := func(vuln, patched string) string {
+		return pinHead + "base: { kind: build, context: src }\nstates:\n" +
+			"  vulnerable: { overlay: [ " + vuln + " ] }\n  patched: { overlay: [ " + patched + " ] }\n"
+	}
+	own := "{ src: files/Dockerfile, dest: Dockerfile }"
+	other := "{ src: files/x, dest: etc/x }"
+	cases := []struct {
+		name, doc string
+		lacking   string // "" = no finding
+	}{
+		{"every state overlays it", doc(own, "{ src: files/Dockerfile, dest: ./Dockerfile }"), ""},
+		{"one state does not", doc(own, other), "patched"},
+		{"none does", doc(other, other), "build context has no Dockerfile"},
+	}
+	for _, tc := range cases {
+		c := parse(t, tc.doc)
+		os.MkdirAll(filepath.Join(c.Folder, "src"), 0o755)
+		os.MkdirAll(filepath.Join(c.Folder, "files"), 0o755)
+		os.WriteFile(filepath.Join(c.Folder, "files", "Dockerfile"), []byte("FROM scratch\n"), 0o644)
+		os.WriteFile(filepath.Join(c.Folder, "files", "x"), []byte("x"), 0o644)
+		got := findingsFor((&Validator{}).Check(c), "missing-dockerfile")
+		switch {
+		case tc.lacking == "" && len(got) > 0:
+			t.Errorf("%s: unexpected %v", tc.name, got)
+		case tc.lacking != "" && (len(got) != 1 || !strings.Contains(got[0].Message, tc.lacking)):
+			t.Errorf("%s: want one missing-dockerfile naming %q, got %v", tc.name, tc.lacking, got)
+		}
 	}
 }

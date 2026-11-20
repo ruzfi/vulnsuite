@@ -3,14 +3,19 @@ package enginetest
 
 import (
 	"archive/tar"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
+	"path"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/distribution/reference"
 
 	"github.com/ruzfi/vulnsuite/pkg/engine"
 )
@@ -42,6 +47,25 @@ type Container struct {
 	IP       string
 	// Networks are further networks attached with NetworkConnect.
 	Networks []engine.NetworkAttachment
+	// Paused is set between ContainerPause and ContainerUnpause.
+	Paused bool
+	// Files is the container's filesystem as ContainerStatPath and
+	// ContainerReadDir see it, absolute path -> file (see WriteFile).
+	Files map[string]File
+	// started is set by the first ContainerStart: a container that never ran
+	// lists as "created", one that ran and stopped as "exited".
+	started bool
+}
+
+// File is one entry of a fake container's filesystem.
+type File struct {
+	// Mode holds the type and permission bits (fs.ModeDir|fs.ModeSticky|0o777
+	// for a world-writable sticky directory, 0o644 for a regular file).
+	Mode fs.FileMode
+	// Data is a regular file's content, or a symlink's target.
+	Data string
+	// ModTime is when WriteFile last wrote it.
+	ModTime time.Time
 }
 
 // Fake is an in-memory engine.
@@ -58,6 +82,11 @@ type Fake struct {
 	Containers     map[string]*Container
 	Networks       map[string]engine.NetworkSpec
 	Execs          []string
+	// Calls logs, in order, every successful ContainerPause ("pause <c>"),
+	// ContainerExec ("exec <c>: <command>") and ContainerUnpause
+	// ("unpause <c>"), with <c> the container as the caller named it, so a
+	// test can assert what ran while a container was frozen.
+	Calls []string
 	// ExecFn answers ContainerExec when set.
 	ExecFn func(container, command string) (int, string, error)
 	// LogsFn answers ContainerLogs when set (receives the container spec).
@@ -101,14 +130,84 @@ func New() *Fake {
 		HostInfo: engine.HostInfo{OS: "linux", Arch: "amd64"}}
 }
 
-func (f *Fake) Ping(context.Context) (string, error) { return "fake", nil }
+// Ping reports the fake's version. Like the real engines, it and every other
+// call fail once their context is done, so a cancelled run never reads as
+// "image missing" or "network absent".
+func (f *Fake) Ping(ctx context.Context) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return "fake", nil
+}
 
-func (f *Fake) Info(context.Context) (engine.HostInfo, error) { return f.HostInfo, nil }
+func (f *Fake) Info(ctx context.Context) (engine.HostInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return engine.HostInfo{}, err
+	}
+	return f.HostInfo, nil
+}
 
-func (f *Fake) ImageExists(_ context.Context, ref, platform string) (bool, error) {
+func (f *Fake) ImageExists(ctx context.Context, ref, platform string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.Images[ref] && f.platformOK(ref, platform), nil
+	key, ok := f.image(ref)
+	return ok && f.platformOK(key, platform), nil
+}
+
+// normalizeRef is the name a daemon resolves an image reference to, so that
+// "busybox", "busybox:latest" and "docker.io/library/busybox:latest" are one
+// image. A reference that does not parse is returned unchanged.
+func normalizeRef(ref string) string {
+	named, err := reference.ParseNormalizedNamed(ref)
+	if err != nil {
+		return ref
+	}
+	return reference.TagNameOnly(named).String()
+}
+
+// image returns the Images key that ref names, matched like a daemon does
+// (see normalizeRef): ref itself when recorded, else the first (sorted)
+// recorded reference that names the same image. Called with f.mu held.
+func (f *Fake) image(ref string) (string, bool) {
+	if f.Images[ref] {
+		return ref, true
+	}
+	want := normalizeRef(ref)
+	keys := make([]string, 0, len(f.Images))
+	for k, ok := range f.Images {
+		if ok {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if normalizeRef(k) == want {
+			return k, true
+		}
+	}
+	return "", false
+}
+
+// dockerfileIn reports whether the build context files hold the Dockerfile a
+// build asks for (name, "Dockerfile" when empty). Like the legacy builder,
+// the default name also matches a lower-case "dockerfile".
+func dockerfileIn(files map[string]string, name string) bool {
+	clean := func(p string) string { return strings.TrimPrefix(path.Clean("/"+p), "/") }
+	want := []string{clean(name)}
+	if name == "" {
+		want = []string{"Dockerfile", "dockerfile"}
+	}
+	for f := range files {
+		for _, w := range want {
+			if clean(f) == w {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // platformOK reports whether the image ref satisfies platform.
@@ -132,7 +231,10 @@ func (f *Fake) setPlatform(ref, platform string) {
 	}
 }
 
-func (f *Fake) ImagePull(_ context.Context, ref, platform string, out io.Writer) error {
+func (f *Fake) ImagePull(ctx context.Context, ref, platform string, out io.Writer) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if f.PullFn != nil {
 		if err := f.PullFn(ref); err != nil {
 			return err
@@ -152,7 +254,10 @@ func (f *Fake) ImagePull(_ context.Context, ref, platform string, out io.Writer)
 	return nil
 }
 
-func (f *Fake) ImageBuild(_ context.Context, opts engine.BuildOptions, out io.Writer) error {
+func (f *Fake) ImageBuild(ctx context.Context, opts engine.BuildOptions, out io.Writer) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	files := map[string]string{}
 	modes := map[string]int64{}
 	links := map[string]string{}
@@ -172,6 +277,14 @@ func (f *Fake) ImageBuild(_ context.Context, opts engine.BuildOptions, out io.Wr
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.Builds = append(f.Builds, Build{Tags: opts.Tags, Dockerfile: opts.Dockerfile, BuildArgs: opts.BuildArgs, Labels: opts.Labels, NoCache: opts.NoCache, Platform: opts.Platform, Files: files, Modes: modes, Links: links})
+	if !dockerfileIn(files, opts.Dockerfile) {
+		// The daemon's error when the context lacks the Dockerfile.
+		name := opts.Dockerfile
+		if name == "" {
+			name = "Dockerfile"
+		}
+		return fmt.Errorf("Cannot locate specified Dockerfile: %s", name)
+	}
 	if f.FailBuild != "" {
 		if out != nil {
 			fmt.Fprintln(out, "Step 1/1 : FROM x")
@@ -188,29 +301,39 @@ func (f *Fake) ImageBuild(_ context.Context, opts engine.BuildOptions, out io.Wr
 	return nil
 }
 
-func (f *Fake) ImageTag(_ context.Context, source, target string) error {
+func (f *Fake) ImageTag(ctx context.Context, source, target string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if !f.Images[source] {
+	key, ok := f.image(source)
+	if !ok {
 		return fmt.Errorf("no such image %s", source)
 	}
 	f.Images[target] = true
-	f.setPlatform(target, f.ImagePlatforms[source])
+	f.setPlatform(target, f.ImagePlatforms[key])
 	f.Tagged = append(f.Tagged, [2]string{source, target})
 	return nil
 }
 
-func (f *Fake) ImagePush(_ context.Context, ref string, out io.Writer) error {
+func (f *Fake) ImagePush(ctx context.Context, ref string, out io.Writer) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if !f.Images[ref] {
+	if _, ok := f.image(ref); !ok {
 		return fmt.Errorf("no such image %s", ref)
 	}
 	f.Pushes = append(f.Pushes, ref)
 	return nil
 }
 
-func (f *Fake) ImageRemove(_ context.Context, ref string, _ bool) error {
+func (f *Fake) ImageRemove(ctx context.Context, ref string, _ bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if f.ImageRemoveFn != nil {
 		if err := f.ImageRemoveFn(ref); err != nil {
 			return err
@@ -218,11 +341,19 @@ func (f *Fake) ImageRemove(_ context.Context, ref string, _ bool) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Remove ref under every spelling it was recorded as.
+	for key, ok := f.image(ref); ok; key, ok = f.image(ref) {
+		delete(f.Images, key)
+		delete(f.ImagePlatforms, key)
+	}
 	delete(f.Images, ref)
 	return nil
 }
 
-func (f *Fake) ImageList(_ context.Context, prefix string) ([]string, error) {
+func (f *Fake) ImageList(ctx context.Context, prefix string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []string
@@ -241,14 +372,20 @@ func (f *Fake) ContainerCreate(ctx context.Context, spec engine.ContainerSpec) (
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if !f.Images[spec.Image] {
+	key, ok := f.image(spec.Image)
+	if !ok {
 		return "", fmt.Errorf("no such image: %s", spec.Image)
 	}
-	if !f.platformOK(spec.Image, spec.Platform) {
+	if !f.platformOK(key, spec.Platform) {
 		return "", fmt.Errorf("image %s was found but does not match the specified platform %s", spec.Image, spec.Platform)
 	}
 	if _, dup := f.Containers[spec.Name]; dup {
 		return "", fmt.Errorf("conflict: name %s already in use", spec.Name)
+	}
+	if spec.Network != nil && !predefinedNetwork(spec.Network.Name) {
+		if _, ok := f.Networks[spec.Network.Name]; !ok {
+			return "", fmt.Errorf("network %s not found", spec.Network.Name)
+		}
 	}
 	f.nextID++
 	f.nextIP++
@@ -257,10 +394,10 @@ func (f *Fake) ContainerCreate(ctx context.Context, spec engine.ContainerSpec) (
 	return c.ID, nil
 }
 
-// freeHostPort returns a currently free TCP port on host (127.0.0.1 for "" or
-// 0.0.0.0).
+// freeHostPort returns a currently free TCP port on host (127.0.0.1 for "",
+// 0.0.0.0 or ::, so a host without IPv6 can still run the tests).
 func freeHostPort(host string) (int, error) {
-	if host == "" || host == "0.0.0.0" {
+	if host == "" || host == "0.0.0.0" || host == "::" {
 		host = "127.0.0.1"
 	}
 	l, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
@@ -293,10 +430,16 @@ func (f *Fake) ContainerStart(ctx context.Context, id string) error {
 		f.mu.Unlock()
 		return fmt.Errorf("no such container %s", id)
 	}
-	c.Running = true
+	if c.Paused {
+		f.mu.Unlock()
+		return fmt.Errorf("cannot start a paused container, try unpause instead")
+	}
+	c.Running, c.started = true, true
 	// Like the daemon, assign a free host port to every binding that asks
 	// for host port 0 (a real free port, so a StartFn can listen on it).
-	if !f.NoAssignPorts {
+	// Nothing is published from an internal network, so inspect then reports
+	// no host port, as the daemon's does.
+	if !f.NoAssignPorts && !f.onInternalNetwork(c) {
 		ports := append([]engine.PortBinding(nil), c.Spec.Ports...)
 		for i := range ports {
 			if ports[i].HostPort == 0 {
@@ -316,6 +459,12 @@ func (f *Fake) ContainerStart(ctx context.Context, id string) error {
 		return fn(spec)
 	}
 	return nil
+}
+
+// onInternalNetwork reports whether c's primary network is an internal one.
+// Called with f.mu held.
+func (f *Fake) onInternalNetwork(c *Container) bool {
+	return c.Spec.Network != nil && f.Networks[c.Spec.Network.Name].Internal
 }
 
 func (f *Fake) ContainerRemove(ctx context.Context, id string) error {
@@ -354,9 +503,14 @@ func (f *Fake) ContainerList(ctx context.Context, all bool, prefix string) ([]en
 		if !strings.HasPrefix(name, prefix) || (!all && !c.Running) {
 			continue
 		}
-		st := "exited"
-		if c.Running {
+		st := "created"
+		switch {
+		case c.Paused:
+			st = "paused"
+		case c.Running:
 			st = "running"
+		case c.started:
+			st = "exited"
 		}
 		out = append(out, engine.ContainerInfo{ID: c.ID, Name: name, Image: c.Spec.Image, State: st, Status: "Up", Labels: c.Spec.Labels})
 	}
@@ -364,7 +518,10 @@ func (f *Fake) ContainerList(ctx context.Context, all bool, prefix string) ([]en
 	return out, nil
 }
 
-func (f *Fake) ContainerInspect(_ context.Context, id string) (*engine.ContainerDetail, error) {
+func (f *Fake) ContainerInspect(ctx context.Context, id string) (*engine.ContainerDetail, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	c := f.byIDOrName(id)
@@ -379,14 +536,33 @@ func (f *Fake) ContainerInspect(_ context.Context, id string) (*engine.Container
 		d.IPs[n.Name] = fmt.Sprintf("10.99.%d.%d", i, f.nextIP)
 	}
 	for _, p := range c.Spec.Ports {
-		d.Ports[fmt.Sprintf("%d/tcp", p.ContainerPort)] = engine.HostBinding{IP: p.HostIP, Port: p.HostPort}
+		proto := p.Protocol
+		if proto == "" {
+			proto = "tcp"
+		}
+		d.Ports[fmt.Sprintf("%d/%s", p.ContainerPort, proto)] = engine.HostBinding{IP: p.HostIP, Port: p.HostPort}
 	}
 	return d, nil
 }
 
-func (f *Fake) ContainerExec(_ context.Context, id, command string, _ time.Duration) (int, string, error) {
+func (f *Fake) ContainerExec(ctx context.Context, id, command string, _ time.Duration) (int, string, error) {
+	if err := ctx.Err(); err != nil {
+		return -1, "", err
+	}
 	f.mu.Lock()
+	// Like the daemon, exec needs an existing, running, unpaused container.
+	if c := f.byIDOrName(id); c == nil || !c.Running || c.Paused {
+		f.mu.Unlock()
+		switch {
+		case c == nil:
+			return -1, "", fmt.Errorf("no such container %s", id)
+		case !c.Running:
+			return -1, "", fmt.Errorf("container %s is not running", id)
+		}
+		return -1, "", fmt.Errorf("Container %s is paused, unpause the container before exec", id)
+	}
 	f.Execs = append(f.Execs, id+": "+command)
+	f.Calls = append(f.Calls, "exec "+id+": "+command)
 	fn := f.ExecFn
 	f.mu.Unlock()
 	if fn != nil {
@@ -400,12 +576,15 @@ func (f *Fake) Exit(idOrName string, code int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if c := f.byIDOrName(idOrName); c != nil {
-		c.Running = false
+		c.Running, c.Paused = false, false
 		c.ExitCode = code
 	}
 }
 
-func (f *Fake) ContainerLogs(_ context.Context, id string, _ int) (string, error) {
+func (f *Fake) ContainerLogs(ctx context.Context, id string, _ int) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	f.mu.Lock()
 	c := f.byIDOrName(id)
 	fn := f.LogsFn
@@ -418,19 +597,56 @@ func (f *Fake) ContainerLogs(_ context.Context, id string, _ int) (string, error
 	}
 	return "", nil
 }
-func (f *Fake) ContainerWait(context.Context, string) (int, error) { return 0, nil }
 
-func (f *Fake) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (string, error) {
+// ContainerWait blocks until the container is no longer running (see Exit)
+// and returns its exit code, like the daemon's wait.
+func (f *Fake) ContainerWait(ctx context.Context, id string) (int, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return -1, err
+		}
+		f.mu.Lock()
+		c := f.byIDOrName(id)
+		if c == nil {
+			f.mu.Unlock()
+			return -1, fmt.Errorf("no such container %s", id)
+		}
+		running, code := c.Running, c.ExitCode
+		f.mu.Unlock()
+		if !running {
+			return code, nil
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+func (f *Fake) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (engine.Network, error) {
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return engine.Network{}, err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.Networks[spec.Name] = spec
-	return "net-" + spec.Name, nil
+	// Like the real engines, an existing network is returned as it is: its
+	// settings are not updated to spec.
+	if _, ok := f.Networks[spec.Name]; !ok {
+		f.Networks[spec.Name] = spec
+	}
+	n := f.Networks[spec.Name]
+	driver := n.Driver
+	if driver == "" {
+		driver = "bridge"
+	}
+	return engine.Network{ID: "net-" + spec.Name, Driver: driver, Internal: n.Internal, Options: n.Options,
+		Subnet: n.Subnet, Gateway: n.Gateway}, nil
 }
 
-func (f *Fake) NetworkExists(_ context.Context, name string) (bool, error) {
+func (f *Fake) NetworkExists(ctx context.Context, name string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	_, ok := f.Networks[name]
@@ -471,6 +687,16 @@ func (f *Fake) NetworkConnect(ctx context.Context, network, container string, al
 	}
 	c.Networks = append(c.Networks, engine.NetworkAttachment{Name: network, Aliases: aliases})
 	return nil
+}
+
+// predefinedNetwork reports whether name is one of the networks a daemon
+// always has.
+func predefinedNetwork(name string) bool {
+	switch name {
+	case "", "default", "bridge", "host", "none":
+		return true
+	}
+	return false
 }
 
 func attachedTo(c *Container, network string) bool {
@@ -535,4 +761,174 @@ func has(list []string, v string) bool {
 	return false
 }
 
-var _ engine.Engine = (*Fake)(nil)
+// ContainerPause freezes a running container. Like dockerd, a missing,
+// stopped or already paused container is an error.
+func (f *Fake) ContainerPause(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c := f.byIDOrName(id)
+	switch {
+	case c == nil:
+		return fmt.Errorf("No such container: %s", id)
+	case !c.Running:
+		return fmt.Errorf("container %s is not running", c.ID)
+	case c.Paused:
+		return fmt.Errorf("container %s is already paused", c.ID)
+	}
+	c.Paused = true
+	f.Calls = append(f.Calls, "pause "+id)
+	return nil
+}
+
+// ContainerUnpause thaws a paused container. Like dockerd, a missing or
+// unpaused container is an error.
+func (f *Fake) ContainerUnpause(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c := f.byIDOrName(id)
+	switch {
+	case c == nil:
+		return fmt.Errorf("No such container: %s", id)
+	case !c.Paused:
+		return fmt.Errorf("Container %s is not paused", c.ID)
+	}
+	c.Paused = false
+	f.Calls = append(f.Calls, "unpause "+id)
+	return nil
+}
+
+// WriteFile puts a file, directory (mode with fs.ModeDir) or symlink (mode
+// with fs.ModeSymlink, data its target) at the absolute path p in a created
+// container, replacing what was there. Parent directories need not be written
+// first: they exist, as 0755 directories, once something is in them. Call it
+// after ContainerCreate, e.g. from StartFn or ExecFn to model a file the
+// container's process writes.
+func (f *Fake) WriteFile(container, p string, mode fs.FileMode, data string) error {
+	if !path.IsAbs(p) {
+		return fmt.Errorf("container path %q is not absolute", p)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c := f.byIDOrName(container)
+	if c == nil {
+		return fmt.Errorf("no such container %s", container)
+	}
+	if c.Files == nil {
+		c.Files = map[string]File{}
+	}
+	c.Files[path.Clean(p)] = File{Mode: mode, Data: data, ModTime: time.Now()}
+	return nil
+}
+
+// lstat returns the file at the clean path p of c: a written one, or an
+// implied parent directory. Called with f.mu held.
+func lstat(c *Container, p string) (File, bool) {
+	if file, ok := c.Files[p]; ok {
+		return file, true
+	}
+	if p == "/" {
+		return File{Mode: fs.ModeDir | 0o755}, true
+	}
+	for q := range c.Files {
+		if strings.HasPrefix(q, p+"/") {
+			return File{Mode: fs.ModeDir | 0o755}, true
+		}
+	}
+	return File{}, false
+}
+
+// archivePath resolves a FileReader call to its container and clean path, or
+// to the daemon's error. Called with f.mu held.
+func (f *Fake) archivePath(id, p string) (*Container, string, File, error) {
+	if !path.IsAbs(p) {
+		return nil, "", File{}, fmt.Errorf("container path %q is not absolute", p)
+	}
+	c := f.byIDOrName(id)
+	if c == nil {
+		return nil, "", File{}, fmt.Errorf("No such container: %s", id)
+	}
+	p = path.Clean(p)
+	file, ok := lstat(c, p)
+	if !ok {
+		return nil, "", File{}, fmt.Errorf("%s in container %s: %w", p, id, fs.ErrNotExist)
+	}
+	return c, p, file, nil
+}
+
+// ContainerStatPath returns the mode of a file written with WriteFile (or of
+// a directory implied by one). It works on a container in any state.
+func (f *Fake) ContainerStatPath(ctx context.Context, id, p string) (fs.FileMode, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, _, file, err := f.archivePath(id, p)
+	return file.Mode, err
+}
+
+// ContainerReadDir returns the regular files directly in dir. It packs dir
+// into a tar the way dockerd's archive API does and reads it back with
+// engine.DirFilesFromTar, as the real engines do.
+func (f *Fake) ContainerReadDir(ctx context.Context, id, dir string, maxBytes int64) (map[string]engine.FileContent, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	c, dir, file, err := f.archivePath(id, dir)
+	if err != nil {
+		f.mu.Unlock()
+		return nil, err
+	}
+	if !file.Mode.IsDir() {
+		f.mu.Unlock()
+		return nil, fmt.Errorf("%s in container %s is not a directory (mode %s)", dir, id, file.Mode)
+	}
+	root := path.Base(dir)
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	names := make([]string, 0, len(c.Files))
+	for p := range c.Files {
+		if strings.HasPrefix(p, strings.TrimSuffix(dir, "/")+"/") {
+			names = append(names, p)
+		}
+	}
+	sort.Strings(names)
+	for _, p := range names {
+		file := c.Files[p]
+		h := &tar.Header{Name: strings.TrimSuffix(root, "/") + "/" + strings.TrimPrefix(p, strings.TrimSuffix(dir, "/")+"/"), Mode: int64(file.Mode.Perm()),
+			ModTime: file.ModTime, Format: tar.FormatPAX} // sub-second, unlike dockerd's whole seconds
+		switch {
+		case file.Mode.IsDir():
+			h.Typeflag, h.Name = tar.TypeDir, h.Name+"/"
+		case file.Mode&fs.ModeSymlink != 0:
+			h.Typeflag, h.Linkname = tar.TypeSymlink, file.Data
+		case file.Mode.IsRegular():
+			h.Typeflag, h.Size = tar.TypeReg, int64(len(file.Data))
+		default:
+			continue
+		}
+		if err := tw.WriteHeader(h); err != nil {
+			f.mu.Unlock()
+			return nil, err
+		}
+		if h.Typeflag == tar.TypeReg {
+			_, _ = io.WriteString(tw, file.Data)
+		}
+	}
+	_ = tw.Close()
+	f.mu.Unlock()
+	return engine.DirFilesFromTar(&buf, root, maxBytes)
+}
+
+var (
+	_ engine.Engine     = (*Fake)(nil)
+	_ engine.Pauser     = (*Fake)(nil)
+	_ engine.FileReader = (*Fake)(nil)
+)

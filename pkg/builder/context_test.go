@@ -59,7 +59,8 @@ func readTar(t *testing.T, r io.Reader) map[string]entry {
 
 // TestBuildContextTree checks what the streamed context carries (#47 item 7):
 // symlinks as symlinks (they used to be dropped), .dockerignore honoured but
-// never for the Dockerfile or .dockerignore itself, .git left out, and
+// never for the Dockerfile or .dockerignore itself, every .git left out (a
+// nested one too, as the content hash leaves it out: #93 item 3), and
 // generated files replacing tree files of the same name.
 func TestBuildContextTree(t *testing.T) {
 	root := t.TempDir()
@@ -71,6 +72,7 @@ func TestBuildContextTree(t *testing.T) {
 	write(t, root, "keep.log", "kept")
 	write(t, root, "secret/key", "k")
 	write(t, root, ".git/config", "[core]")
+	write(t, root, "app/vendor/lib/.git/HEAD", "ref: refs/heads/main\n")
 	write(t, root, "app.py", "original")
 	symlink(t, "app/main.py", filepath.Join(root, "main.py"))
 	symlink(t, "/etc/passwd", filepath.Join(root, "abs-link"))
@@ -87,7 +89,7 @@ func TestBuildContextTree(t *testing.T) {
 		names = append(names, n)
 	}
 	sort.Strings(names)
-	want := []string{".dockerignore", "Dockerfile", "abs-link", "app.py", "app/", "app/cache/", "app/main.py", "keep.log", "main.py"}
+	want := []string{".dockerignore", "Dockerfile", "abs-link", "app.py", "app/", "app/cache/", "app/main.py", "app/vendor/", "app/vendor/lib/", "keep.log", "main.py"}
 	if strings.Join(names, " ") != strings.Join(want, " ") {
 		t.Fatalf("context:\n got  %v\n want %v", names, want)
 	}
@@ -137,8 +139,14 @@ func TestBakeEnvRefusesSymlinkedDockerfile(t *testing.T) {
 	write(t, outside, "Dockerfile", "FROM scratch\n")
 	symlink(t, filepath.Join(outside, "Dockerfile"), filepath.Join(root, "Dockerfile"))
 	err := bakeEnv(newBuildContext(root), "Dockerfile", map[string]string{"A": "b"})
-	if err == nil || !strings.Contains(err.Error(), "symlink") {
-		t.Fatalf("a symlinked Dockerfile must not be read through: %v", err)
+	if !errors.Is(err, contract.ErrPathEscapes) {
+		t.Fatalf("a Dockerfile symlinked out of the context must not be read through: %v", err)
+	}
+	// Nor through a symlinked parent directory.
+	symlink(t, outside, filepath.Join(root, "out"))
+	err = bakeEnv(newBuildContext(root), "out/Dockerfile", map[string]string{"A": "b"})
+	if !errors.Is(err, contract.ErrPathEscapes) {
+		t.Fatalf("a Dockerfile under a directory symlinked out of the context must not be read: %v", err)
 	}
 	write(t, root, "sub/Dockerfile", "FROM scratch\n")
 	bc := newBuildContext(root)
@@ -147,6 +155,29 @@ func TestBakeEnvRefusesSymlinkedDockerfile(t *testing.T) {
 	}
 	if df := string(bc.files["sub/Dockerfile"].data); df != "FROM scratch\nENV A=b\n" {
 		t.Fatalf("baked: %q", df)
+	}
+}
+
+// A Dockerfile symlinked to another file inside the context is accepted by
+// validate and by the daemon, so baking environment into it must work too
+// (it used to fail with "is a symlink" as soon as a state set environment).
+func TestBakeEnvFollowsInContextSymlink(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "docker/Dockerfile.prod", "FROM scratch\n")
+	symlink(t, "docker/Dockerfile.prod", filepath.Join(root, "Dockerfile"))
+	write(t, root, "real/Dockerfile", "FROM busybox\n")
+	symlink(t, "real", filepath.Join(root, "alias"))
+	for name, want := range map[string]string{
+		"Dockerfile":       "FROM scratch\nENV A=b\n",
+		"alias/Dockerfile": "FROM busybox\nENV A=b\n",
+	} {
+		bc := newBuildContext(root)
+		if err := bakeEnv(bc, name, map[string]string{"A": "b"}); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if df := string(bc.files[name].data); df != want {
+			t.Fatalf("%s baked: %q", name, df)
+		}
 	}
 }
 
@@ -178,13 +209,15 @@ func TestDockerignorePatterns(t *testing.T) {
 		{"a?c", "abc", true},
 		{"a?c", "a/c", false},
 		{"[a-c].txt", "b.txt", true},
-		{"[!a-c].txt", "b.txt", false},
+		{"[!a-c].txt", "b.txt", true}, // "!" is a literal in the class, as in Docker
+		{"[^a-c].txt", "b.txt", false},
 		{"docs/**", "docs/x/y.md", true},
 		{"docs/**", "docsx", false},
 		{"*\n!keep", "keep", false},
 		{"*\n!keep", "other", true},
 		{"!keep\n*", "keep", true}, // the last matching pattern wins
-		{".", "anything", true},
+		{".", "anything", false},   // "." and "/" exclude nothing in Docker
+		{"/", "anything", false},
 	}
 	if runtime.GOOS != "windows" {
 		// "\\" escapes only off Windows; there it is a path separator, as in Docker.
@@ -208,5 +241,92 @@ func TestDockerignorePatterns(t *testing.T) {
 		if got := d.excludes(tc.path); got != tc.excluded {
 			t.Errorf("patterns %q, path %q: excluded=%v, want %v", tc.patterns, tc.path, got, tc.excluded)
 		}
+	}
+}
+
+// A Dockerfile inside a directory .dockerignore excludes is still sent, as
+// the Docker CLI does by adding "!<dockerfile>" to the excludes; the rest of
+// that directory stays out.
+func TestBuildContextKeepsDockerfileInIgnoredDir(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, ".dockerignore", "docker\n")
+	write(t, root, "docker/Dockerfile", "FROM scratch\n")
+	write(t, root, "docker/secret", "s")
+	write(t, root, "docker/sub/x", "x")
+	write(t, root, "app.py", "x")
+	s := newBuildContext(root).stream("docker/Dockerfile")
+	got := readTar(t, s)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for n := range got {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	want := []string{".dockerignore", "app.py", "docker/Dockerfile"}
+	if strings.Join(names, " ") != strings.Join(want, " ") {
+		t.Fatalf("context:\n got  %v\n want %v", names, want)
+	}
+}
+
+// Docker reads "#" as a comment only in the first column and refuses a bare
+// "!" (which used to re-include everything excluded before it).
+func TestDockerignoreDockerParity(t *testing.T) {
+	for _, p := range []string{"*.log\n!\n", "*.log\n!  \n"} {
+		if _, err := parseDockerignore([]byte(p)); err == nil || !strings.Contains(err.Error(), `illegal exclusion pattern: "!"`) {
+			t.Errorf("%q: want the illegal exclusion error, got %v", p, err)
+		}
+	}
+	d, err := parseDockerignore([]byte("  # notes\n# real comment\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.excludes("# notes") || d.excludes("# real comment") {
+		t.Errorf("indented # must be a pattern, column-0 # a comment: rules=%d", len(d.rules))
+	}
+}
+
+// #93 item 3: the content hash and the context agree on .git. Editing a
+// nested .git directory used to change what the daemon got (and what
+// `COPY . /` baked) but not the image tag, so a stale image was reused. Now it
+// changes neither.
+func TestNestedGitNeitherSentNorHashed(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "src/Dockerfile", "FROM scratch\nCOPY . /\n")
+	write(t, dir, "src/vendor/lib/a.go", "package lib\n")
+	write(t, dir, "src/vendor/lib/.git/HEAD", "ref: refs/heads/main\n")
+	c, err := contract.Parse([]byte("apiVersion: vulnsuite/v1\nkind: Target\nmetadata: { id: nested-git, summary: x }\n" +
+		"base: { kind: build, context: src }\nservice: { ports: [ { container: 80 } ] }\nstates:\n  vulnerable: {}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Folder = dir
+	snapshot := func() (string, map[string]entry) {
+		s := newBuildContext(filepath.Join(dir, "src")).stream("Dockerfile")
+		got := readTar(t, s)
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return c.ContentHash("vulnerable"), got
+	}
+	h1, ctx1 := snapshot()
+	write(t, dir, "src/vendor/lib/.git/HEAD", "0123456789abcdef0123456789abcdef01234567\n")
+	h2, ctx2 := snapshot()
+	if h1 != h2 {
+		t.Errorf("a nested .git must not enter the hash: %s -> %s", h1, h2)
+	}
+	for n := range ctx2 {
+		if strings.Contains("/"+n, "/.git/") {
+			t.Errorf("nested .git sent to the daemon: %s", n)
+		}
+	}
+	if len(ctx1) != len(ctx2) {
+		t.Errorf("context changed: %d -> %d entries", len(ctx1), len(ctx2))
+	}
+	// A real source change still changes both.
+	write(t, dir, "src/vendor/lib/a.go", "package lib // edited\n")
+	if h3, _ := snapshot(); h3 == h2 {
+		t.Error("a source edit must change the hash")
 	}
 }

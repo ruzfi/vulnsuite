@@ -65,6 +65,13 @@ func checkOverlayDest(dest string, absolute bool) error {
 	if strings.Trim(dest, "/.") == "" {
 		return errors.New("must name a file, not the root")
 	}
+	// On an image base COPY reads a trailing "/" as "into this directory"
+	// (the file lands there under its build-context name), while a source or
+	// build base writes a file named after the last segment: the same dest
+	// would land in two different places.
+	if strings.HasSuffix(dest, "/") || strings.HasSuffix(dest, "/.") {
+		return errors.New("must name a file: no trailing / or /. (write the full destination path, file name included)")
+	}
 	return nil
 }
 

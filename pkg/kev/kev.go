@@ -7,8 +7,10 @@
 //
 //   - the templates checkout's data/cisa-kev.txt (the source of truth, a
 //     CVE-id snapshot kept fresh by the templates repo's cisa-kev-sync Action),
-//     unless the local cache holds a newer catalog;
-//   - a local cache (~/.cache/vulnsuite/cisa-kev.json), when the templates file
+//     unless the local cache holds a newer catalog (or the snapshot is
+//     undated and the cache is not);
+//   - a local cache (vulnsuite/cisa-kev.json under os.UserCacheDir: ~/.cache
+//     on Linux, ~/Library/Caches on macOS), when the templates file
 //     is absent or older than the cache;
 //   - empty, offline, when neither exists — the caller warns and --kev matches
 //     nothing.
@@ -154,7 +156,8 @@ type Options struct {
 	TemplatesDir string
 	// Refresh forces a network fetch and rewrites the cache (Option B).
 	Refresh bool
-	// CacheDir overrides the default ~/.cache/vulnsuite cache location.
+	// CacheDir overrides the default cache location, vulnsuite under
+	// os.UserCacheDir.
 	CacheDir string
 	// Client overrides the HTTP client used for a fetch (tests).
 	Client *http.Client
@@ -221,8 +224,11 @@ func Resolve(ctx context.Context, opts Options) (Set, Source, error) {
 			return nil, Source{}, fmt.Errorf("refresh KEV from CISA feed: %w", err)
 		}
 		fetched := opts.now().UTC().Format(time.RFC3339)
-		// A fresh set is still usable even if the cache write fails.
-		_ = writeCache(cachePath, set, string(OriginNetwork), fetched, version)
+		// A fresh set is still usable even if the cache write fails, but the
+		// next run will not see it: say so.
+		if err := writeCache(cachePath, set, string(OriginNetwork), fetched, version); err != nil {
+			opts.warn("could not write the KEV cache %s: %v (this run uses the fresh catalog; later runs will not)", cachePath, err)
+		}
 		return set, Source{Origin: OriginNetwork, Path: url, Fetched: fetched, CatalogVersion: version, AsOf: asOf(version, fetched)}, nil
 	}
 
@@ -240,14 +246,15 @@ func Resolve(ctx context.Context, opts Options) (Set, Source, error) {
 
 	// Source of truth: the templates checkout's snapshot, unless the cache is
 	// known to hold a newer catalog (a recent -refresh-kev against an old
-	// checkout).
+	// checkout). A snapshot without a catalogVersion header cannot be dated,
+	// so a cache that can be dated wins over it.
 	if opts.TemplatesDir != "" {
 		txt := filepath.Join(opts.TemplatesDir, "data", "cisa-kev.txt")
 		if data, err := os.ReadFile(txt); err == nil {
 			if set := parseTxt(data); set.Len() > 0 {
 				version := txtCatalogVersion(data)
 				src := Source{Origin: OriginTemplates, Path: txt, CatalogVersion: version, AsOf: catalogDate(version)}
-				if cacheLoadErr == nil && cacheSet.Len() > 0 && !src.AsOf.IsZero() && cacheSrc.AsOf.After(src.AsOf) {
+				if cacheLoadErr == nil && !cacheSrc.AsOf.IsZero() && (src.AsOf.IsZero() || cacheSrc.AsOf.After(src.AsOf)) {
 					return cacheSet, cacheSrc, nil
 				}
 				return set, src, nil
@@ -321,6 +328,11 @@ func loadCache(path string) (Set, cacheFile, error) {
 		if cveExactRe.MatchString(id) {
 			set[strings.ToUpper(id)] = true
 		}
+	}
+	// Valid JSON without ids (null, {}, an emptied list) is no catalog: used
+	// as one, KEV would show "-" everywhere and -no-kev would match all.
+	if len(set) == 0 {
+		return nil, cacheFile{}, fmt.Errorf("KEV cache holds no CVE ids")
 	}
 	return set, cf, nil
 }

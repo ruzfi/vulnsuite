@@ -12,6 +12,7 @@ import (
 
 	"github.com/ruzfi/vulnsuite/pkg/contract"
 	"github.com/ruzfi/vulnsuite/pkg/loader"
+	"github.com/ruzfi/vulnsuite/pkg/validator"
 )
 
 // suitePrefix marks a selector that names a curated suite rather than a target.
@@ -108,6 +109,9 @@ func (r *resolver) addFile(path string) error {
 		origin := fmt.Sprintf("%s:%d", path, l.line)
 		if l.args != nil {
 			f, err := parseFilterLine(l.args)
+			if err == nil {
+				err = checkCategory(r.store, f.category)
+			}
 			if err != nil {
 				return atOrigin(origin, err)
 			}
@@ -137,8 +141,12 @@ func parseSelectorFile(path string) ([]selectorLine, error) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if i := strings.Index(line, " #"); i >= 0 {
-			line = strings.TrimSpace(line[:i])
+		// A comment starts at a "#" preceded by any whitespace (a tab too).
+		for j := 1; j < len(line); j++ {
+			if line[j] == '#' && (line[j-1] == ' ' || line[j-1] == '\t') {
+				line = strings.TrimSpace(line[:j])
+				break
+			}
 		}
 		if line == "" {
 			continue
@@ -185,6 +193,9 @@ func resolveTargets(ctx context.Context, store *loader.Store, sel, files []strin
 	r := &resolver{store: store, variants: variants, visitedSuite: map[string]bool{}}
 	if cliFilters.active() {
 		if err := cliFilters.validate(); err != nil {
+			return nil, err
+		}
+		if err := checkCategory(store, cliFilters.category); err != nil {
 			return nil, err
 		}
 		r.filterSets = append(r.filterSets, cliFilters)
@@ -265,11 +276,40 @@ func resolveTargets(ctx context.Context, store *loader.Store, sel, files []strin
 
 // gatherSet resolves the full selector/filter/suite surface into loaded
 // contracts (plus per-template load errors), for run and build.
+//
+// A template that loads but that validate would reject (a probe regex that
+// does not compile, a referenced file that is missing, no ports...) counts
+// as failing to load: run and build report it up front instead of failing
+// halfway through, or verifying a state with a probe that cannot work. An
+// unpinned base is allowed, as it is while authoring.
 func gatherSet(ctx context.Context, store *loader.Store, sel, files []string, all, variants bool, cliFilters filters) ([]*contract.Contract, []error, error) {
 	paths, err := resolveTargets(ctx, store, sel, files, all, variants, cliFilters)
 	if err != nil {
 		return nil, nil, err
 	}
-	cs, errs := store.LoadMany(paths)
+	loaded, errs := store.LoadMany(paths)
+	v := &validator.Validator{AllowUnpinned: true}
+	var cs []*contract.Contract
+	for _, c := range loaded {
+		if err := runnableErr(v, c); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		cs = append(cs, c)
+	}
 	return cs, errs, nil
+}
+
+// runnableErr returns c's error-level validation findings as a load error.
+func runnableErr(v *validator.Validator, c *contract.Contract) error {
+	var msgs []string
+	for _, f := range v.Check(c) {
+		if f.Level == validator.Error {
+			msgs = append(msgs, fmt.Sprintf("[%s] %s", f.Rule, f.Message))
+		}
+	}
+	if len(msgs) == 0 {
+		return nil
+	}
+	return &loader.Error{Path: c.SourcePath, Message: "invalid (see `vulnsuite validate`): " + strings.Join(msgs, "; ")}
 }

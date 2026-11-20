@@ -51,7 +51,7 @@ func makeZip(t *testing.T, entries ...zipEntry) []byte {
 func templatesZip(t *testing.T) []byte {
 	return makeZip(t,
 		zipEntry{name: "vulnsuite-templates-main/", mode: os.ModeDir | 0o755},
-		zipEntry{name: "vulnsuite-templates-main/web/x/contract.yaml", body: "id: x\n"},
+		zipEntry{name: "vulnsuite-templates-main/web/x/contract.yaml", body: "apiVersion: vulnsuite/v1\nkind: Target\n"},
 	)
 }
 
@@ -422,6 +422,81 @@ func TestUpdateGitPullAndRef(t *testing.T) {
 	}
 }
 
+// A plain update after -ref (which leaves HEAD detached) returns to origin's
+// default branch instead of failing in `git pull`, without losing work.
+func TestUpdateGitAfterRefReturnsToDefaultBranch(t *testing.T) {
+	origin, clone, git := gitRepo(t)
+	ctx := context.Background()
+	branchOf := func() string {
+		t.Helper()
+		out, err := exec.Command("git", "-C", clone, "symbolic-ref", "-q", "--short", "HEAD").Output()
+		if err != nil {
+			return "(detached)"
+		}
+		return strings.TrimSpace(string(out))
+	}
+	commit := func(content string) string {
+		t.Helper()
+		_ = os.WriteFile(filepath.Join(origin, "a.yaml"), []byte(content), 0o644)
+		git(origin, "commit", "-q", "-am", content)
+		return git(origin, "rev-parse", "--short", "HEAD")
+	}
+
+	if _, _, err := Update(ctx, UpdateOptions{Dir: clone, Ref: "v1"}); err != nil {
+		t.Fatal(err)
+	}
+	if b := branchOf(); b != "(detached)" {
+		t.Fatalf("-ref should detach, on %s", b)
+	}
+	v2 := commit("v2")
+	_, rev, err := Update(ctx, UpdateOptions{Dir: clone})
+	if err != nil || rev != v2 || branchOf() != "main" {
+		t.Fatalf("after -ref: rev=%s err=%v branch=%s (want %s on main)", rev, err, branchOf(), v2)
+	}
+	// ...and plain pulls keep working from there.
+	v3 := commit("v3")
+	if _, rev, err := Update(ctx, UpdateOptions{Dir: clone}); err != nil || rev != v3 {
+		t.Fatalf("second pull: rev=%s err=%v", rev, err)
+	}
+
+	// Detached with uncommitted changes to tracked files: refused, work kept.
+	if _, _, err := Update(ctx, UpdateOptions{Dir: clone, Ref: "v1"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(clone, "a.yaml"), []byte("wip"), 0o644)
+	if _, _, err := Update(ctx, UpdateOptions{Dir: clone}); err == nil || !strings.Contains(err.Error(), "uncommitted") {
+		t.Fatalf("dirty detached: err = %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(clone, "a.yaml")); string(b) != "wip" || branchOf() != "(detached)" {
+		t.Fatalf("dirty detached: a.yaml=%q branch=%s", b, branchOf())
+	}
+
+	// Commits made on the detached HEAD are not orphaned: refused.
+	git(clone, "commit", "-q", "-am", "local work")
+	local := git(clone, "rev-parse", "--short", "HEAD")
+	if _, _, err := Update(ctx, UpdateOptions{Dir: clone}); err == nil || !strings.Contains(err.Error(), "no branch or tag keeps") {
+		t.Fatalf("orphan commits: err = %v", err)
+	}
+	if got := git(clone, "rev-parse", "--short", "HEAD"); got != local {
+		t.Fatalf("orphan commits: HEAD moved to %s", got)
+	}
+
+	// No local default branch yet, and origin/HEAD names another branch: a
+	// tracking branch is created for it.
+	git(origin, "branch", "trunk", "main")
+	v4 := commit("v4") // on main only
+	git(clone, "checkout", "-q", "--detach", "v1")
+	git(clone, "fetch", "-q", "origin")
+	git(clone, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
+	_, rev, err = Update(ctx, UpdateOptions{Dir: clone})
+	if err != nil || branchOf() != "trunk" || rev != v3 {
+		t.Fatalf("origin/HEAD=trunk: rev=%s err=%v branch=%s (want %s on trunk, not %s)", rev, err, branchOf(), v3, v4)
+	}
+	if up := git(clone, "rev-parse", "--abbrev-ref", "trunk@{upstream}"); up != "origin/trunk" {
+		t.Fatalf("trunk upstream = %s", up)
+	}
+}
+
 func TestUnzipSkipsSymlinks(t *testing.T) {
 	dst := filepath.Join(t.TempDir(), "out")
 	data := makeZip(t,
@@ -431,7 +506,7 @@ func TestUnzipSkipsSymlinks(t *testing.T) {
 		zipEntry{name: "top/link", body: "real.yaml", mode: os.ModeSymlink | 0o777},
 		zipEntry{name: "top/escape", body: "/etc/passwd", mode: os.ModeSymlink | 0o777},
 	)
-	if err := unzipStripTop(data, dst); err != nil {
+	if err := unzipBytes(data, dst); err != nil {
 		t.Fatal(err)
 	}
 	for _, n := range []string{"link", "escape"} {
@@ -453,16 +528,258 @@ func TestUnzipSkipsSymlinks(t *testing.T) {
 	}
 }
 
+// An archive install drops symlinks; it must say so, since a template
+// relying on an in-context symlink works from a git checkout only.
+func TestUpdateArchiveReportsSkippedSymlinks(t *testing.T) {
+	entries := []zipEntry{
+		{name: "vulnsuite-templates-main/", mode: os.ModeDir | 0o755},
+		{name: "vulnsuite-templates-main/web/x/contract.yaml", body: "apiVersion: vulnsuite/v1\nkind: Target\n"},
+	}
+	for _, n := range []string{"a", "b", "c", "d", "e", "f", "g"} {
+		entries = append(entries, zipEntry{name: "vulnsuite-templates-main/web/x/" + n, body: "contract.yaml", mode: os.ModeSymlink | 0o777})
+	}
+	s := serveArchive(t, http.StatusOK, makeZip(t, entries...))
+	var out bytes.Buffer
+	o := opts(filepath.Join(t.TempDir(), "tpl"), s)
+	o.Output = &out
+	if _, _, err := Update(context.Background(), o); err != nil {
+		t.Fatal(err)
+	}
+	if want := "skipped 7 symlink(s) in the archive"; !strings.Contains(out.String(), want) {
+		t.Fatalf("output %q lacks %q", out.String(), want)
+	}
+	if want := "web/x/a, web/x/b, web/x/c, web/x/d, web/x/e and 2 more"; !strings.Contains(out.String(), want) {
+		t.Fatalf("output %q lacks %q", out.String(), want)
+	}
+
+	// No symlinks, no note.
+	out.Reset()
+	o = opts(filepath.Join(t.TempDir(), "tpl"), serveArchive(t, http.StatusOK, templatesZip(t)))
+	o.Output = &out
+	if _, _, err := Update(context.Background(), o); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "symlink") {
+		t.Fatalf("unexpected note: %q", out.String())
+	}
+}
+
 func TestUnzipRejectsEscapingPaths(t *testing.T) {
 	parent := t.TempDir()
 	dst := filepath.Join(parent, "out")
 	for _, name := range []string{"top/../../evil.yaml", "top/a/../../../evil.yaml"} {
 		data := makeZip(t, zipEntry{name: name, body: "x"})
-		if err := unzipStripTop(data, dst); err == nil || !strings.Contains(err.Error(), "unsafe path") {
+		if err := unzipBytes(data, dst); err == nil || !strings.Contains(err.Error(), "unsafe path") {
 			t.Fatalf("%s: err = %v", name, err)
 		}
 	}
 	if _, err := os.Stat(filepath.Join(parent, "evil.yaml")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("entry escaped the destination")
+	}
+}
+
+// Only files declaring a vulnsuite apiVersion count: template.yaml is also
+// the AWS SAM / CloudFormation file name.
+func TestHasTemplatesNeedsVulnsuiteContract(t *testing.T) {
+	write := func(dir, name, body string) {
+		t.Helper()
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sam := t.TempDir()
+	write(sam, "template.yaml", "AWSTemplateFormatVersion: '2010-09-09'\nTransform: AWS::Serverless-2016-10-31\n")
+	write(filepath.Join(sam, "infra"), "contract.yaml", "apiVersion: v1\nkind: Contract\n")
+	if HasTemplates(sam) {
+		t.Error("a SAM project counts as a templates directory")
+	}
+	for _, v := range []string{"apiVersion: vulnsuite/v1", `apiVersion: "vulnsuite/v1"`, "apiVersion: 'vulnsuite/v1' # pinned"} {
+		dir := t.TempDir()
+		write(filepath.Join(dir, "web", "x"), "template.yaml", "# a target\n"+v+"\nkind: Target\n")
+		if !HasTemplates(dir) {
+			t.Errorf("%q not recognised", v)
+		}
+	}
+}
+
+// Running from inside an unrelated git repository that happens to hold a
+// template.yaml must not resolve to that repository: update-templates would
+// then git pull, or with -ref check out a detached commit, in the user's own
+// project.
+func TestResolveIgnoresUnrelatedRepo(t *testing.T) {
+	t.Setenv(EnvDir, "")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(repo, "template.yaml"), []byte("AWSTemplateFormatVersion: '2010-09-09'\n"), 0o644)
+	src := filepath.Join(repo, "src")
+	os.Mkdir(src, 0o755)
+	t.Chdir(src)
+	got, err := Resolve("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != DefaultDir() {
+		t.Fatalf("Resolve = %q, want the default %q", got, DefaultDir())
+	}
+	// A real templates checkout is still found from a subfolder.
+	os.WriteFile(filepath.Join(repo, "template.yaml"), []byte("apiVersion: vulnsuite/v1\nkind: Target\n"), 0o644)
+	got, err = Resolve("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want, _ := filepath.EvalSymlinks(repo); got != repo && got != want {
+		t.Fatalf("Resolve = %q, want %q", got, repo)
+	}
+}
+
+// #94 item 2: inside an archive install (no .git, only the version marker),
+// a subfolder resolves to the install root, not to itself.
+func TestResolveArchiveInstallFromSubfolder(t *testing.T) {
+	t.Setenv(EnvDir, "")
+	t.Setenv("HOME", t.TempDir())
+	root := filepath.Join(t.TempDir(), "tpl")
+	sub := filepath.Join(root, "web-apps")
+	if err := os.MkdirAll(filepath.Join(sub, "x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(sub, "x", "contract.yaml"), []byte("apiVersion: vulnsuite/v1\nkind: Target\n"), 0o644)
+	os.WriteFile(filepath.Join(root, versionFile), []byte("ruzfi/vulnsuite-templates@main\n"), 0o644)
+	t.Chdir(sub)
+	got, err := Resolve("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want, _ := filepath.EvalSymlinks(root); got != root && got != want {
+		t.Fatalf("Resolve = %q, want the install root %q", got, root)
+	}
+}
+
+// #94 item 2: update-templates never replaces a subfolder of an archive
+// install with the whole archive, even with -force.
+func TestUpdateRefusesSubfolderOfInstall(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "tpl")
+	sub := filepath.Join(root, "web-apps")
+	keep := filepath.Join(sub, "x", "contract.yaml")
+	if err := os.MkdirAll(filepath.Dir(keep), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(keep, []byte("apiVersion: vulnsuite/v1\nkind: Target\n"), 0o644)
+	os.WriteFile(filepath.Join(root, versionFile), []byte("old\n"), 0o644)
+	s := serveArchive(t, http.StatusOK, templatesZip(t))
+	o := opts(sub, s)
+	o.Force = true
+	_, _, err := Update(context.Background(), o)
+	if err == nil || !strings.Contains(err.Error(), "inside the templates installed at "+root) {
+		t.Fatalf("err = %v", err)
+	}
+	mustExist(t, keep)
+	if len(s.requests()) != 0 {
+		t.Fatal("nothing should be downloaded for a refused directory")
+	}
+	// The install root itself still updates.
+	if _, _, err := Update(context.Background(), opts(root, s)); err != nil {
+		t.Fatal(err)
+	}
+	mustExist(t, filepath.Join(root, "web", "x", "contract.yaml"))
+}
+
+// #94 item 3: once the new tree is in place the update has succeeded; a
+// previous tree that cannot be removed is a warning naming the leftover.
+func TestUpdateSucceedsWhenOldTreeCannotBeRemoved(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("needs a directory the current user cannot write")
+	}
+	dir := filepath.Join(t.TempDir(), "tpl")
+	ro := filepath.Join(dir, "ro")
+	_ = os.MkdirAll(ro, 0o755)
+	_ = os.WriteFile(filepath.Join(dir, versionFile), []byte("old\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(ro, "stale.yaml"), []byte("old"), 0o644)
+	if err := os.Chmod(ro, 0o555); err != nil { // its file cannot be deleted
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { // let t.TempDir remove the leftover
+		matches, _ := filepath.Glob(filepath.Join(filepath.Dir(dir), ".tpl.old-*", "ro"))
+		for _, m := range append(matches, ro) {
+			_ = os.Chmod(m, 0o755)
+		}
+	})
+
+	s := serveArchive(t, http.StatusOK, templatesZip(t))
+	var warn bytes.Buffer
+	o := opts(dir, s)
+	o.Warn = &warn
+	_, version, err := Update(context.Background(), o)
+	if err != nil {
+		t.Fatalf("the update was applied but reported as failed: %v", err)
+	}
+	mustExist(t, filepath.Join(dir, "web", "x", "contract.yaml"))
+	if Version(dir) != version {
+		t.Fatalf("Version = %q, want %q", Version(dir), version)
+	}
+	sib := siblings(t, dir)
+	if len(sib) != 1 || !strings.HasPrefix(sib[0], ".tpl.old-") {
+		t.Fatalf("want the one leftover .old tree, got %v", sib)
+	}
+	if w := warn.String(); !strings.Contains(w, "warning:") || !strings.Contains(w, sib[0]) {
+		t.Fatalf("warning should name the leftover: %q", w)
+	}
+}
+
+// #94 item 4: a symlinked templates directory is updated through the link:
+// the directory it points to is replaced and the link is kept.
+func TestUpdateThroughSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks need privileges on Windows")
+	}
+	data := t.TempDir()
+	real := filepath.Join(data, "tpl")
+	_ = os.MkdirAll(real, 0o755)
+	_ = os.WriteFile(filepath.Join(real, versionFile), []byte("old\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(real, "stale.yaml"), []byte("old"), 0o644)
+	home := t.TempDir()
+	link := filepath.Join(home, "vulnsuite-templates")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	s := serveArchive(t, http.StatusOK, templatesZip(t))
+	got, _, err := Update(context.Background(), opts(link, s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != link {
+		t.Fatalf("dir = %q, want the link %q", got, link)
+	}
+	if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("the link must be kept: %v %v", fi, err)
+	}
+	if dest, _ := os.Readlink(link); dest != real {
+		t.Fatalf("link points to %q, want %q", dest, real)
+	}
+	mustExist(t, filepath.Join(real, "web", "x", "contract.yaml"))
+	if _, err := os.Stat(filepath.Join(real, "stale.yaml")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("the target should have been replaced")
+	}
+	if sib := siblings(t, real); len(sib) != 0 {
+		t.Fatalf("leftovers next to the target: %v", sib)
+	}
+	if sib := siblings(t, link); len(sib) != 0 {
+		t.Fatalf("leftovers next to the link: %v", sib)
+	}
+
+	// A link that does not resolve is refused, not replaced.
+	dangling := filepath.Join(home, "dangling")
+	_ = os.Symlink(filepath.Join(data, "missing"), dangling)
+	if _, _, err := Update(context.Background(), opts(dangling, s)); err == nil || !strings.Contains(err.Error(), "does not resolve") {
+		t.Fatalf("dangling link: %v", err)
+	}
+	if fi, err := os.Lstat(dangling); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("the dangling link must be left alone")
 	}
 }

@@ -50,6 +50,26 @@ func readFile(t *testing.T, path string) string {
 	return string(data)
 }
 
+// checkRequiresCause checks that the requires skip of bbb-windows-only names
+// its cause and what the host lacks (#119 item 4), and that no other skip
+// carries a cause.
+func checkRequiresCause(t *testing.T, skipped []outcomeEntry, out string) {
+	t.Helper()
+	for _, e := range skipped {
+		switch {
+		case e.ID == "bbb-windows-only":
+			if e.Cause != "host_os" || strings.Join(e.Missing, ",") != "windows" || e.Detail == "" {
+				t.Fatalf("requires skip without its cause: %+v\n%s", e, out)
+			}
+		case e.Cause != "" || e.Missing != nil:
+			t.Fatalf("a %s skip carries a cause: %+v", e.Reason, e)
+		}
+	}
+	if !strings.Contains(out, `"cause": "host_os"`) || !strings.Contains(out, `"missing": [`) {
+		t.Fatalf("cause/missing not in the JSON:\n%s", out)
+	}
+}
+
 func reasons(es []outcomeEntry) map[string]string {
 	m := map[string]string{}
 	for _, e := range es {
@@ -94,6 +114,7 @@ func TestRunJSONSummary(t *testing.T) {
 			}
 		}
 	}
+	checkRequiresCause(t, sum.Skipped, out)
 
 	// Without the cap: ddd-fails is a start failure, the run exits 1, and the
 	// summary is still printed.
@@ -184,6 +205,7 @@ func TestBuildJSONSummary(t *testing.T) {
 	if got := reasons(sum.Skipped); len(got) != 2 || got["bbb-windows-only"] != reasonRequires || got["fff-vuln-only"] != reasonNoState {
 		t.Fatalf("skipped: %v\n%s", got, out)
 	}
+	checkRequiresCause(t, sum.Skipped, out)
 
 	fe = enginetest.New() // the image is not local, so it must be pulled
 	fe.FailPull = true

@@ -24,6 +24,9 @@ func TestFilterValuesAreValidated(t *testing.T) {
 		{"-since", "2023/01/01", `-since wants an ISO date`},
 		{"-since", "2023-1-1", `-since wants an ISO date`},
 		{"-since", "2023-02-30", `-since wants an ISO date`},
+		{"-arch", "amd46", `unknown -arch "amd46"`},
+		{"-category", "web-app", `unknown -category "web-app"; the templates directory has databases, exposures, iot, web-apps, web-servers`},
+		{"-product", "web-app", `unknown -category "web-app"`},
 	}
 	for _, cmd := range []string{"list", "run", "build"} {
 		for _, b := range bad {
@@ -42,6 +45,7 @@ func TestFilterValuesAreValidated(t *testing.T) {
 	for _, args := range [][]string{
 		{"-fidelity", "real"}, {"-fidelity", "simulated"},
 		{"-year", "2021"}, {"-since", "2023-01-01"},
+		{"-arch", "arm64"}, {"-arch", "loong64"}, {"-category", "web-apps"},
 	} {
 		if code, out, errOut := run(t, nil, append([]string{"-json", "-T", root, "list"}, args...)...); code != ExitOK {
 			t.Fatalf("list %v: %d\n%s\n%s", args, code, out, errOut)
@@ -70,6 +74,11 @@ func TestSelectorFileErrorsNameFileLine(t *testing.T) {
 	code, _, errOut := run(t, enginetest.New(), "-T", root, "build", "-f", f)
 	if code != ExitUsage || !strings.Contains(errOut, f+`:2: unknown -fidelity "reel"`) {
 		t.Fatalf("build -f bad filter line: exit %d\n%s", code, errOut)
+	}
+	writeFile(t, f, "grafana\n-category web-app\n")
+	code, _, errOut = run(t, enginetest.New(), "-T", root, "build", "-f", f)
+	if code != ExitUsage || !strings.Contains(errOut, f+`:2: unknown -category "web-app"`) {
+		t.Fatalf("build -f bad category line: exit %d\n%s", code, errOut)
 	}
 	writeFile(t, f, "\n\n-nope\n")
 	code, _, errOut = run(t, enginetest.New(), "-T", root, "build", "-f", f)
@@ -100,4 +109,36 @@ func copyTemplates(t *testing.T, src string) string {
 		t.Fatal(fmt.Errorf("copy templates: %w", err))
 	}
 	return dst
+}
+
+// #95: an explicit scanner directory that is not a directory is a usage
+// error, not a silent fallback to $NUCLEI_TEMPLATES or ~/nuclei-templates.
+func TestScannerDirFlagsMustBeDirectories(t *testing.T) {
+	isolateHome(t)
+	t.Setenv("NUCLEI_TEMPLATES", "")
+	root := fixtures(t)
+	missing := filepath.Join(t.TempDir(), "no-such-dir")
+	file := filepath.Join(t.TempDir(), "file.yaml")
+	writeFile(t, file, "id: x\n")
+	cases := [][]string{
+		{"info", "-nuclei-templates", missing, "grafana"},
+		{"info", "-nuclei-templates", file, "grafana"},
+		{"validate", "-allow-unpinned", "-nuclei-templates", missing},
+		{"validate", "-allow-unpinned", "-nmap-scripts", file},
+		{"run", "-t", "grafana", "-detach", "-no-verify", "-nuclei-templates", missing},
+	}
+	for _, args := range cases {
+		code, out, errOut := run(t, enginetest.New(), append([]string{"-T", root}, args...)...)
+		flagName := "-nuclei-templates "
+		if strings.Contains(strings.Join(args, " "), "-nmap-scripts") {
+			flagName = "-nmap-scripts "
+		}
+		if code != ExitUsage || !strings.Contains(errOut, flagName) {
+			t.Fatalf("%v: exit %d, want %d\nstdout: %s\nstderr: %s", args, code, ExitUsage, out, errOut)
+		}
+	}
+	// A real directory is accepted.
+	if code, out, errOut := run(t, nil, "-T", root, "info", "-nuclei-templates", t.TempDir(), "grafana"); code != ExitOK {
+		t.Fatalf("info with an empty checkout: %d\n%s\n%s", code, out, errOut)
+	}
 }

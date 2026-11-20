@@ -346,3 +346,38 @@ func TestBareInvocationHelpOnStderr(t *testing.T) {
 		t.Fatalf("help: %d %s", code, out)
 	}
 }
+
+// #94 item 5: run -json prints its array on early failures too (here: a
+// template fails to load, and nothing comes up), so a pipeline always gets
+// JSON; the exit code still says it failed.
+func TestRunJSONOnEarlyFailure(t *testing.T) {
+	root, _ := brokenFixtures(t)
+	fe := enginetest.New()
+	code, out, errOut := run(t, fe, "-json", "-T", root, "run", "-t", "grafana", "-detach", "-no-verify", "-ready-timeout", "1s")
+	var handles []map[string]any
+	if code != ExitFail || json.Unmarshal([]byte(out), &handles) != nil || handles == nil || len(handles) != 0 {
+		t.Fatalf("run -json with a load error: %d\nstdout: %q\nstderr: %s", code, out, errOut)
+	}
+
+	fe = enginetest.New()
+	fe.FailPull = true // grafana is an image base: nothing comes up
+	code, out, errOut = run(t, fe, "-json", "-T", fixtures(t), "run", "-t", "grafana", "-detach", "-no-verify", "-ready-timeout", "1s")
+	handles = nil
+	if code != ExitFail || !strings.Contains(errOut, "nothing came up") || json.Unmarshal([]byte(out), &handles) != nil || handles == nil || len(handles) != 0 {
+		t.Fatalf("run -json with nothing up: %d\nstdout: %q\nstderr: %s", code, out, errOut)
+	}
+}
+
+// #94 item 5: targets -json prints [] with nothing running, like ps -json.
+func TestTargetsJSONWithNothingRunning(t *testing.T) {
+	code, out, errOut := run(t, enginetest.New(), "-json", "-T", fixtures(t), "targets")
+	var pairs []map[string]string
+	if code != ExitFail || json.Unmarshal([]byte(out), &pairs) != nil || pairs == nil || len(pairs) != 0 {
+		t.Fatalf("targets -json: %d\nstdout: %q\nstderr: %s", code, out, errOut)
+	}
+	// A usage error still prints no JSON.
+	code, out, _ = run(t, enginetest.New(), "-json", "-T", fixtures(t), "targets", "-by", "bogus")
+	if code != ExitUsage || out != "" {
+		t.Fatalf("targets -json -by bogus: %d %q", code, out)
+	}
+}

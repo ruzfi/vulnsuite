@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
@@ -53,7 +54,39 @@ const (
 	// LabelSidecarNetwork names the private network a target state shares with
 	// its sidecars (only set when the template has sidecars).
 	LabelSidecarNetwork = "dev.vulnsuite.sidecar_network"
+	// LabelPorts records the ports a target publishes to a scanner, primary
+	// first, as "3000/http,8443/https,5432" (no scheme: raw TCP), so `targets`
+	// can address a running target without its template (FormatPortsLabel).
+	LabelPorts = "dev.vulnsuite.ports"
 )
+
+// FormatPortsLabel renders published ports as the LabelPorts value.
+func FormatPortsLabel(ports []contract.Port) string {
+	parts := make([]string, 0, len(ports))
+	for _, p := range ports {
+		v := strconv.Itoa(p.Container)
+		if s := p.Scheme(); s != "" {
+			v += "/" + s
+		}
+		parts = append(parts, v)
+	}
+	return strings.Join(parts, ",")
+}
+
+// ParsePortsLabel reads a LabelPorts value back as container ports with their
+// schemes, in order. Malformed entries are skipped.
+func ParsePortsLabel(v string) []PublishedPort {
+	out := []PublishedPort{}
+	for _, part := range strings.Split(v, ",") {
+		port, scheme, _ := strings.Cut(strings.TrimSpace(part), "/")
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			continue
+		}
+		out = append(out, PublishedPort{ContainerPort: n, Scheme: scheme})
+	}
+	return out
+}
 
 // Container roles.
 const (
@@ -295,6 +328,10 @@ type Options struct {
 	// capabilities. Off by default: those are host-access primitives and
 	// templates are untrusted, so the user must opt in per run.
 	AllowHostAccess bool
+	// IgnoreRequires skips the template's requires.probe (-ignore-requires).
+	// Otherwise the probe runs once the image is resolved, before anything
+	// starts, and a failing probe makes Run return a *SkipError.
+	IgnoreRequires bool
 }
 
 // safeCaps are capabilities benign enough to add without host-access consent.
@@ -378,6 +415,17 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 	if err != nil {
 		return nil, err
 	}
+	// requires.probe needs the image, so it runs here: after the image is
+	// resolved, before any container, sidecar or network of the target.
+	if c.Requires.Probe != nil && !opts.IgnoreRequires {
+		d, err := RequiresProbe(ctx, r.Engine, c, state, img.Ref, opts.Build.Platform)
+		if err != nil {
+			return nil, err
+		}
+		if d.Skip() {
+			return nil, &SkipError{ID: c.ID(), Decision: d}
+		}
+	}
 	name := c.ContainerName(state)
 	port := c.Service.PrimaryPort()
 	alias := TargetAlias(c.ID(), state)
@@ -393,6 +441,11 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 	}
 	for _, sc := range c.Service.Sidecars {
 		if err := r.Engine.ContainerRemove(ctx, SidecarContainerName(c.ID(), state, sc.Name)); err != nil {
+			return nil, err
+		}
+	}
+	if scNet != "" {
+		if err := r.clearSidecarNetwork(ctx, scNet); err != nil {
 			return nil, err
 		}
 	}
@@ -423,6 +476,7 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 	if scNet != "" {
 		spec.Labels[LabelSidecarNetwork] = scNet
 	}
+	spec.Labels[LabelPorts] = FormatPortsLabel(c.Service.HostPublishPorts())
 	for _, d := range c.Service.Devices {
 		spec.Devices = append(spec.Devices, engine.Device{PathOnHost: d, PathInContainer: d})
 	}
@@ -449,8 +503,13 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 	primaryNet := ""
 	switch exp.Mode {
 	case ModeInternal:
-		if _, err := r.Engine.NetworkEnsure(ctx, engine.NetworkSpec{Name: exp.Network, Internal: exp.Internal}); err != nil {
-			return nil, fmt.Errorf("network %s: %w", exp.Network, err)
+		stop := "vulnsuite stop -prune-net"
+		if exp.Network != DefaultNetwork {
+			stop = "vulnsuite stop -network " + exp.Network + " -prune-net"
+		}
+		if err := r.ensureNetwork(ctx, engine.NetworkSpec{Name: exp.Network, Internal: exp.Internal},
+			fmt.Sprintf("stop the targets on it and remove it with %q (or \"docker network rm %s\"), or pick another network with -network", stop, exp.Network)); err != nil {
+			return nil, err
 		}
 		primaryNet = exp.Network
 		spec.Network = &engine.NetworkAttachment{Name: exp.Network, Aliases: []string{alias}}
@@ -474,10 +533,9 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 			spec.Ports = append(spec.Ports, engine.PortBinding{HostIP: exp.Bind, HostPort: hp, ContainerPort: pp.Container, Protocol: "tcp"})
 			h.PublishedPorts = append(h.PublishedPorts, PublishedPort{ContainerPort: pp.Container, HostIP: exp.Bind, HostPort: hp, Scheme: pp.Scheme()})
 			if i == 0 {
-				h.EndpointHost, h.EndpointPort = exp.Bind, hp
-				if exp.Bind == "0.0.0.0" {
-					h.EndpointHost = "127.0.0.1"
-				}
+				// A wildcard bind (0.0.0.0 or ::) is dialled via loopback, as
+				// every other published port is (portAddress).
+				h.EndpointHost, h.EndpointPort = normalizeHostIP(exp.Bind), hp
 			}
 		}
 		primaryNet = "bridge"
@@ -489,10 +547,10 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 			return nil, errors.New("macvlan exposure needs --parent <host interface>")
 		}
 		netName := "vulnsuite-macvlan-" + exp.Parent
-		if _, err := r.Engine.NetworkEnsure(ctx, engine.NetworkSpec{
+		if err := r.ensureNetwork(ctx, engine.NetworkSpec{
 			Name: netName, Driver: "macvlan", Options: map[string]string{"parent": exp.Parent},
 			Subnet: exp.Subnet, Gateway: exp.Gateway,
-		}); err != nil {
+		}, fmt.Sprintf("stop the targets on it and remove it with \"vulnsuite stop -network %s -prune-net\" (or \"docker network rm %s\"), or run with its -subnet and -gateway", netName, netName)); err != nil {
 			return nil, fmt.Errorf("macvlan network: %w", err)
 		}
 		primaryNet = netName
@@ -521,13 +579,11 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 		return nil, err
 	}
 	// The sidecar network: target state and its sidecars only. Any stale copy
-	// (its containers were removed above) is replaced so its settings match
-	// this run's exposure.
+	// was removed above, so it is created afresh with this run's settings.
 	var targetExtraNet *engine.NetworkAttachment
 	if scNet != "" {
-		_ = r.Engine.NetworkRemove(ctx, scNet)
-		if _, err := r.Engine.NetworkEnsure(ctx, scSpec); err != nil {
-			return fail(fmt.Errorf("network %s: %w", scNet, err))
+		if err := r.ensureNetwork(ctx, scSpec, "another run of this target state may have recreated it; stop it and run again"); err != nil {
+			return fail(err)
 		}
 		att := engine.NetworkAttachment{Name: scNet, Aliases: []string{c.ID(), alias}}
 		if spec.Network == nil {
@@ -685,6 +741,104 @@ func (r *Runner) cleanup(ctx context.Context, container string, sidecars []strin
 	return errors.Join(errs...)
 }
 
+// ensureNetwork creates the network spec names, or checks that the existing one
+// has the settings spec asks for. NetworkEnsure keeps an existing network as it
+// is, so without this check a -no-egress run would join a network with egress
+// (created by an earlier run without the flag) and the target could reach the
+// internet. A mismatch is an error naming what differs and remedy, the way out.
+func (r *Runner) ensureNetwork(ctx context.Context, spec engine.NetworkSpec, remedy string) error {
+	n, err := r.Engine.NetworkEnsure(ctx, spec)
+	if err != nil {
+		return fmt.Errorf("network %s: %w", spec.Name, err)
+	}
+	if diffs := networkMismatch(spec, n); len(diffs) > 0 {
+		return fmt.Errorf("network %s already exists with other settings than this run needs: %s; %s",
+			spec.Name, strings.Join(diffs, "; "), remedy)
+	}
+	return nil
+}
+
+// networkMismatch lists how the network n differs from spec. Subnet and gateway
+// are compared only when spec sets them (the daemon picks them otherwise).
+func networkMismatch(spec engine.NetworkSpec, n engine.Network) []string {
+	var diffs []string
+	want := spec.Driver
+	if want == "" {
+		want = "bridge"
+	}
+	if n.Driver != want {
+		diffs = append(diffs, fmt.Sprintf("its driver is %q, not %q", n.Driver, want))
+	}
+	switch {
+	case spec.Internal && !n.Internal:
+		diffs = append(diffs, "it has egress (a route off the host), but -no-egress needs an internal network")
+	case !spec.Internal && n.Internal:
+		diffs = append(diffs, "it is internal (no egress, created with -no-egress), but this run asks for egress")
+	}
+	keys := make([]string, 0, len(spec.Options))
+	for k := range spec.Options {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if got := n.Options[k]; got != spec.Options[k] {
+			diffs = append(diffs, fmt.Sprintf("its %s is %q, not %q", k, got, spec.Options[k]))
+		}
+	}
+	if spec.Subnet != "" && !samePrefix(spec.Subnet, n.Subnet) {
+		diffs = append(diffs, fmt.Sprintf("its subnet is %q, not %q", n.Subnet, spec.Subnet))
+	}
+	if spec.Gateway != "" && !sameAddr(spec.Gateway, n.Gateway) {
+		diffs = append(diffs, fmt.Sprintf("its gateway is %q, not %q", n.Gateway, spec.Gateway))
+	}
+	return diffs
+}
+
+func samePrefix(a, b string) bool {
+	pa, errA := netip.ParsePrefix(a)
+	pb, errB := netip.ParsePrefix(b)
+	if errA != nil || errB != nil {
+		return a == b
+	}
+	return pa.Masked() == pb.Masked()
+}
+
+func sameAddr(a, b string) bool {
+	aa, errA := netip.ParseAddr(a)
+	ab, errB := netip.ParseAddr(b)
+	if errA != nil || errB != nil {
+		return a == b
+	}
+	return aa == ab
+}
+
+// clearSidecarNetwork removes the sidecar network an earlier run of this state
+// left behind, so the run creates it afresh with its own settings. NetworkEnsure
+// keeps an existing network as it is, and a stale one may differ from what this
+// run needs: an internal network left by a -no-egress run cannot publish ports
+// in host mode. Every managed container labelled with the network goes first,
+// including sidecars the template no longer declares (renamed or dropped since):
+// they would keep the network attached and impossible to remove. A network that
+// still cannot be removed is an error, not silently reused.
+func (r *Runner) clearSidecarNetwork(ctx context.Context, scNet string) error {
+	rows, err := r.Engine.ContainerList(ctx, true, contract.ContainerNamePrefix)
+	if err != nil {
+		return fmt.Errorf("list containers on network %s: %w", scNet, err)
+	}
+	for _, row := range rows {
+		if row.Labels[LabelManaged] != "true" || row.Labels[LabelSidecarNetwork] != scNet {
+			continue
+		}
+		if err := r.Engine.ContainerRemove(ctx, row.Name); err != nil {
+			return fmt.Errorf("remove %s from stale network %s: %w", row.Name, scNet, err)
+		}
+	}
+	if err := r.Engine.NetworkRemove(ctx, scNet); err != nil {
+		return fmt.Errorf("remove stale network %s (a container vulnsuite did not start may still be attached): %w", scNet, err)
+	}
+	return nil
+}
+
 // startSidecars starts the state's sidecars on the private network scNet,
 // each resolvable there under its template name. They run on the target's
 // platform: a stack that needs emulation is emulated as a whole. It returns
@@ -695,7 +849,11 @@ func (r *Runner) startSidecars(ctx context.Context, c *contract.Contract, st *co
 	for _, sc := range c.Service.Sidecars {
 		name := SidecarContainerName(c.ID(), state, sc.Name)
 		ref := st.SidecarRef(sc)
-		if exists, _ := r.Engine.ImageExists(ctx, ref, platform); !exists {
+		if st.BuildsSidecar(sc) {
+			// Built (or reused) with the target's image by Builder.Resolve;
+			// a local tag, never pulled.
+			ref = c.SidecarTag(sc)
+		} else if exists, _ := r.Engine.ImageExists(ctx, ref, platform); !exists {
 			if err := r.Engine.ImagePull(ctx, ref, platform, nil); err != nil {
 				return names, fmt.Errorf("sidecar %s: %w", sc.Name, err)
 			}
@@ -766,8 +924,8 @@ func isLoopbackHost(host string) bool {
 
 // probeFromHereFutile reports that no probe run on this machine can reach the
 // target: host mode on a remote daemon that published the port on the daemon
-// host's loopback (default -bind 127.0.0.1, or -bind 0.0.0.0 which we dial as
-// 127.0.0.1). The port lives on the daemon's host, not here.
+// host's loopback (default -bind 127.0.0.1, or a wildcard -bind 0.0.0.0 / ::
+// which we dial as 127.0.0.1). The port lives on the daemon's host, not here.
 func probeFromHereFutile(h *Handle) bool {
 	return h.Exposure.Mode == ModeHost && h.DaemonRemote && isLoopbackHost(h.EndpointHost)
 }
@@ -894,22 +1052,16 @@ func (r *Runner) watchExit(ctx context.Context, container string, exited chan<- 
 
 func (r *Runner) waitReady(ctx context.Context, c *contract.Contract, h *Handle, timeout time.Duration) {
 	hc := c.Service.Healthcheck
-	running := func() bool {
-		det, err := r.Engine.ContainerInspect(ctx, h.Container)
-		return err == nil && det.Running
-	}
 	host, port := r.probeAddress(h, c)
 	if host == "" {
-		// Cannot reach it from here; the engine says whether it's running.
-		sleepCtx(ctx, 2*time.Second)
-		h.Ready = running()
+		// Cannot reach it from here: run the healthcheck inside the target.
+		h.Ready = r.waitReadyInside(ctx, c, h, time.Now().Add(timeout))
 		return
 	}
 	if probeFromHereFutile(h) {
 		// A remote daemon's loopback-published port never comes up here; don't
 		// burn the whole healthcheck timeout against it. verify explains.
-		sleepCtx(ctx, time.Second)
-		h.Ready = running()
+		h.Ready = r.waitReadyInside(ctx, c, h, time.Now().Add(timeout))
 		return
 	}
 	{
@@ -917,7 +1069,7 @@ func (r *Runner) waitReady(ctx context.Context, c *contract.Contract, h *Handle,
 		// remote daemon publishes host ports on its own machine. A connection
 		// that is *refused* means the address is routable and the service just
 		// isn't up yet; a timeout / no-route means we can't reach it from here at
-		// all, so don't sit through the whole healthcheck.
+		// all, so check from inside the target instead.
 		reach := r.Reach
 		if reach == nil {
 			reach = probes.Reachability
@@ -928,7 +1080,7 @@ func (r *Runner) waitReady(ctx context.Context, c *contract.Contract, h *Handle,
 				if h.Exposure.Mode != ModeHost {
 					h.IP = "" // verify will explain instead of failing
 				}
-				h.Ready = running()
+				h.Ready = r.waitReadyInside(ctx, c, h, time.Now().Add(timeout))
 				return
 			}
 		}
@@ -957,6 +1109,97 @@ func (r *Runner) waitReady(ctx context.Context, c *contract.Contract, h *Handle,
 	default:
 		h.Ready = probes.WaitForPort(ctx, host, port, time.Until(deadline))
 	}
+}
+
+// Exit codes of the in-container healthcheck scripts.
+const (
+	insideReady    = 0
+	insideNotReady = 1
+	insideCannot   = 3 // the script cannot tell (no /proc/net/tcp)
+)
+
+// insidePoll is how often the in-container healthcheck runs.
+var insidePoll = 500 * time.Millisecond
+
+// waitReadyInside runs the healthcheck from inside the target's own network
+// namespace, for a target this machine cannot reach (internal mode on Docker
+// Desktop/OrbStack, macvlan, a remote daemon). Without it the target would be
+// ready as soon as it runs, and seeds would race the service's startup.
+//
+// A tcp (or default) healthcheck passes once something listens on the port,
+// read from /proc/net/tcp{,6} with POSIX sh builtins only, so it works in any
+// image with a shell. An http healthcheck uses curl when the image has it and
+// otherwise falls back to the listening check. An image the check cannot run in
+// (no shell, no /proc/net/tcp) gets the old answer: ready once it is running.
+func (r *Runner) waitReadyInside(ctx context.Context, c *contract.Contract, h *Handle, deadline time.Time) bool {
+	hc := c.Service.Healthcheck
+	port := c.Service.PrimaryPort().Container
+	if hc.TCP != nil && hc.TCP.Port != 0 {
+		port = hc.TCP.Port
+	}
+	cmd := listenScript(port)
+	if hc.HTTP != nil && h.Scheme != "" {
+		cmd = httpScript(h.Scheme, port, hc.HTTP.Path, hc.HTTP.Status)
+	}
+	running := func() bool {
+		det, err := r.Engine.ContainerInspect(ctx, h.Container)
+		return err == nil && det.Running
+	}
+	for first := true; ; first = false {
+		// At least one attempt, however short the timeout.
+		left := time.Until(deadline)
+		if (left <= 0 && !first) || ctx.Err() != nil {
+			return false
+		}
+		code, _, err := r.Engine.ContainerExec(ctx, h.Container, cmd, min(10*time.Second, max(left, 5*time.Second)))
+		switch {
+		case ctx.Err() != nil:
+			return false
+		case err == nil && code == insideReady:
+			return true
+		case err == nil && code == insideNotReady:
+			// not up yet
+		case err != nil && !running():
+			// Not started yet, or exited (the exit watcher then cancels ctx).
+		default:
+			// No shell (exec error, 126/127) or nothing to read: the check
+			// cannot run in this image.
+			return running()
+		}
+		sleepCtx(ctx, insidePoll)
+	}
+}
+
+// listenScript exits 0 when a TCP socket listens on port in the namespace it
+// runs in (state 0A in /proc/net/tcp or tcp6), 1 when none does, and 3 when
+// neither file can be read. POSIX sh builtins only: no cat, grep or awk.
+func listenScript(port int) string {
+	return fmt.Sprintf(`p=%04X; seen=; for f in /proc/net/tcp /proc/net/tcp6; do [ -r "$f" ] || continue; seen=1; `+
+		`while read -r _ l _ st _; do [ "$st" = 0A ] && [ "${l##*:}" = "$p" ] && exit 0; done < "$f"; done; `+
+		`[ -n "$seen" ] || exit 3; exit 1`, port)
+}
+
+// httpScript runs an http healthcheck with curl from inside the target, or the
+// listening check when the image has no curl. want 0 accepts any status.
+func httpScript(scheme string, port int, path string, want int) string {
+	if path == "" {
+		path = "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	url := fmt.Sprintf("%s://127.0.0.1:%d%s", scheme, port, path)
+	ok := `[ "$s" != 000 ]`
+	if want != 0 {
+		ok = fmt.Sprintf(`[ "$s" = %d ]`, want)
+	}
+	return fmt.Sprintf(`if command -v curl >/dev/null 2>&1; then s=$(curl -sk -o /dev/null -w '%%{http_code}' --max-time 5 %s); `+
+		`%s && exit 0; exit 1; fi; %s`, shellQuote(url), ok, listenScript(port))
+}
+
+// shellQuote quotes s as one sh word.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // sleepCtx sleeps for d or until ctx ends.
@@ -992,30 +1235,17 @@ func (r *Runner) runProbes(ctx context.Context, c *contract.Contract, st *contra
 		h.VerifyDetail = "no verify probes declared"
 		return
 	}
-	host, port := r.probeAddress(h, c)
-	if host == "" {
-		h.VerifyDetail = fmt.Sprintf("could not verify from this host in %s mode: the target's address lives on the Docker daemon's network, "+
-			"not this machine's (normal on Docker Desktop/OrbStack and macvlan, and whenever the daemon is remote). "+
-			"The target is up; scan it from a container on the same network, or use --expose host.", h.Exposure.Mode)
+	exec := func(ctx context.Context, container, command string, timeout time.Duration) (int, string, error) {
+		return r.Engine.ContainerExec(ctx, container, command, timeout)
+	}
+	seq := r.sequenceFunc(c, h, exec)
+	tgt, why := r.networkTarget(c, h, exec)
+	if why != "" {
+		r.runExecProbesOnly(ctx, st, h, probes.Target{Container: h.Container, Exec: exec, Sequence: seq}, why)
 		return
 	}
-	if probeFromHereFutile(h) {
-		// The probe address resolves to our own loopback but the daemon, and so
-		// the target, is elsewhere. Report it as unreachable-from-here, not as a
-		// wrong state, and name the flag that fixes it.
-		h.VerifyDetail = remoteProbeHint(h)
-		return
-	}
-	scheme := h.Scheme
-	if scheme == "" {
-		scheme = "http"
-	}
-	ok, results := probes.RunAll(ctx, st.Verify, probes.Target{
-		Host: host, Port: port, Scheme: scheme, Container: h.Container, PortMap: hostPortMap(h),
-		Exec: func(ctx context.Context, container, command string, timeout time.Duration) (int, string, error) {
-			return r.Engine.ContainerExec(ctx, container, command, timeout)
-		},
-	})
+	tgt.Sequence = seq
+	ok, results := probes.RunAll(ctx, st.Verify, tgt)
 	if h.DaemonRemote && allTransportFailures(results) {
 		// Every probe failed to connect and the daemon is remote: the bound
 		// address isn't reachable from here, which is an addressing problem, not
@@ -1027,6 +1257,71 @@ func (r *Runner) runProbes(ctx context.Context, c *contract.Contract, st *contra
 	h.VerifyOK = &ok
 	h.Probes = results
 	h.VerifyDetail = probes.FormatResults(results)
+}
+
+// networkTarget is where network probes reach the target from this machine,
+// or, when they cannot, why not (in which case the target is zero).
+func (r *Runner) networkTarget(c *contract.Contract, h *Handle, exec probes.ExecFunc) (probes.Target, string) {
+	host, port := r.probeAddress(h, c)
+	if host == "" {
+		return probes.Target{}, fmt.Sprintf("could not verify from this host in %s mode: the target's address lives on the Docker daemon's network, "+
+			"not this machine's (normal on Docker Desktop/OrbStack and macvlan, and whenever the daemon is remote). "+
+			"The target is up; scan it from a container on the same network, or use --expose host.", h.Exposure.Mode)
+	}
+	if probeFromHereFutile(h) {
+		// The probe address resolves to our own loopback but the daemon, and so
+		// the target, is elsewhere. Report it as unreachable-from-here, not as a
+		// wrong state, and name the flag that fixes it.
+		return probes.Target{}, remoteProbeHint(h)
+	}
+	scheme := h.Scheme
+	if scheme == "" {
+		scheme = "http"
+	}
+	return probes.Target{
+		Host: host, Port: port, Scheme: scheme, Schemes: portSchemes(c), Container: h.Container, PortMap: hostPortMap(h),
+		Exec: exec,
+	}, ""
+}
+
+// runExecProbesOnly verifies a target this machine cannot reach. exec and
+// sequence probes need no network path (they run through the engine and on
+// the private sidecar network), so they run; the network probes are skipped
+// and why says why. A failed exec or sequence probe fails verify. When every
+// probe is one of those and all pass, verify passes; when network probes were
+// skipped, the result is partial and VerifyOK stays nil (not verified), with
+// the in-container results in the detail.
+func (r *Runner) runExecProbesOnly(ctx context.Context, st *contract.State, h *Handle, tgt probes.Target, why string) {
+	var execs []contract.Probe
+	for _, p := range st.Verify {
+		if k := p.Kind(); k == "exec" || k == "sequence" {
+			execs = append(execs, p)
+		}
+	}
+	if len(execs) == 0 {
+		h.VerifyDetail = why
+		return
+	}
+	ok, results := probes.RunAll(ctx, execs, tgt)
+	h.Probes = results
+	h.VerifyDetail = probes.FormatResults(results)
+	skipped := len(st.Verify) - len(execs)
+	if skipped > 0 {
+		h.VerifyDetail += fmt.Sprintf("\nskip %d network probe(s): %s", skipped, why)
+	}
+	if !ok || skipped == 0 {
+		h.VerifyOK = &ok
+	}
+}
+
+// portSchemes is the scheme of every declared container port ("" for raw TCP),
+// so a probe naming a port speaks that port's protocol.
+func portSchemes(c *contract.Contract) map[int]string {
+	m := make(map[int]string, len(c.Service.Ports))
+	for _, p := range c.Service.Ports {
+		m[p.Container] = p.Scheme()
+	}
+	return m
 }
 
 // hostPortMap is container port -> host port for every published port in host
@@ -1056,8 +1351,13 @@ type Target struct {
 	HostPort  int    `json:"host_port,omitempty"`
 	// Ports is every published port's host binding (host mode), by ascending
 	// container port. HostIP/HostPort above mirror the first. Scheme is unset
-	// here (the daemon doesn't know it); callers fill it from the template.
+	// here (the daemon doesn't know it); see Published.
 	Ports []PublishedPort `json:"ports,omitempty"`
+	// Published is the ports the target publishes to a scanner with their
+	// schemes, primary first, as recorded on the container at run time
+	// (LabelPorts). Nil for containers started before vulnsuite recorded them:
+	// callers then fall back to the template.
+	Published []PublishedPort `json:"published_ports,omitempty"`
 }
 
 // fleetMember classifies a listed container: whether vulnsuite manages it,
@@ -1104,6 +1404,9 @@ func (r *Runner) Running(ctx context.Context, network string) ([]Target, error) 
 			continue
 		}
 		t := Target{ID: id, State: state, Container: row.Name, Status: row.Status, Image: row.Image}
+		if v, ok := row.Labels[LabelPorts]; ok {
+			t.Published = ParsePortsLabel(v)
+		}
 		if det, err := r.Engine.ContainerInspect(ctx, row.Name); err == nil {
 			prefer := row.Labels[LabelNetwork]
 			if _, ok := det.IPs[prefer]; !ok || prefer == "" {
@@ -1262,11 +1565,7 @@ func assignedHostPorts(h *Handle, det *engine.ContainerDetail) error {
 }
 
 func assertPortFree(bind string, port int) error {
-	host := bind
-	if host == "0.0.0.0" || host == "" {
-		host = "127.0.0.1"
-	}
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), time.Second)
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(normalizeHostIP(bind), strconv.Itoa(port)), time.Second)
 	if err == nil {
 		conn.Close()
 		return fmt.Errorf("port %d is already in use on %s; pick another with --host-port, or use --expose internal (one host port serves one target)", port, bind)

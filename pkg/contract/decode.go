@@ -3,11 +3,15 @@ package contract
 import (
 	"errors"
 	"fmt"
+	"path"
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/goccy/go-yaml"
+	"github.com/goccy/go-yaml/ast"
+	"github.com/goccy/go-yaml/parser"
 )
 
 // Command accepts either a YAML string or a list of strings.
@@ -50,6 +54,7 @@ type rawService struct {
 	CapAdd      []string          `yaml:"cap_add,omitempty"`
 	CapDrop     []string          `yaml:"cap_drop,omitempty"`
 	Devices     []string          `yaml:"devices,omitempty"`
+	Sanitizer   *Sanitizer        `yaml:"sanitizer,omitempty"`
 }
 
 type rawState struct {
@@ -81,13 +86,19 @@ func (e *SchemaError) Error() string { return fmt.Sprintf("schema: %s: %s", e.Lo
 var (
 	// idRe is a valid Docker repository path component (no leading, trailing
 	// or doubled separators); idMinLen/idMaxLen bound it as the schema does.
-	idRe      = regexp.MustCompile(`^[a-z0-9]+([.-][a-z0-9]+)*$`)
-	vulnRefRe = regexp.MustCompile(`^(CVE-\d{4}-\d{4,7}|GHSA-[a-z0-9-]+|[A-Z]{2,8}-[A-Z0-9-]+)$`)
+	idRe = regexp.MustCompile(`^[a-z0-9]+([.-][a-z0-9]+)*$`)
+	// vulnRefRe is a CVE id, a GHSA id, or a generic PREFIX-ID whose prefix
+	// is 2-8 upper-case letters other than CVE and GHSA, so a malformed
+	// CVE-21-41773 is rejected instead of passing as a generic ref (and then
+	// not being treated as a CVE). The prefix alternatives spell out "not CVE,
+	// not GHSA" without a lookahead, so the schema can use the same pattern.
+	vulnRefRe = regexp.MustCompile(`^(CVE-\d{4}-\d{4,7}|GHSA-[a-z0-9-]+|` +
+		`([A-Z]{2}|[A-BD-Z][A-Z]{2}|C[A-UW-Z][A-Z]|CV[A-DF-Z]|[A-FH-Z][A-Z]{3}|G[A-GI-Z][A-Z]{2}|GH[A-RT-Z][A-Z]|GHS[B-Z]|[A-Z]{5,8})` +
+		`-[A-Z0-9-]+)$`)
 	// refShapeRe is vulnRefRe case-insensitively, for recognising a ref-shaped
 	// selector or filter value (CVE-, GHSA-, GO-, VS-... in any case).
-	refShapeRe  = regexp.MustCompile(`(?i)^(CVE-\d{4}-\d{4,7}|GHSA-[a-z0-9-]+|[A-Z]{2,8}-[A-Z0-9-]+)$`)
-	cweRe       = regexp.MustCompile(`^CWE-\d+$`)
-	disclosedRe = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
+	refShapeRe = regexp.MustCompile(`(?i)^(CVE-\d{4}-\d{4,7}|GHSA-[a-z0-9-]+|[A-Z]{2,8}-[A-Z0-9-]+)$`)
+	cweRe      = regexp.MustCompile(`^CWE-\d+$`)
 	// handleRe is the pattern for a group handle and a variant discriminator:
 	// lower-case alphanumerics in dash-separated segments.
 	handleRe   = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
@@ -97,6 +108,7 @@ var (
 	deviceRe   = regexp.MustCompile(`^/dev/[a-zA-Z0-9/_-]+$`)
 	modeRe     = regexp.MustCompile(`^0[0-7]{3}$`)
 	timeoutRe  = regexp.MustCompile(`^\d+[smh]$`)
+	cpuFlagRe  = regexp.MustCompile(`^[a-z0-9_]+$`)
 	severities = map[string]bool{"info": true, "low": true, "medium": true, "high": true, "critical": true}
 	protocols  = map[string]bool{"http": true, "https": true, "tcp": true, "ssh": true, "ftp": true,
 		"smtp": true, "redis": true, "mysql": true, "postgres": true}
@@ -110,11 +122,24 @@ var (
 // Parse decodes and structurally validates a contract document. Semantic lint
 // (is the template *wrong* rather than malformed?) lives in package validator.
 func Parse(data []byte) (*Contract, error) {
+	// Aliases are checked before decoding: goccy expands them (and merge
+	// keys) without a limit, so an alias bomb must be stopped first.
+	file, perr := parser.ParseBytes(data, 0)
+	var anchors map[string]ast.Node
+	if perr == nil {
+		var err error
+		if anchors, err = checkAliases(file); err != nil {
+			return nil, err
+		}
+	}
 	var raw rawContract
 	if err := yaml.UnmarshalWithOptions(data, &raw, yaml.Strict()); err != nil {
 		return nil, fmt.Errorf("invalid YAML: %s", strings.TrimSpace(yaml.FormatError(err, false, false)))
 	}
-	if err := checkDocument(data); err != nil {
+	if perr != nil { // the decoder reports syntax errors itself; a backstop
+		return nil, fmt.Errorf("invalid YAML: %w", perr)
+	}
+	if err := checkDocument(file, anchors); err != nil {
 		return nil, err
 	}
 	c := &Contract{
@@ -133,6 +158,7 @@ func Parse(data []byte) (*Contract, error) {
 			CapAdd:      raw.Service.CapAdd,
 			CapDrop:     raw.Service.CapDrop,
 			Devices:     raw.Service.Devices,
+			Sanitizer:   raw.Service.Sanitizer,
 		},
 		States: map[string]*State{},
 	}
@@ -154,7 +180,20 @@ func Parse(data []byte) (*Contract, error) {
 			Verify:      rs.Verify,
 		}
 	}
-	if err := c.checkStructure(); err != nil {
+	// Which base keys are present, even with an empty value: the schema
+	// rejects `context: ""` on an image base like any other foreign key.
+	// Likewise which keys each sidecar writes: `image: ""` or `digest: ""`
+	// next to a build is a key the schema rejects there.
+	var keys struct {
+		Base    map[string]any `yaml:"base"`
+		Service struct {
+			Sidecars []map[string]any `yaml:"sidecars"`
+		} `yaml:"service"`
+	}
+	if err := yaml.Unmarshal(data, &keys); err != nil {
+		return nil, fmt.Errorf("invalid YAML: %s", strings.TrimSpace(yaml.FormatError(err, false, false)))
+	}
+	if err := c.checkStructure(keys.Base, keys.Service.Sidecars); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -164,8 +203,17 @@ func se(loc, format string, args ...any) error {
 	return &SchemaError{Loc: loc, Message: fmt.Sprintf(format, args...)}
 }
 
+// baseKeys are the keys each base kind allows, besides kind itself.
+var baseKeys = map[string]map[string]bool{
+	BaseImage:  {"image": true, "digest": true},
+	BaseSource: {"repo": true, "commit": true, "dockerfile": true, "build_args": true},
+	BaseBuild:  {"context": true, "dockerfile": true, "build_args": true},
+}
+
 // checkStructure enforces the same rules as schemas/contract.schema.json.
-func (c *Contract) checkStructure() error {
+// present holds the keys written under base, empty values included, and
+// sidecarKeys those of each service sidecar, in order.
+func (c *Contract) checkStructure(present map[string]any, sidecarKeys []map[string]any) error {
 	if c.APIVersion != APIVersion {
 		return se("apiVersion", "must be %q (got %q)", APIVersion, c.APIVersion)
 	}
@@ -208,8 +256,10 @@ func (c *Contract) checkStructure() error {
 		}
 		seenClass[cl] = true
 	}
-	if m.Disclosed != "" && !disclosedRe.MatchString(m.Disclosed) {
-		return se("metadata/disclosed", "%q must be an ISO date (YYYY-MM-DD)", m.Disclosed)
+	if m.Disclosed != "" {
+		if _, err := time.Parse(time.DateOnly, m.Disclosed); err != nil {
+			return se("metadata/disclosed", "%q must be an ISO date (YYYY-MM-DD)", m.Disclosed)
+		}
 	}
 	if m.Group != "" && !handleRe.MatchString(m.Group) {
 		return se("metadata/group", "%q must match %s", m.Group, handleRe)
@@ -222,27 +272,32 @@ func (c *Contract) checkStructure() error {
 	}
 
 	b := c.Base
+	if allowed, ok := baseKeys[b.Kind]; ok {
+		for _, k := range sortedKeys(present) {
+			if k != "kind" && !allowed[k] {
+				switch b.Kind {
+				case BaseImage:
+					return se("base", "kind: image allows only image and digest")
+				case BaseSource:
+					return se("base", "kind: source allows only repo, commit, dockerfile, build_args")
+				default:
+					return se("base", "kind: build allows only context, dockerfile, build_args")
+				}
+			}
+		}
+	}
 	switch b.Kind {
 	case BaseImage:
 		if b.Image == "" {
 			return se("base/image", "is required for kind: image")
 		}
-		if b.Repo != "" || b.Commit != "" || b.Context != "" || b.Dockerfile != "" || len(b.BuildArgs) > 0 {
-			return se("base", "kind: image allows only image and digest")
-		}
 	case BaseSource:
 		if b.Repo == "" || b.Commit == "" {
 			return se("base", "kind: source requires repo and commit")
 		}
-		if b.Image != "" || b.Digest != "" || b.Context != "" {
-			return se("base", "kind: source allows only repo, commit, dockerfile, build_args")
-		}
 	case BaseBuild:
 		if b.Context == "" {
 			return se("base/context", "is required for kind: build")
-		}
-		if b.Image != "" || b.Digest != "" || b.Repo != "" || b.Commit != "" {
-			return se("base", "kind: build allows only context, dockerfile, build_args")
 		}
 		if err := checkLocalPath(b.Context); err != nil {
 			return se("base/context", "%q %v", b.Context, err)
@@ -267,6 +322,27 @@ func (c *Contract) checkStructure() error {
 	for i, a := range c.Requires.Arch {
 		if !arches[a] {
 			return se(fmt.Sprintf("requires/arch/%d", i), "%q is not a known GOARCH (amd64, arm64, ...)", a)
+		}
+	}
+	seenFlag := map[string]bool{}
+	for i, f := range c.Requires.CPUFlags {
+		if !cpuFlagRe.MatchString(f) {
+			return se(fmt.Sprintf("requires/cpu_flags/%d", i), "%q is not a /proc/cpuinfo flag name (lower-case letters, digits, _)", f)
+		}
+		if seenFlag[f] {
+			return se(fmt.Sprintf("requires/cpu_flags/%d", i), "%q is listed more than once", f)
+		}
+		seenFlag[f] = true
+	}
+	if p := c.Requires.Probe; p != nil {
+		if strings.TrimSpace(p.Run) == "" {
+			return se("requires/probe/run", "must be a non-empty shell command")
+		}
+		if strings.TrimSpace(p.Reason) == "" {
+			return se("requires/probe/reason", "must say what a host that fails the probe lacks")
+		}
+		if p.Timeout != "" && !timeoutRe.MatchString(p.Timeout) {
+			return se("requires/probe/timeout", "must look like 30s or 2m")
 		}
 	}
 
@@ -299,39 +375,60 @@ func (c *Contract) checkStructure() error {
 		if !deviceRe.MatchString(d) {
 			return se("service/devices", "%q must be a /dev path", d)
 		}
-		if dangerousDevice(d) {
-			return se("service/devices", "%q gives raw host disk/memory access and is never needed for a target", d)
+		if !allowedDevice(d) {
+			return se("service/devices", "%q is not an allowed device (allowed: /dev/kvm, /dev/net/tun, /dev/fuse, /dev/vhost-net, /dev/vhost-vsock, /dev/dri/cardN, /dev/dri/renderDN); raw disk/memory and other host devices are never needed for a target", d)
 		}
 	}
 	if s.Healthcheck.Timeout != "" && !timeoutRe.MatchString(s.Healthcheck.Timeout) {
 		return se("service/healthcheck/timeout", "must look like 60s or 5m")
 	}
+	if san := s.Sanitizer; san != nil {
+		if san.LogDir == "" {
+			return se("service/sanitizer/log_dir", "is required")
+		}
+		if err := checkLogDir(san.LogDir); err != nil {
+			return se("service/sanitizer/log_dir", "%q %v", san.LogDir, err)
+		}
+	}
 	seenSidecar := map[string]bool{}
 	for i, sc := range s.Sidecars {
-		if sc.Name == "" || sc.Image == "" {
-			return se(fmt.Sprintf("service/sidecars/%d", i), "name and image are required")
+		loc := fmt.Sprintf("service/sidecars/%d", i)
+		if sc.Build != nil {
+			if err := checkSidecarBuild(loc, sc, keysAt(sidecarKeys, i)); err != nil {
+				return err
+			}
+		} else if sc.Name == "" || sc.Image == "" {
+			return se(loc, "name and image are required")
 		}
 		if seenSidecar[sc.Name] {
-			return se(fmt.Sprintf("service/sidecars/%d/name", i), "sidecar %q is declared more than once", sc.Name)
+			return se(loc+"/name", "sidecar %q is declared more than once", sc.Name)
 		}
 		seenSidecar[sc.Name] = true
 		if sc.Digest != "" && !digestRe.MatchString(sc.Digest) {
-			return se(fmt.Sprintf("service/sidecars/%d/digest", i), "must look like sha256:<64 hex>")
+			return se(loc+"/digest", "must look like sha256:<64 hex>")
 		}
 	}
 
 	if len(c.States) == 0 || !c.HasState(StateVulnerable) {
 		return se("states/vulnerable", "is required")
 	}
-	for name, st := range c.States {
-		known := false
-		for _, n := range StateNames {
-			if n == name {
-				known = true
-			}
-		}
-		if !known {
+	// Check names before contents, and states in a fixed order, so a contract
+	// with several errors always reports the same one (ranging over the map
+	// would pick one at random).
+	names := make([]string, 0, len(c.States))
+	for name := range c.States {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if !has(StateNames, name) {
 			return se("states/"+name, "unknown state; only vulnerable and patched are allowed")
+		}
+	}
+	for _, name := range StateNames {
+		st, ok := c.States[name]
+		if !ok {
+			continue
 		}
 		if st == nil {
 			return se("states/"+name, "must be a mapping")
@@ -339,6 +436,17 @@ func (c *Contract) checkStructure() error {
 		loc := "states/" + name
 		if st.Digest != "" && !digestRe.MatchString(st.Digest) {
 			return se(loc+"/digest", "must look like sha256:<64 hex>")
+		}
+		// A source or build base builds every state from the same checkout or
+		// context; nothing runs FROM a state image there, so one would be
+		// silently ignored and "patched" would still be the vulnerable build.
+		if b.Kind != BaseImage {
+			if st.Image != "" {
+				return se(loc+"/image", "a per-state image applies only to kind: image; a %s base builds every state from its own source, so make the states differ with a patch or overlay", b.Kind)
+			}
+			if st.Digest != "" {
+				return se(loc+"/digest", "pins a per-state image, which applies only to kind: image")
+			}
 		}
 		if st.Patch != "" {
 			if err := checkLocalPath(st.Patch); err != nil {
@@ -364,7 +472,13 @@ func (c *Contract) checkStructure() error {
 				return se(loc+"/environment", "%v", err)
 			}
 		}
-		for scName, ov := range st.Sidecars {
+		scNames := make([]string, 0, len(st.Sidecars))
+		for scName := range st.Sidecars {
+			scNames = append(scNames, scName)
+		}
+		sort.Strings(scNames)
+		for _, scName := range scNames {
+			ov := st.Sidecars[scName]
 			if ov.Image == "" {
 				return se(fmt.Sprintf("%s/sidecars/%s/image", loc, scName), "is required")
 			}
@@ -423,10 +537,162 @@ func (c *Contract) checkStructure() error {
 					return err
 				}
 			}
+			if p.Sequence != nil {
+				n++
+				if err := checkSequence(ploc+"/sequence", p.Sequence); err != nil {
+					return err
+				}
+			}
 			if n != 1 {
-				return se(ploc, "exactly one of http, exec, tcp, net must be set")
+				return se(ploc, "exactly one of http, exec, tcp, net, sequence must be set")
 			}
 		}
+	}
+	return nil
+}
+
+// sidecarNameRe is the name of a built sidecar, which is part of its image
+// tag (sidecar-<name>-<hash>): a Docker tag's characters, at most
+// maxSidecarName long so the tag stays within Docker's 128.
+var sidecarNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
+
+const maxSidecarName = 100
+
+// keysAt returns the i-th sidecar's key set (nil when out of range).
+func keysAt(keys []map[string]any, i int) map[string]any {
+	if i < len(keys) {
+		return keys[i]
+	}
+	return nil
+}
+
+// checkSidecarBuild checks a sidecar with a build: no image or digest next to
+// it (present holds the keys written, empty values included), a name that can
+// be part of an image tag, and a context and Dockerfile under the base build
+// path rules.
+func checkSidecarBuild(loc string, sc Sidecar, present map[string]any) error {
+	_, hasImage := present["image"]
+	if hasImage || sc.Image != "" {
+		return se(loc, "set either image or build, not both")
+	}
+	if _, hasDigest := present["digest"]; hasDigest || sc.Digest != "" {
+		return se(loc+"/digest", "pins an image; a built sidecar is pinned by its content and takes no digest")
+	}
+	if sc.Name == "" {
+		return se(loc+"/name", "is required")
+	}
+	if !sidecarNameRe.MatchString(sc.Name) || len(sc.Name) > maxSidecarName {
+		return se(loc+"/name", "%q must match %s and be at most %d characters: a built sidecar's name is part of its image tag", sc.Name, sidecarNameRe, maxSidecarName)
+	}
+	b := sc.Build
+	if b.Context == "" {
+		return se(loc+"/build/context", "is required")
+	}
+	if err := checkLocalPath(b.Context); err != nil {
+		return se(loc+"/build/context", "%q %v", b.Context, err)
+	}
+	_, hasDockerfile := present["build"].(map[string]any)["dockerfile"]
+	if b.Dockerfile != "" || hasDockerfile {
+		if err := checkLocalPath(b.Dockerfile); err != nil {
+			return se(loc+"/build/dockerfile", "%q %v", b.Dockerfile, err)
+		}
+	}
+	return nil
+}
+
+// sanitizerKindRe is an expect_sanitizer kind: a sanitizer's bug class as its
+// report names it, e.g. heap-use-after-free.
+var sanitizerKindRe = regexp.MustCompile(`^[a-z-]+$`)
+
+// checkSequence enforces a sequence probe's shape. The cross-step rules
+// (freeze/resume balance, what may run while frozen, sidecar names) are
+// semantic and live in package validator.
+func checkSequence(loc string, s *SequenceProbe) error {
+	if s.Attempts < 0 || s.Attempts > MaxSequenceAttempts {
+		return se(loc+"/attempts", "must be 1..%d", MaxSequenceAttempts)
+	}
+	if s.MinHits < 0 {
+		return se(loc+"/min_hits", "must be at least 1")
+	}
+	if s.MinHitCount() > s.AttemptCount() {
+		return se(loc+"/min_hits", "%d is more than attempts (%d)", s.MinHitCount(), s.AttemptCount())
+	}
+	if s.Timeout < 0 {
+		return se(loc+"/timeout", "must be greater than 0")
+	}
+	if len(s.Steps) == 0 {
+		return se(loc+"/steps", "at least one step is required")
+	}
+	for i, st := range s.Steps {
+		sloc := fmt.Sprintf("%s/steps/%d", loc, i)
+		if st.kinds() != 1 {
+			return se(sloc, "exactly one of exec, freeze, resume, sleep, expect_sanitizer, expect_log, http, tcp, net must be set")
+		}
+		switch {
+		case st.Exec != nil:
+			if st.Exec.Run == "" {
+				return se(sloc+"/exec/run", "is required")
+			}
+			if err := checkProbeNums(sloc+"/exec", 0, st.Exec.Timeout); err != nil {
+				return err
+			}
+		case st.Sleep != nil:
+			if st.Sleep.MS < 1 || st.Sleep.MS > MaxSleepMS {
+				return se(sloc+"/sleep/ms", "must be 1..%d", MaxSleepMS)
+			}
+		case st.ExpectSanitizer != nil:
+			if e := st.ExpectSanitizer; !e.None && !sanitizerKindRe.MatchString(e.Kind) {
+				if e.Kind == "" {
+					return se(sloc+"/expect_sanitizer/kind", "is required")
+				}
+				return se(sloc+"/expect_sanitizer/kind", "%q must match %s (the bug class, e.g. heap-use-after-free)", e.Kind, sanitizerKindRe)
+			}
+		case st.ExpectLog != nil:
+			if *st.ExpectLog == "" {
+				return se(sloc+"/expect_log", "must be a non-empty regexp")
+			}
+		case st.HTTP != nil:
+			if err := checkProbeNums(sloc+"/http", st.HTTP.Port, st.HTTP.Timeout); err != nil {
+				return err
+			}
+		case st.TCP != nil:
+			if st.TCP.Port == 0 {
+				return se(sloc+"/tcp/port", "is required")
+			}
+			if err := checkProbeNums(sloc+"/tcp", st.TCP.Port, st.TCP.Timeout); err != nil {
+				return err
+			}
+		case st.Net != nil:
+			if len(st.Net.Steps) == 0 {
+				return se(sloc+"/net/steps", "at least one step is required")
+			}
+			if err := checkProbeNums(sloc+"/net", st.Net.Port, st.Net.Timeout); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// checkLogDir validates service.sanitizer.log_dir: an absolute, canonical
+// directory in the target, written with overlay dest's characters.
+func checkLogDir(dir string) error {
+	if !destCharRe.MatchString(dir) {
+		return errors.New("must be a plain path (letters, digits and . _ @ % + = : , / -; no whitespace, quotes, $ or control characters)")
+	}
+	if !strings.HasPrefix(dir, "/") {
+		return errors.New("must be an absolute path in the target")
+	}
+	for _, seg := range strings.Split(dir, "/") {
+		if seg == ".." {
+			return errors.New("must not contain .. segments")
+		}
+	}
+	if dir == "/" {
+		return errors.New("must name a directory, not the root")
+	}
+	if path.Clean(dir) != dir {
+		return errors.New("must be canonical: no trailing /, no // and no . segments")
 	}
 	return nil
 }
@@ -443,28 +709,37 @@ func checkProbeNums(loc string, port int, timeout float64) error {
 	return nil
 }
 
-// dangerousDevice reports whether a /dev path grants raw host disk or memory
-// access (a direct host-compromise primitive, never legitimate for a target).
-// Device access that can be legitimate (e.g. /dev/kvm) is allowed here but
-// still consent-gated at run time.
-func dangerousDevice(d string) bool {
-	d = strings.ToLower(strings.TrimRight(d, "0123456789"))
-	switch d {
-	case "/dev/mem", "/dev/kmem", "/dev/port", "/dev/msr":
-		return true
+// allowedDevices are the host devices a template may pass through (still
+// consent-gated at run time by -allow-host-access). Everything else is
+// rejected at parse time: a denylist of raw disk/memory devices cannot be made
+// complete (LVM /dev/<vg>/<lv>, zvols, nbd, rbd, /dev/root, by-id links, …), and
+// none of those is ever needed to stand up a vulnerable service.
+var allowedDevices = []*regexp.Regexp{
+	regexp.MustCompile(`^/dev/kvm$`),         // KVM/QEMU targets
+	regexp.MustCompile(`^/dev/net/tun$`),     // VPN / tunnelling services
+	regexp.MustCompile(`^/dev/fuse$`),        // FUSE file systems
+	regexp.MustCompile(`^/dev/vhost-net$`),   // virtio networking for QEMU
+	regexp.MustCompile(`^/dev/vhost-vsock$`), // virtio vsock for QEMU
+	regexp.MustCompile(`^/dev/dri/(card|renderD)[0-9]+$`),
+}
+
+// allowedDevice reports whether d is an exact, canonical path on the device
+// allowlist. Non-canonical spellings (/dev//kvm) are refused rather than
+// cleaned: the daemon resolves them, so the string that is checked must be
+// the string that is passed through.
+func allowedDevice(d string) bool {
+	if path.Clean(d) != d {
+		return false
 	}
-	for _, pfx := range []string{
-		"/dev/sd", "/dev/hd", "/dev/vd", "/dev/xvd", "/dev/nvme", "/dev/sg",
-		"/dev/dm-", "/dev/loop", "/dev/md", "/dev/mmcblk", "/dev/disk", "/dev/mapper",
-	} {
-		if strings.HasPrefix(d, pfx) {
+	for _, re := range allowedDevices {
+		if re.MatchString(d) {
 			return true
 		}
 	}
 	return false
 }
 
-func sortedKeys(m map[string]string) []string {
+func sortedKeys[V any](m map[string]V) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)

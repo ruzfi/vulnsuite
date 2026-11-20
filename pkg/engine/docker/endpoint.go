@@ -164,6 +164,12 @@ func fileExists(p string) bool {
 	return err == nil && info.Mode().IsRegular()
 }
 
+// TLSConfig builds the client TLS configuration from f for serverName, for
+// engine clients other than this package's.
+func (f *TLSFiles) TLSConfig(serverName string) (*tls.Config, error) {
+	return f.tlsConfig(serverName)
+}
+
 // tlsConfig builds the client TLS configuration from f: a CA bundle when
 // present (else the system roots), a client certificate when both cert and
 // key are present.

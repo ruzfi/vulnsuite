@@ -42,7 +42,9 @@ func (m *buildContext) add(name string, data []byte, mode int64) {
 }
 
 // readFile returns a context file's content: a generated entry, or a regular
-// file of the tree (never through a symlink, which may point anywhere).
+// file of the tree. A symlink on the way is followed only while it resolves
+// inside the context (as the daemon does); one that leads out of it, which
+// may point anywhere on the host, is refused.
 func (m *buildContext) readFile(name string) (memFile, bool, error) {
 	name = filepath.ToSlash(filepath.Clean(name))
 	if f, ok := m.files[name]; ok {
@@ -51,19 +53,12 @@ func (m *buildContext) readFile(name string) (memFile, bool, error) {
 	if m.root == "" || name == ".." || strings.HasPrefix(name, "../") || path.IsAbs(name) {
 		return memFile{}, false, nil
 	}
-	p := m.root
-	for _, part := range strings.Split(name, "/") {
-		p = filepath.Join(p, part)
-		info, err := os.Lstat(p)
-		if errors.Is(err, fs.ErrNotExist) {
-			return memFile{}, false, nil
-		}
-		if err != nil {
-			return memFile{}, false, err
-		}
-		if info.Mode()&fs.ModeSymlink != 0 {
-			return memFile{}, false, fmt.Errorf("%s: is a symlink", name)
-		}
+	p, err := contract.ConfinedPath(m.root, name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return memFile{}, false, nil
+	}
+	if err != nil {
+		return memFile{}, false, err
 	}
 	info, err := os.Stat(p)
 	if err != nil {
@@ -149,8 +144,10 @@ func (m *buildContext) writeTar(w io.Writer, dockerfile string) error {
 
 // walkTree writes the tree's directories, regular files and symlinks (as
 // symlinks: the daemon resolves them inside the context, never on the host).
-// .git, names .dockerignore excludes, and names a generated file replaces are
-// left out.
+// Every .git directory (nested ones too, e.g. a vendored checkout), names
+// .dockerignore excludes, and names a generated file replaces are left out.
+// The .git rule must match the content hash (contract.hashTree): anything sent
+// but not hashed could change the image without changing its tag.
 func (m *buildContext) walkTree(tw *tar.Writer, ign *dockerignore, keep map[string]bool) error {
 	root := m.root
 	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
@@ -165,11 +162,14 @@ func (m *buildContext) walkTree(tw *tar.Writer, ign *dockerignore, keep map[stri
 			return err
 		}
 		name := filepath.ToSlash(rel)
-		if d.IsDir() && name == ".git" {
+		if d.IsDir() && d.Name() == ".git" {
 			return filepath.SkipDir
 		}
 		if !keep[name] && ign.excludes(name) {
-			if d.IsDir() && !ign.hasExceptions {
+			// An excluded directory is still walked when it holds a kept
+			// file (the Docker CLI adds "!<dockerfile>" to the excludes, so
+			// "docker" in .dockerignore does not drop docker/Dockerfile).
+			if d.IsDir() && !ign.hasExceptions && !holdsKept(name, keep) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -211,6 +211,16 @@ func (m *buildContext) walkTree(tw *tar.Writer, ign *dockerignore, keep map[stri
 		_, err = io.CopyN(tw, f, hdr.Size)
 		return err
 	})
+}
+
+// holdsKept reports whether dir is a parent directory of a kept path.
+func holdsKept(dir string, keep map[string]bool) bool {
+	for k := range keep {
+		if strings.HasPrefix(k, dir+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // overlayDockerfile generates the tiny Dockerfile that bakes overlay files and

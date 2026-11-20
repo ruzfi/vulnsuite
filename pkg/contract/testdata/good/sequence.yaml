@@ -1,0 +1,49 @@
+apiVersion: vulnsuite/v1
+kind: Target
+metadata:
+  id: demo-sequence
+  summary: a race-condition UAF verified by a frozen-window sequence
+  vuln_refs: [VS-DEMO-1]
+base:
+  kind: image
+  image: nginx:1.27
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+service:
+  ports: [ { container: 80, protocol: http } ]
+  environment:
+    ASAN_OPTIONS: "detect_leaks=0:halt_on_error=1:log_path=/var/log/asan/asan"
+  sanitizer:
+    log_dir: /var/log/asan
+  sidecars:
+    - { name: dns, image: python:3.13-slim, command: ["python", "/fakedns.py"] }
+    - { name: driver, image: python:3.13-slim, command: ["sleep", "infinity"] }
+states:
+  vulnerable:
+    verify:
+      - sequence:
+          attempts: 3
+          min_hits: 1
+          timeout: 60
+          steps:
+            - http: { path: /, status: 200 }
+            - exec: { container: driver, run: "/trigger.py setup", expect_exit: 0, timeout: 5 }
+            - freeze: {}
+            - exec: &fire { container: driver, run: "/trigger.py fire" }
+            - sleep: { ms: 100 }
+            - resume: {}
+            - expect_sanitizer: { kind: heap-use-after-free, frame: "ngx_resolver_process_a" }
+  patched:
+    verify:
+      - http: { path: /, status: 200 }
+      - sequence:
+          attempts: 3
+          timeout: 30.5
+          steps:
+            - exec: { run: "test -d /var/log/asan" }
+            - freeze: {}
+            - exec: { <<: *fire, timeout: 10 }
+            - resume: {}
+            - expect_sanitizer: none
+            - expect_log: "writev\\(\\) failed .* while sending to client"
+            - tcp: { port: 80 }
+            - net: { steps: [ { send: "GET / HTTP/1.0\r\n\r\n", expect: "^HTTP" } ] }

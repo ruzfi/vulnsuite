@@ -12,8 +12,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -31,11 +33,23 @@ const UserAgent = "vulnsuite-verify/1.0"
 // ExecFunc runs a shell command inside a container and returns (exit code, output).
 type ExecFunc func(ctx context.Context, container, command string, timeout time.Duration) (int, string, error)
 
+// SequenceFunc runs a sequence probe. It needs the container engine (freeze,
+// sidecar exec, archive reads), so the runner supplies it; Run fills in the
+// result's Kind and Elapsed.
+type SequenceFunc func(ctx context.Context, s *contract.SequenceProbe) Result
+
 // Target is where probes are sent.
 type Target struct {
-	Host      string
-	Port      int
-	Scheme    string // http | https; anything else is treated as http for http probes
+	Host   string
+	Port   int
+	Scheme string // http | https; anything else is treated as http for http probes
+	// Schemes, when non-nil, is the scheme of each declared container port
+	// ("http", "https", or "" for raw TCP). A probe that names a port speaks
+	// that port's scheme, not the primary port's: an https primary must not
+	// make a probe of a plain-HTTP or SMTP port handshake TLS, nor a plain
+	// primary send cleartext to a TLS port. A probe on the default port, or on
+	// a port missing from Schemes, uses Scheme.
+	Schemes   map[int]string
 	Container string
 	Exec      ExecFunc
 	// PortMap, when non-nil, translates a container port named by a probe
@@ -44,6 +58,9 @@ type Target struct {
 	// missing from a non-nil map is not reachable from here. Port (the default
 	// when a probe names none) is already the address to dial.
 	PortMap map[int]int
+	// Sequence runs sequence probes. Without it a sequence fails with
+	// SequenceUnsupported.
+	Sequence SequenceFunc
 }
 
 // dialPort resolves the port a probe dials: 0 means the target's own Port; a
@@ -61,6 +78,16 @@ func (t Target) dialPort(p int) (int, error) {
 	return 0, fmt.Errorf("container port %d is not published to the host, so it cannot be probed from here", p)
 }
 
+// portScheme is the scheme of the port a probe names (0 = the default port).
+func (t Target) portScheme(p int) string {
+	if p != 0 && t.Schemes != nil {
+		if s, ok := t.Schemes[p]; ok {
+			return s
+		}
+	}
+	return t.Scheme
+}
+
 // Result is the outcome of one probe.
 type Result struct {
 	Kind    string        `json:"kind"`
@@ -72,6 +99,34 @@ type Result struct {
 	// lets a caller tell "I can't get to this address from here" from "the
 	// service answered but is in the wrong state".
 	Transport bool `json:"transport,omitempty"`
+	// Attempts is each attempt of a sequence probe, in order (nil for the
+	// other kinds).
+	Attempts []SequenceAttempt `json:"attempts,omitempty"`
+}
+
+// Sequence attempt outcomes.
+const (
+	// OutcomeHit: every assertion held, a positive expect_sanitizer among them.
+	OutcomeHit = "hit"
+	// OutcomePass: every assertion held and none expects a sanitizer report.
+	OutcomePass = "pass"
+	// OutcomeNotReached: an exec, network, freeze or resume step or an
+	// expect_log failed, or the attempt timed out: the race was not shown to
+	// run, so the attempt counts toward neither side.
+	OutcomeNotReached = "not_reached"
+	// OutcomeFail: an expect_sanitizer did not hold.
+	OutcomeFail = "fail"
+)
+
+// SequenceAttempt is the outcome of one attempt of a sequence probe.
+type SequenceAttempt struct {
+	Attempt int    `json:"attempt"` // 1-based
+	Outcome string `json:"outcome"` // OutcomeHit, OutcomePass, OutcomeNotReached or OutcomeFail
+	Detail  string `json:"detail"`
+	// Restarted is set when the target had exited and was started again
+	// before this attempt.
+	Restarted bool          `json:"restarted,omitempty"`
+	Elapsed   time.Duration `json:"elapsed"`
 }
 
 // connError marks a probe failure as a transport failure: the target could not
@@ -129,6 +184,7 @@ func RawHTTP(ctx context.Context, host string, port int, method, path string, he
 		return nil, err
 	}
 	defer conn.Close()
+	defer closeOnDone(ctx, conn)()
 	// The deadline covers the TLS handshake too: a peer that accepts and then
 	// stalls must not outlive the probe timeout.
 	_ = conn.SetDeadline(time.Now().Add(timeout))
@@ -143,6 +199,9 @@ func RawHTTP(ctx context.Context, host string, port int, method, path string, he
 		return nil, err
 	}
 	blob := readResponse(conn, method) // a timeout mid-read still yields what arrived
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(blob) == 0 {
 		return nil, fmt.Errorf("empty response")
 	}
@@ -314,11 +373,10 @@ func dechunk(s string) string {
 			out.WriteString(s)
 			break
 		}
-		sizeStr := strings.TrimSpace(s[:nl])
-		if i := strings.Index(sizeStr, ";"); i >= 0 {
-			sizeStr = sizeStr[:i]
-		}
-		size, err := strconv.ParseInt(sizeStr, 16, 64)
+		// Cut a chunk extension first, then trim: RFC 9112 7.1.1 allows
+		// whitespace before the ';' ("5 ;x=y"), as chunkedComplete does.
+		sizeStr, _, _ := strings.Cut(s[:nl], ";")
+		size, err := strconv.ParseInt(strings.TrimSpace(sizeStr), 16, 64)
 		if err != nil {
 			out.WriteString(s)
 			break
@@ -344,9 +402,19 @@ func secs(f float64, def time.Duration) time.Duration {
 	return time.Duration(f * float64(time.Second))
 }
 
+// SequenceUnsupported is the detail of a sequence probe run without a
+// Target.Sequence executor.
+const SequenceUnsupported = "sequence probes need a container engine to run, and none was given"
+
 // Run executes one probe against the target.
 func Run(ctx context.Context, p contract.Probe, t Target) Result {
 	started := time.Now()
+	// A pattern that does not compile must fail the probe: an *_absent check
+	// would otherwise "not match" and pass, verifying a state that may be
+	// wrong.
+	if err := checkPatterns(p); err != nil {
+		return Result{Kind: p.Kind(), Detail: err.Error(), Elapsed: time.Since(started)}
+	}
 	var ok bool
 	var detail string
 	var err error
@@ -359,6 +427,17 @@ func Run(ctx context.Context, p contract.Probe, t Target) Result {
 		ok, detail, err = runTCP(ctx, p.TCP, t)
 	case "net":
 		ok, detail, err = runNet(ctx, p.Net, t)
+	case "sequence":
+		// Fail rather than skip without an executor: a target whose only
+		// proof is a sequence must not be reported as verified (or silently
+		// unverified).
+		if t.Sequence == nil {
+			ok, detail = false, SequenceUnsupported
+			break
+		}
+		r := t.Sequence(ctx, p.Sequence)
+		r.Kind, r.Elapsed = p.Kind(), time.Since(started)
+		return r
 	default:
 		err = fmt.Errorf("unknown probe kind %q", p.Kind())
 	}
@@ -383,7 +462,7 @@ func runHTTP(ctx context.Context, s *contract.HTTPProbe, t Target) (bool, string
 	if err != nil {
 		return false, "", fmt.Errorf("%s -> %v", path, err)
 	}
-	resp, err := RawHTTP(ctx, t.Host, port, s.Method, path, s.Headers, s.Body, secs(s.Timeout, 10*time.Second), t.Scheme == "https")
+	resp, err := RawHTTP(ctx, t.Host, port, s.Method, path, s.Headers, s.Body, secs(s.Timeout, 10*time.Second), t.portScheme(s.Port) == "https")
 	if err != nil {
 		return false, "", &connError{fmt.Errorf("%s -> %v", path, err)}
 	}
@@ -459,28 +538,52 @@ func runTCP(ctx context.Context, s *contract.TCPProbe, t Target) (bool, string, 
 	timeout := secs(s.Timeout, 10*time.Second)
 	d := net.Dialer{Timeout: timeout}
 	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(t.Host, strconv.Itoa(dport)))
+	if err == nil {
+		defer conn.Close()
+	}
+	// A port proxy accepts for a port nothing listens on, then closes: that
+	// connection does not make the port open.
+	var early []byte
+	listening := err == nil
+	if listening {
+		early, listening = checkListener(conn, min(ListenerGrace, timeout))
+	}
 	if s.Closed {
 		// Asserting the port is NOT open: a dial error (refused/unreachable) is
 		// the expected result; a successful connection is the failure.
 		if err != nil {
 			return true, fmt.Sprintf("tcp %d closed as expected (%v)", port, err), nil
 		}
-		conn.Close()
+		if !listening {
+			return true, fmt.Sprintf("tcp %d closed as expected (%s)", port, errNotListening), nil
+		}
 		return false, fmt.Sprintf("tcp %d is open but was expected to be closed", port), nil
 	}
 	if err != nil {
 		return false, "", &connError{fmt.Errorf("tcp %d -> %v", port, err)}
 	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(timeout))
+	if !listening {
+		return false, "", &connError{fmt.Errorf("tcp %d -> %v", port, errNotListening)}
+	}
+	defer closeOnDone(ctx, conn)()
+	deadline := time.Now().Add(timeout)
+	_ = conn.SetDeadline(deadline)
+	banner := string(early)
 	if s.Send != "" {
 		if _, err := io.WriteString(conn, s.Send); err != nil {
 			return false, "", fmt.Errorf("tcp %d send -> %v", port, err)
 		}
 	}
-	buf := make([]byte, 4096)
-	n, _ := conn.Read(buf) // a timeout yields an empty banner, which may be the expected result
-	banner := string(buf[:n])
+	// The listener check may already hold the greeting. Read on when a reply
+	// to send is due, when nothing arrived yet, or when the greeting so far
+	// does not match banner_matches (it may continue in later segments). A
+	// timeout yields an empty banner, which may be the expected result.
+	if s.Send != "" || len(early) == 0 || (s.BannerMatches != "" && !matchDotAll(s.BannerMatches, banner)) {
+		banner = readUntilFrom(conn, early, 4096, s.BannerMatches, deadline)
+	}
+	if err := ctx.Err(); err != nil {
+		return false, "", err
+	}
 	if s.BannerMatches != "" && !matchDotAll(s.BannerMatches, banner) {
 		return false, fmt.Sprintf("tcp %d banner %q !~ /%s/", port, trunc(banner, 60), s.BannerMatches), nil
 	}
@@ -503,9 +606,13 @@ func runNet(ctx context.Context, s *contract.NetProbe, t Target) (bool, string, 
 		return false, "", &connError{fmt.Errorf("net %d -> %v", port, err)}
 	}
 	defer conn.Close()
+	defer closeOnDone(ctx, conn)()
 	// Set before the handshake so a stalled TLS peer is bounded by the timeout.
-	_ = conn.SetDeadline(time.Now().Add(timeout))
-	if s.TLS || t.Scheme == "https" {
+	deadline := time.Now().Add(timeout)
+	_ = conn.SetDeadline(deadline)
+	// tls: true forces TLS; otherwise the probed port's own scheme decides, so a
+	// dialogue with a plain port (SMTP, FTP) of an https target stays plain.
+	if s.TLS || t.portScheme(s.Port) == "https" {
 		tc := tls.Client(conn, &tls.Config{InsecureSkipVerify: true, ServerName: t.Host}) //nolint:gosec // knowingly-vulnerable targets
 		if err := tc.HandshakeContext(ctx); err != nil {
 			return false, "", fmt.Errorf("net %d tls -> %v", port, err)
@@ -527,9 +634,11 @@ func runNet(ctx context.Context, s *contract.NetProbe, t Target) (bool, string, 
 		if readN <= 0 {
 			readN = 4096
 		}
-		buf := make([]byte, readN)
-		n, _ := conn.Read(buf) // a timeout yields what arrived, which the expect then judges
-		resp := string(buf[:n])
+		// A timeout yields what arrived, which the expect then judges.
+		resp := readUntil(conn, readN, step.Expect, deadline)
+		if err := ctx.Err(); err != nil {
+			return false, "", err
+		}
 		log.WriteString("< " + oneline(resp) + "\n")
 		if step.Expect != "" && !matchDotAll(step.Expect, resp) {
 			return false, fmt.Sprintf("net step %d: %q !~ /%s/\n%s", i+1, trunc(resp, 80), step.Expect, log.String()), nil
@@ -539,6 +648,56 @@ func runNet(ctx context.Context, s *contract.NetProbe, t Target) (bool, string, 
 		}
 	}
 	return true, "net dialogue ok (" + strconv.Itoa(len(s.Steps)) + " steps)", nil
+}
+
+// quietGap is how long readUntil waits for more data once some has arrived. A
+// server that sends its reply in several segments (an FTP "220-" multi-line
+// banner) sends them back to back; a gap this long means the reply is over.
+var quietGap = 500 * time.Millisecond
+
+// readUntil reads from conn until expect (a probe regex, dot matches newline)
+// matches what arrived, max bytes have arrived, the connection ends, or
+// deadline passes. Once something has arrived it also stops after quietGap
+// without more data. Without expect it reads to the same limits, so a reply
+// sent in several segments is judged whole and its tail is not left for the
+// next step's read. The quiet gap never extends past deadline.
+func readUntil(conn net.Conn, max int, expect string, deadline time.Time) string {
+	return readUntilFrom(conn, nil, max, expect, deadline)
+}
+
+// readUntilFrom is readUntil continuing from bytes already read (got), which
+// count toward max and toward matching expect.
+func readUntilFrom(conn net.Conn, got []byte, max int, expect string, deadline time.Time) string {
+	defer func() { _ = conn.SetReadDeadline(deadline) }()
+	_ = conn.SetReadDeadline(deadline)
+	got = append([]byte(nil), got...)
+	buf := make([]byte, max)
+	for len(got) < max {
+		n, err := conn.Read(buf[:max-len(got)])
+		got = append(got, buf[:n]...)
+		if n > 0 && expect != "" && matchDotAll(expect, string(got)) {
+			break
+		}
+		if err != nil {
+			break // EOF, reset, the quiet gap or the deadline
+		}
+		if n > 0 {
+			gap := time.Now().Add(quietGap)
+			if gap.After(deadline) {
+				gap = deadline
+			}
+			_ = conn.SetReadDeadline(gap)
+		}
+	}
+	return string(got)
+}
+
+// closeOnDone closes conn when ctx ends, so a cancelled probe (Ctrl-C) stops at
+// once instead of waiting out its own read deadline. Call the returned
+// function to stop watching.
+func closeOnDone(ctx context.Context, conn net.Conn) func() {
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	return func() { stop() }
 }
 
 func oneline(s string) string {
@@ -586,11 +745,47 @@ const (
 	Unreachable              // timeout / no route: not reachable from here
 )
 
-// Reachability tells whether host:port is open, refused, or unreachable.
+// ListenerGrace is how long a new connection is watched for the immediate close
+// that means nothing is listening behind a port proxy (see checkListener).
+// Docker's proxy closes within a few milliseconds of the backend refusing.
+var ListenerGrace = 300 * time.Millisecond
+
+var errNotListening = errors.New("connection accepted, then closed with no data: nothing is listening yet (the host port is held by a port proxy)")
+
+// checkListener tells whether something listens behind a fresh connection. In
+// host exposure mode the published port is held by Docker's port proxy, which
+// accepts a connection whether or not anything listens in the container and
+// closes it as soon as its own connection to the container is refused. So a
+// connection that ends (EOF or reset) within grace without sending a byte
+// means nothing is listening yet. Data means something listens, and so does
+// silence until grace passes: many servers (HTTP, redis, databases) wait for
+// the client to speak first. The bytes read are returned so a banner is kept.
+// The read deadline is cleared on return.
+func checkListener(conn net.Conn, grace time.Duration) ([]byte, bool) {
+	_ = conn.SetReadDeadline(time.Now().Add(grace))
+	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if n > 0 {
+		return buf[:n], true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return nil, true
+	}
+	return nil, false
+}
+
+// Reachability tells whether host:port is open, refused, or unreachable. A
+// connection a port proxy accepts and then closes at once counts as refused:
+// the address answers, but nothing listens yet.
 func Reachability(host string, port int, timeout time.Duration) Reach {
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), timeout)
 	if err == nil {
-		conn.Close()
+		defer conn.Close()
+		if _, ok := checkListener(conn, min(ListenerGrace, timeout)); !ok {
+			return Refused
+		}
 		return Open
 	}
 	if isConnRefused(err) {
@@ -615,7 +810,9 @@ func isConnRefused(err error) bool {
 	return errors.As(err, &errno) && errno == wsaeConnRefused
 }
 
-// WaitForPort polls until host:port accepts a TCP connection or the deadline passes.
+// WaitForPort polls until something listens on host:port or the deadline
+// passes. A connection that a port proxy accepts and closes at once does not
+// count (see checkListener).
 func WaitForPort(ctx context.Context, host string, port int, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
@@ -626,8 +823,11 @@ func WaitForPort(ctx context.Context, host string, port int, timeout time.Durati
 		d := net.Dialer{Timeout: 2 * time.Second}
 		conn, err := d.DialContext(ctx, "tcp", addr)
 		if err == nil {
+			_, ok := checkListener(conn, ListenerGrace)
 			conn.Close()
-			return true
+			if ok {
+				return true
+			}
 		}
 		if !pause(ctx, 500*time.Millisecond) {
 			return false
@@ -666,6 +866,68 @@ func pause(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+// checkPatterns compiles every regex a probe uses, as matchDotAll will.
+func checkPatterns(p contract.Probe) error {
+	type field struct{ name, pat string }
+	var fs []field
+	switch {
+	case p.HTTP != nil:
+		fs = append(fs, field{"body_matches", p.HTTP.BodyMatches}, field{"body_absent", p.HTTP.BodyAbsent})
+		for _, name := range slices.Sorted(maps.Keys(p.HTTP.HeaderMatches)) {
+			fs = append(fs, field{"header_matches." + name, p.HTTP.HeaderMatches[name]})
+		}
+	case p.Exec != nil:
+		fs = append(fs, field{"stdout_matches", p.Exec.StdoutMatches})
+	case p.TCP != nil:
+		fs = append(fs, field{"banner_matches", p.TCP.BannerMatches})
+	case p.Net != nil:
+		for i, st := range p.Net.Steps {
+			fs = append(fs, field{fmt.Sprintf("steps[%d].expect", i), st.Expect},
+				field{fmt.Sprintf("steps[%d].expect_absent", i), st.ExpectAbsent})
+		}
+	case p.Sequence != nil:
+		for i, st := range p.Sequence.Steps {
+			pre := fmt.Sprintf("steps[%d].", i)
+			switch {
+			case st.Exec != nil:
+				fs = append(fs, field{pre + "exec.stdout_matches", st.Exec.StdoutMatches})
+			case st.ExpectSanitizer != nil:
+				fs = append(fs, field{pre + "expect_sanitizer.frame", st.ExpectSanitizer.Frame})
+			case st.ExpectLog != nil:
+				fs = append(fs, field{pre + "expect_log", *st.ExpectLog})
+			case st.HTTP != nil:
+				fs = append(fs, field{pre + "http.body_matches", st.HTTP.BodyMatches}, field{pre + "http.body_absent", st.HTTP.BodyAbsent})
+				for _, name := range slices.Sorted(maps.Keys(st.HTTP.HeaderMatches)) {
+					fs = append(fs, field{pre + "http.header_matches." + name, st.HTTP.HeaderMatches[name]})
+				}
+			case st.TCP != nil:
+				fs = append(fs, field{pre + "tcp.banner_matches", st.TCP.BannerMatches})
+			case st.Net != nil:
+				for j, ns := range st.Net.Steps {
+					fs = append(fs, field{fmt.Sprintf("%snet.steps[%d].expect", pre, j), ns.Expect},
+						field{fmt.Sprintf("%snet.steps[%d].expect_absent", pre, j), ns.ExpectAbsent})
+				}
+			}
+		}
+	}
+	for _, f := range fs {
+		if f.pat == "" {
+			continue
+		}
+		if _, err := regexp.Compile("(?s)" + f.pat); err != nil {
+			return fmt.Errorf("invalid regex in %s probe %s: %v", p.Kind(), f.name, err)
+		}
+	}
+	return nil
+}
+
+// MatchDotAll matches the Go regexp pat against text with dot matching
+// newline, the semantics of every probe pattern. A pattern that does not
+// compile matches nothing.
+func MatchDotAll(pat, text string) bool { return matchDotAll(pat, text) }
+
+// matchDotAll matches pat in dot-all mode. Run rejects patterns that do not
+// compile before any probe runs, so the error branch is unreachable there.
 func matchDotAll(pat, text string) bool {
 	re, err := regexp.Compile("(?s)" + pat)
 	if err != nil {

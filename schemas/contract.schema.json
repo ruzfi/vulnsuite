@@ -13,6 +13,43 @@
     "states"
   ],
   "additionalProperties": false,
+  "if": {
+    "required": [
+      "base"
+    ],
+    "properties": {
+      "base": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "enum": [
+              "source",
+              "build"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "then": {
+    "description": "A source or build base builds every state from its own source: a per-state image (and the digest pinning it) applies only to kind: image.",
+    "properties": {
+      "states": {
+        "additionalProperties": {
+          "propertyNames": {
+            "not": {
+              "enum": [
+                "image",
+                "digest"
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
   "properties": {
     "apiVersion": {
       "enum": [
@@ -39,15 +76,17 @@
           "description": "Unique target id; also a Docker repository path component, so no leading, trailing or doubled '.'/'-'."
         },
         "summary": {
-          "type": "string"
+          "type": "string",
+          "pattern": "\\S",
+          "description": "One-line description; must not be blank."
         },
         "vuln_refs": {
           "type": "array",
           "items": {
             "type": "string",
-            "pattern": "^(CVE-\\d{4}-\\d{4,7}|GHSA-[a-z0-9-]+|[A-Z]{2,8}-[A-Z0-9-]+)$"
+            "pattern": "^(CVE-\\d{4}-\\d{4,7}|GHSA-[a-z0-9-]+|([A-Z]{2}|[A-BD-Z][A-Z]{2}|C[A-UW-Z][A-Z]|CV[A-DF-Z]|[A-FH-Z][A-Z]{3}|G[A-GI-Z][A-Z]{2}|GH[A-RT-Z][A-Z]|GHS[B-Z]|[A-Z]{5,8})-[A-Z0-9-]+)$"
           },
-          "description": "CVE or GHSA ids, or a PREFIX-ID for simulations / misconfigurations with no CVE (community templates use VS-...)."
+          "description": "CVE or GHSA ids, or a PREFIX-ID for simulations / misconfigurations with no CVE (community templates use VS-...). The PREFIX-ID form is 2-8 upper-case letters other than CVE and GHSA (the pattern spells that out without a lookahead), so a malformed CVE-/GHSA- id is rejected rather than taken as a generic ref."
         },
         "cwe": {
           "type": "array",
@@ -140,8 +179,8 @@
         },
         "disclosed": {
           "type": "string",
-          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
-          "description": "optional public-disclosure date (YYYY-MM-DD); drives the list --year/--since filters and a timeline view, falling back to the CVE-id year when unset."
+          "pattern": "^\\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\\d|3[01])$",
+          "description": "optional public-disclosure date (YYYY-MM-DD), a real calendar date (vulnsuite also rejects e.g. 2021-02-30); drives the list --year/--since filters and a timeline view, falling back to the CVE-id year when unset."
         }
       }
     },
@@ -158,7 +197,8 @@
               "const": "image"
             },
             "image": {
-              "type": "string"
+              "type": "string",
+              "minLength": 1
             },
             "digest": {
               "type": "string",
@@ -176,10 +216,12 @@
               "const": "source"
             },
             "repo": {
-              "type": "string"
+              "type": "string",
+              "minLength": 1
             },
             "commit": {
               "type": "string",
+              "minLength": 1,
               "description": "Pinned commit -- an RC or unreleased vulnerable revision. Must be a full 40-character (or 64-character SHA-256) commit id: `validate` reports a branch or tag as unpinned-base and an abbreviated id as short-commit."
             },
             "dockerfile": {
@@ -319,24 +361,51 @@
         },
         "sidecars": {
           "type": "array",
-          "description": "Helper containers started next to the target. Pin each image with digest (`validate`: unpinned-sidecar); under emulation they run on the target's platform.",
+          "description": "Helper containers started next to the target. Each runs a prebuilt image (pin it with digest; `validate`: unpinned-sidecar) or an image built from a context in the template (build), never both; under emulation they run on the target's platform.",
           "items": {
             "type": "object",
             "required": [
-              "name",
-              "image"
+              "name"
             ],
             "additionalProperties": false,
             "properties": {
               "name": {
-                "type": "string"
+                "type": "string",
+                "minLength": 1
               },
               "image": {
-                "type": "string"
+                "type": "string",
+                "minLength": 1
               },
               "digest": {
                 "type": "string",
                 "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              "build": {
+                "type": "object",
+                "description": "Build the sidecar's image from a context in the template, like a kind: build base, instead of running a prebuilt image. The image is tagged vulnsuite/<id>:sidecar-<name>-<hash> by content (Dockerfile path, context, build_args), so it is pinned by construction and never rebuilt when unchanged.",
+                "required": [
+                  "context"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "context": {
+                    "type": "string",
+                    "pattern": "^(?![/\\\\]|[A-Za-z]:)(?!(.*[/\\\\])?\\.\\.([/\\\\]|$))[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]+$",
+                    "description": "Folder inside the template with the sidecar's Dockerfile and files. Relative to the template folder: not absolute, no .. segments, no control characters; a symlink must resolve inside the folder."
+                  },
+                  "dockerfile": {
+                    "type": "string",
+                    "pattern": "^(?![/\\\\]|[A-Za-z]:)(?!(.*[/\\\\])?\\.\\.([/\\\\]|$))[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]+$",
+                    "description": "Dockerfile path inside the build context (default Dockerfile). Not absolute, no .. segments, no control characters; a symlink must resolve inside the context."
+                  },
+                  "build_args": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  }
+                }
               },
               "command": {
                 "type": "array",
@@ -348,6 +417,39 @@
                 "type": "object",
                 "additionalProperties": {
                   "type": "string"
+                }
+              }
+            },
+            "oneOf": [
+              {
+                "required": [
+                  "image"
+                ]
+              },
+              {
+                "required": [
+                  "build"
+                ]
+              }
+            ],
+            "if": {
+              "required": [
+                "build"
+              ]
+            },
+            "then": {
+              "description": "A built sidecar takes no digest (its tag is its content hash), and its name is part of that tag.",
+              "propertyNames": {
+                "not": {
+                  "enum": [
+                    "digest"
+                  ]
+                }
+              },
+              "properties": {
+                "name": {
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+                  "maxLength": 100
                 }
               }
             }
@@ -378,9 +480,24 @@
           "type": "array",
           "items": {
             "type": "string",
-            "pattern": "^/dev/[a-zA-Z0-9/_-]+$"
+            "pattern": "^/dev/(kvm|net/tun|fuse|vhost-net|vhost-vsock|dri/(card|renderD)[0-9]+)$"
           },
-          "description": "Host device paths to pass through to the container, e.g. ['/dev/kvm'] for KVM/QEMU targets"
+          "description": "Host devices to pass through to the container (consent-gated by run -allow-host-access). Only /dev/kvm, /dev/net/tun, /dev/fuse, /dev/vhost-net, /dev/vhost-vsock and /dev/dri/cardN|renderDN are allowed; raw disk/memory and other host devices are rejected"
+        },
+        "sanitizer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "log_dir"
+          ],
+          "description": "Where a sanitizer-instrumented target writes its reports, for sequence expect_sanitizer steps. Point log_path at it (ASAN_OPTIONS=...:log_path=<log_dir>/asan). Not part of the image hash.",
+          "properties": {
+            "log_dir": {
+              "type": "string",
+              "pattern": "^(/([A-Za-z0-9_@%+=:,-][A-Za-z0-9._@%+=:,-]*|\\.[A-Za-z0-9_@%+=:,-][A-Za-z0-9._@%+=:,-]*|\\.\\.[A-Za-z0-9._@%+=:,-]+))+$",
+              "description": "Absolute, canonical directory in the target (no trailing /, no //, no . or .. segments, not /), a plain path: letters, digits and . _ @ % + = : , / -."
+            }
+          }
         }
       }
     },
@@ -436,6 +553,41 @@
         "kvm": {
           "type": "boolean",
           "description": "needs /dev/kvm + nested virtualization (a linux/amd64 host)"
+        },
+        "cpu_flags": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9_]+$"
+          },
+          "description": "CPU feature flags the daemon's machine must have, as /proc/cpuinfo names them (x86 `flags`, arm64 `Features`), e.g. [avx512f, avx512bw, avx512vbmi, bmi2]. Read from the daemon (not the CLI host) only when a selected target sets it; a target whose flags are missing, or cannot be read, is skipped. Implies no emulation: qemu does not provide them."
+        },
+        "probe": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "run",
+            "reason"
+          ],
+          "properties": {
+            "run": {
+              "type": "string",
+              "pattern": "\\S",
+              "description": "a /bin/sh -c command run in the target's image (no network, no capabilities) after its image is built or pulled and before anything starts; exit 0 = the host can run the target"
+            },
+            "reason": {
+              "type": "string",
+              "pattern": "\\S",
+              "description": "the skip reason when run exits non-zero, e.g. needs AVX-512 VBMI"
+            },
+            "timeout": {
+              "type": "string",
+              "pattern": "^\\d+[smh]$",
+              "description": "bound on run (default 30s); running out fails the target rather than skipping it"
+            }
+          },
+          "description": "Generic host check for what no dedicated field covers (kernel version, cgroup v2, a sysctl, a device). A non-zero exit skips the target with reason, never fails it; -ignore-requires does not run it."
         }
       }
     }
@@ -447,12 +599,12 @@
       "properties": {
         "image": {
           "type": "string",
-          "description": "Per-state image override (reuse-if-matches): e.g. patched = a newer tag. Pin it with digest (`validate`: unpinned-state-image). Part of the content hash of an overlay build."
+          "description": "Per-state image override (reuse-if-matches): e.g. patched = a newer tag. Only for kind: image bases; a source or build base rejects it. Pin it with digest (`validate`: unpinned-state-image). Part of the content hash of an overlay build."
         },
         "digest": {
           "type": "string",
           "pattern": "^sha256:[0-9a-f]{64}$",
-          "description": "Digest pinning the state's image override."
+          "description": "Digest pinning the state's image override (kind: image bases only)."
         },
         "patch": {
           "type": "string",
@@ -476,8 +628,8 @@
               },
               "dest": {
                 "type": "string",
-                "pattern": "^(?!(.*/)?\\.\\.(/|$))(?![/.]*$)[A-Za-z0-9._@%+=:,/-]+$",
-                "description": "Absolute path in the image (image base) or a path in the build context (source/build base). A plain path: letters, digits and . _ @ % + = : , / -; no whitespace, quotes, $ or control characters; no .. segments; not the root."
+                "pattern": "^(?!(.*/)?\\.\\.(/|$))(?![/.]*$)(?!.*/\\.?$)[A-Za-z0-9._@%+=:,/-]+$",
+                "description": "Absolute path in the image (image base) or a path in the build context (source/build base), naming the file. A plain path: letters, digits and . _ @ % + = : , / -; no whitespace, quotes, $ or control characters; no .. segments; not the root; no trailing / or /. (an image base would copy into that directory, a source/build base would write a file)."
               },
               "mode": {
                 "type": "string",
@@ -508,7 +660,8 @@
             "additionalProperties": false,
             "properties": {
               "run": {
-                "type": "string"
+                "type": "string",
+                "minLength": 1
               }
             }
           }
@@ -532,7 +685,7 @@
         },
         "sidecars": {
           "type": "object",
-          "description": "Per-state sidecar image overrides, keyed by sidecar name (e.g. the patched version on every node of a multi-node target). Pin each image with digest (`validate`: unpinned-sidecar).",
+          "description": "Per-state sidecar image overrides, keyed by sidecar name (e.g. the patched version on every node of a multi-node target). An override swaps a sidecar's image, or runs an image in place of a built sidecar's build. Pin each image with digest (`validate`: unpinned-sidecar).",
           "additionalProperties": {
             "type": "object",
             "required": [
@@ -541,7 +694,8 @@
             "additionalProperties": false,
             "properties": {
               "image": {
-                "type": "string"
+                "type": "string",
+                "minLength": 1
               },
               "digest": {
                 "type": "string",
@@ -559,68 +713,228 @@
       "additionalProperties": false,
       "properties": {
         "http": {
+          "$ref": "#/$defs/httpProbe"
+        },
+        "exec": {
+          "$ref": "#/$defs/execProbe"
+        },
+        "tcp": {
+          "$ref": "#/$defs/tcpProbe"
+        },
+        "net": {
+          "$ref": "#/$defs/netProbe"
+        },
+        "sequence": {
+          "$ref": "#/$defs/sequenceProbe"
+        }
+      }
+    },
+    "httpProbe": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "method": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "raw_path": {
+          "type": "string"
+        },
+        "headers": {
           "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "method": {
-              "type": "string"
-            },
-            "path": {
-              "type": "string"
-            },
-            "raw_path": {
-              "type": "string"
-            },
-            "headers": {
-              "type": "object",
-              "additionalProperties": {
-                "type": "string"
-              }
-            },
-            "body": {
-              "type": "string"
-            },
-            "status": {
-              "type": "integer"
-            },
-            "status_in": {
-              "type": "array",
-              "items": {
-                "type": "integer"
-              }
-            },
-            "body_matches": {
-              "type": "string"
-            },
-            "body_absent": {
-              "type": "string"
-            },
-            "timeout": {
-              "type": "number",
-              "exclusiveMinimum": 0
-            },
-            "header_matches": {
-              "type": "object",
-              "additionalProperties": {
-                "type": "string"
-              },
-              "description": "response header name -> regex the value must match (case-insensitive name)"
-            },
-            "header_absent": {
-              "type": "array",
-              "items": {
-                "type": "string"
-              },
-              "description": "response header names that must NOT be present"
-            },
-            "port": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 65535,
-              "description": "Target a non-primary container port (default: the primary port)."
-            }
+          "additionalProperties": {
+            "type": "string"
           }
         },
+        "body": {
+          "type": "string"
+        },
+        "status": {
+          "type": "integer"
+        },
+        "status_in": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "body_matches": {
+          "type": "string"
+        },
+        "body_absent": {
+          "type": "string"
+        },
+        "timeout": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "header_matches": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "response header name -> regex the value must match (case-insensitive name)"
+        },
+        "header_absent": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "response header names that must NOT be present"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Target a non-primary container port (default: the primary port)."
+        }
+      }
+    },
+    "execProbe": {
+      "type": "object",
+      "required": [
+        "run"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "run": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expect_exit": {
+          "type": "integer"
+        },
+        "stdout_matches": {
+          "type": "string"
+        },
+        "timeout": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      }
+    },
+    "tcpProbe": {
+      "type": "object",
+      "required": [
+        "port"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "send": {
+          "type": "string"
+        },
+        "banner_matches": {
+          "type": "string"
+        },
+        "timeout": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "closed": {
+          "type": "boolean",
+          "description": "Assert the port is NOT open (connection refused/unreachable is a pass)."
+        }
+      }
+    },
+    "netProbe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "steps"
+      ],
+      "description": "scripted TCP dialogue (send/expect steps over one connection) for multi-step protocols",
+      "properties": {
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "tls": {
+          "type": "boolean",
+          "description": "force TLS; without it the connection is TLS only when the probed port is declared protocol: https (the primary port when port is unset)"
+        },
+        "timeout": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "send": {
+                "type": "string"
+              },
+              "expect": {
+                "type": "string",
+                "description": "regex the response must match"
+              },
+              "expect_absent": {
+                "type": "string",
+                "description": "regex the response must NOT match"
+              },
+              "read": {
+                "type": "integer",
+                "description": "bytes to read after this step (default 4096)"
+              },
+              "no_read": {
+                "type": "boolean",
+                "description": "send without reading a response"
+              }
+            }
+          }
+        }
+      }
+    },
+    "sequenceProbe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "steps"
+      ],
+      "description": "Ordered steps run as one attempt, for race-condition targets: the core freezes and resumes the target between steps and reads the sanitizer reports and logs written during the attempt. `validate` checks that every freeze is resumed, that nothing runs in or connects to the target while it is frozen, and that the sequence asserts something.",
+      "properties": {
+        "attempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10,
+          "description": "attempts budget for harness flakes (default 1, at most 10)"
+        },
+        "min_hits": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10,
+          "description": "attempts that must hit for a sequence with a positive expect_sanitizer to pass (default 1, at most attempts)"
+        },
+        "timeout": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "seconds for one whole attempt (default 60)"
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/sequenceStep"
+          }
+        }
+      }
+    },
+    "sequenceStep": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 1,
+      "additionalProperties": false,
+      "properties": {
         "exec": {
           "type": "object",
           "required": [
@@ -629,7 +943,8 @@
           "additionalProperties": false,
           "properties": {
             "run": {
-              "type": "string"
+              "type": "string",
+              "minLength": 1
             },
             "expect_exit": {
               "type": "integer"
@@ -640,87 +955,79 @@
             "timeout": {
               "type": "number",
               "exclusiveMinimum": 0
+            },
+            "container": {
+              "type": "string",
+              "description": "run in this sidecar (a service.sidecars name) instead of the target; empty = the target"
             }
           }
         },
-        "tcp": {
+        "freeze": {
           "type": "object",
-          "required": [
-            "port"
-          ],
           "additionalProperties": false,
-          "properties": {
-            "port": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 65535
-            },
-            "send": {
-              "type": "string"
-            },
-            "banner_matches": {
-              "type": "string"
-            },
-            "timeout": {
-              "type": "number",
-              "exclusiveMinimum": 0
-            },
-            "closed": {
-              "type": "boolean",
-              "description": "Assert the port is NOT open (connection refused/unreachable is a pass)."
-            }
-          }
+          "properties": {},
+          "description": "pause the target container (docker pause); never a sidecar. No options."
         },
-        "net": {
+        "resume": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {},
+          "description": "unpause the target container. No options."
+        },
+        "sleep": {
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "steps"
+            "ms"
           ],
-          "description": "scripted TCP dialogue (send/expect steps over one connection) for multi-step protocols",
           "properties": {
-            "port": {
+            "ms": {
               "type": "integer",
               "minimum": 1,
-              "maximum": 65535
+              "maximum": 10000
+            }
+          },
+          "description": "a fixed wait, in milliseconds (at most 10000)"
+        },
+        "expect_sanitizer": {
+          "description": "none: no sanitizer report may be written during the attempt; or { kind, frame }: a report of that bug class whose first stack has a frame matching the Go regexp frame. Needs service.sanitizer.log_dir.",
+          "oneOf": [
+            {
+              "const": "none"
             },
-            "tls": {
-              "type": "boolean"
-            },
-            "timeout": {
-              "type": "number",
-              "exclusiveMinimum": 0
-            },
-            "steps": {
-              "type": "array",
-              "minItems": 1,
-              "items": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                  "send": {
-                    "type": "string"
-                  },
-                  "expect": {
-                    "type": "string",
-                    "description": "regex the response must match"
-                  },
-                  "expect_absent": {
-                    "type": "string",
-                    "description": "regex the response must NOT match"
-                  },
-                  "read": {
-                    "type": "integer",
-                    "description": "bytes to read after this step (default 4096)"
-                  },
-                  "no_read": {
-                    "type": "boolean",
-                    "description": "send without reading a response"
-                  }
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind"
+              ],
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "pattern": "^[a-z-]+$",
+                  "description": "the bug class, e.g. heap-use-after-free"
+                },
+                "frame": {
+                  "type": "string",
+                  "description": "Go regexp matched against the frames of the report's first stack"
                 }
               }
             }
-          }
+          ]
+        },
+        "expect_log": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Go regexp that must match the target's container log written during the attempt"
+        },
+        "http": {
+          "$ref": "#/$defs/httpProbe"
+        },
+        "tcp": {
+          "$ref": "#/$defs/tcpProbe"
+        },
+        "net": {
+          "$ref": "#/$defs/netProbe"
         }
       }
     }

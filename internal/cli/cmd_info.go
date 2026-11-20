@@ -2,8 +2,12 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 
@@ -37,6 +41,9 @@ writing a template and contributing it upstream.`,
 			if len(args) != 1 {
 				return usageError{"pass exactly one selector"}
 			}
+			if err := checkScannerDir("-nuclei-templates", nucleiDir); err != nil {
+				return err
+			}
 			store, err := g.Store()
 			if err != nil {
 				return err
@@ -52,7 +59,7 @@ writing a template and contributing it upstream.`,
 			}
 			var idx *scanners.Index
 			if dir := scanners.ResolveDir(nucleiDir); dir != "" {
-				if idx, err = scanners.Load(dir); err != nil {
+				if idx, err = loadNucleiIndex(dir); err != nil {
 					return err
 				}
 			}
@@ -97,20 +104,7 @@ writing a template and contributing it upstream.`,
 			}
 			kv("ports", strings.Join(ports, ", "))
 			if !c.Requires.Empty() {
-				var parts []string
-				if len(c.Requires.HostOS) > 0 {
-					parts = append(parts, "host_os "+strings.Join(c.Requires.HostOS, "/"))
-				}
-				if len(c.Requires.Arch) > 0 {
-					parts = append(parts, "arch "+strings.Join(c.Requires.Arch, "/"))
-				}
-				if c.Requires.KVM {
-					parts = append(parts, "kvm")
-				}
-				if !c.Requires.EmulationAllowed() {
-					parts = append(parts, "no-emulation")
-				}
-				kv("requires", strings.Join(parts, ", "))
+				kv("requires", requiresText(c.Requires))
 			}
 			if reason := runner.HostAccessReason(c); reason != "" {
 				kv("host access", reason+" -- run needs -allow-host-access (trust the template first)")
@@ -232,6 +226,70 @@ func probeSummary(p contract.Probe) string {
 		return fmt.Sprintf("exec %q stdout ~ /%s/", p.Exec.Run, p.Exec.StdoutMatches)
 	case "net":
 		return fmt.Sprintf("net :%d, %d-step dialogue", p.Net.Port, len(p.Net.Steps))
+	case "sequence":
+		s := p.Sequence
+		kinds := make([]string, 0, len(s.Steps))
+		for _, st := range s.Steps {
+			kinds = append(kinds, st.Kind())
+		}
+		return fmt.Sprintf("sequence x%d (min_hits %d): %s", s.AttemptCount(), s.MinHitCount(), strings.Join(kinds, ", "))
 	}
 	return p.Kind()
+}
+
+// loadNucleiIndex indexes a nuclei-templates checkout, reusing the index
+// cached under the user cache dir (vulnsuite/nuclei-index-*.json) while the
+// checkout's template files are unchanged.
+func loadNucleiIndex(dir string) (*scanners.Index, error) {
+	cache := ""
+	if base, err := os.UserCacheDir(); err == nil {
+		cache = filepath.Join(base, "vulnsuite")
+	}
+	return scanners.LoadCached(dir, cache)
+}
+
+// checkScannerDir makes an explicit scanner directory flag that is not a
+// directory a usage error. Without it a typo silently fell back to
+// $NUCLEI_TEMPLATES / ~/nuclei-templates (or $NMAPDIR / the system scripts).
+func checkScannerDir(flagName, dir string) error {
+	if dir == "" {
+		return nil
+	}
+	st, err := os.Stat(dir)
+	if err != nil {
+		var pe *fs.PathError
+		if errors.As(err, &pe) {
+			err = pe.Err
+		}
+		return usageError{fmt.Sprintf("%s %s: %v", flagName, dir, err)}
+	}
+	if !st.IsDir() {
+		return usageError{fmt.Sprintf("%s %s: not a directory", flagName, dir)}
+	}
+	return nil
+}
+
+// requiresText is a requires block on one line, for info and list's REQUIRES
+// column, e.g. "arch amd64, cpu_flags avx512f,bmi2".
+func requiresText(r contract.Requires) string {
+	var parts []string
+	if len(r.HostOS) > 0 {
+		parts = append(parts, "host_os "+strings.Join(r.HostOS, "/"))
+	}
+	if len(r.Arch) > 0 {
+		parts = append(parts, "arch "+strings.Join(r.Arch, "/"))
+	}
+	if r.KVM {
+		parts = append(parts, "kvm")
+	}
+	if r.Emulation != nil && !*r.Emulation { // cpu_flags imply it: not repeated
+		parts = append(parts, "no-emulation")
+	}
+	if len(r.CPUFlags) > 0 {
+		parts = append(parts, "cpu_flags "+strings.Join(r.CPUFlags, ","))
+	}
+	if r.Probe != nil {
+		parts = append(parts, fmt.Sprintf("probe (%s)", r.Probe.Reason))
+	}
+	return strings.Join(parts, ", ")
 }

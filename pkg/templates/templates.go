@@ -4,7 +4,6 @@ package templates
 
 import (
 	"archive/zip"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -48,8 +47,9 @@ func Resolve(flag string) (string, error) {
 	}
 	if cwd, err := os.Getwd(); err == nil {
 		// The working directory itself, or any parent up to the enclosing git
-		// repository root (so running from a subfolder of a templates checkout
-		// works, without wandering into unrelated parents).
+		// repository root or archive install (so running from a subfolder of
+		// a templates checkout works, without wandering into unrelated
+		// parents).
 		for _, dir := range candidateDirs(cwd) {
 			if HasTemplates(dir) {
 				return dir, nil
@@ -62,10 +62,10 @@ func Resolve(flag string) (string, error) {
 func candidateDirs(cwd string) []string {
 	dirs := []string{cwd}
 	dir := cwd
-	for i := 0; i < 8; i++ {
-		if isRepoRoot(dir) {
-			// Prefer the repository root (the whole templates tree) over a
-			// subfolder of it.
+	for i := 0; i < maxRootDepth; i++ {
+		if isTemplatesRoot(dir) {
+			// Prefer the repository or install root (the whole templates
+			// tree) over a subfolder of it.
 			for i, j := 0, len(dirs)-1; i < j; i, j = i+1, j-1 {
 				dirs[i], dirs[j] = dirs[j], dirs[i]
 			}
@@ -81,12 +81,48 @@ func candidateDirs(cwd string) []string {
 	return dirs[:1] // not inside a repository: only cwd counts
 }
 
+// maxRootDepth bounds how many parents are searched for a templates root.
+const maxRootDepth = 8
+
+// isTemplatesRoot reports whether dir is the root of a templates tree: a git
+// checkout, or an archive install carrying the version marker.
+func isTemplatesRoot(dir string) bool {
+	return isRepoRoot(dir) || isArchiveInstall(dir)
+}
+
+// isArchiveInstall reports whether dir was installed by update-templates.
+func isArchiveInstall(dir string) bool {
+	fi, err := os.Stat(filepath.Join(dir, versionFile))
+	return err == nil && fi.Mode().IsRegular()
+}
+
+// enclosingInstall returns the nearest proper ancestor of dir (searching
+// maxRootDepth levels) that is an archive install, or "".
+func enclosingInstall(dir string) string {
+	d := dir
+	for i := 0; i < maxRootDepth; i++ {
+		parent := filepath.Dir(d)
+		if parent == d {
+			return ""
+		}
+		d = parent
+		if isArchiveInstall(d) {
+			return d
+		}
+	}
+	return ""
+}
+
 func isRepoRoot(dir string) bool {
 	_, err := os.Stat(filepath.Join(dir, ".git"))
 	return err == nil
 }
 
-// HasTemplates reports whether dir contains at least one contract within three levels.
+// HasTemplates reports whether dir contains at least one vulnsuite contract
+// within three levels. A file only counts when it declares a vulnsuite
+// apiVersion: template.yaml is also the AWS SAM / CloudFormation file name,
+// and an unrelated project must not be taken for a templates checkout (and
+// then pulled or checked out by update-templates).
 func HasTemplates(dir string) bool {
 	found := false
 	var walk func(string, int)
@@ -110,7 +146,7 @@ func HasTemplates(dir string) bool {
 				continue
 			}
 			for _, n := range loader.ContractNames {
-				if e.Name() == n {
+				if e.Name() == n && isContract(filepath.Join(d, n)) {
 					found = true
 					return
 				}
@@ -119,6 +155,29 @@ func HasTemplates(dir string) bool {
 	}
 	walk(dir, 0)
 	return found
+}
+
+// isContract reports whether the file at p declares a top-level
+// `apiVersion: vulnsuite/...`, looking only at its first 64 KiB.
+func isContract(p string) bool {
+	f, err := os.Open(p)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	head, _ := io.ReadAll(io.LimitReader(f, 64<<10))
+	for _, line := range strings.Split(string(head), "\n") {
+		v, ok := strings.CutPrefix(line, "apiVersion:")
+		if !ok {
+			continue
+		}
+		if i := strings.Index(v, "#"); i >= 0 {
+			v = v[:i]
+		}
+		v = strings.Trim(strings.TrimSpace(v), `"'`)
+		return strings.HasPrefix(v, "vulnsuite/")
+	}
+	return false
 }
 
 // DefaultArchiveBaseURL serves GitHub repository archives as
@@ -139,6 +198,9 @@ type UpdateOptions struct {
 	// (no .vulnsuite-templates-version marker).
 	Force  bool
 	Output io.Writer
+	// Warn receives warnings about an update that succeeded (default Output),
+	// such as a previous tree that could not be removed.
+	Warn io.Writer
 
 	// ArchiveBaseURL overrides DefaultArchiveBaseURL (tests, mirrors).
 	ArchiveBaseURL string
@@ -149,7 +211,8 @@ type UpdateOptions struct {
 }
 
 // Update fetches the templates repository into Dir. A git checkout is pulled
-// (or, with Ref, fetched and checked out detached); otherwise Dir is replaced
+// (or, with Ref, fetched and checked out detached; without Ref, a detached
+// checkout returns to origin's default branch); otherwise Dir is replaced
 // by the GitHub archive of Ref, but only when Dir is missing, empty or was
 // installed by Update before, unless Force is set. It returns the directory
 // and the version string recorded.
@@ -163,6 +226,9 @@ func Update(ctx context.Context, o UpdateOptions) (string, string, error) {
 	if o.Output == nil {
 		o.Output = io.Discard
 	}
+	if o.Warn == nil {
+		o.Warn = o.Output
+	}
 	if o.GitTimeout <= 0 {
 		o.GitTimeout = DefaultGitTimeout
 	}
@@ -175,10 +241,42 @@ func Update(ctx context.Context, o UpdateOptions) (string, string, error) {
 	if o.Ref == "" {
 		o.Ref = DefaultBranch
 	}
-	if err := checkReplaceable(o.Dir, o.Force); err != nil {
+	// A symbolic link (~/vulnsuite-templates -> /data/tpl) is kept: the
+	// directory it points to is what gets checked and replaced, swapped next
+	// to itself, so the link resolves to the new tree afterwards.
+	target, err := resolveLink(o.Dir)
+	if err != nil {
 		return o.Dir, "", err
 	}
-	return updateArchive(ctx, o)
+	if target != o.Dir {
+		fmt.Fprintf(o.Output, "%s is a link to %s; updating %s\n", o.Dir, target, target)
+	}
+	if err := checkReplaceable(target, o.Force); err != nil {
+		return o.Dir, "", err
+	}
+	to := o
+	to.Dir = target
+	_, version, err := updateArchive(ctx, to)
+	return o.Dir, version, err
+}
+
+// resolveLink returns dir with symbolic links resolved when dir itself is a
+// link, else dir unchanged. A link to something missing or to a non-directory
+// is refused: replacing it would mean creating a tree at, or replacing, a
+// path the user only named indirectly.
+func resolveLink(dir string) (string, error) {
+	fi, err := os.Lstat(dir)
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		return dir, nil
+	}
+	target, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", fmt.Errorf("%s is a symbolic link that does not resolve (%v); create its target or remove the link", dir, err)
+	}
+	if tfi, err := os.Stat(target); err != nil || !tfi.IsDir() {
+		return "", fmt.Errorf("%s is a symbolic link to %s, which is not a directory", dir, target)
+	}
+	return target, nil
 }
 
 // updateGit updates a git checkout in place. It never falls back to replacing
@@ -213,8 +311,12 @@ func updateGit(ctx context.Context, o UpdateOptions) (string, string, error) {
 		return o.Dir, "", fmt.Errorf("%s is a git checkout: -repo is not used for checkouts; change its remote with `git remote set-url origin`", o.Dir)
 	}
 	if o.Ref == "" {
-		fmt.Fprintf(o.Output, "git pull in %s\n", o.Dir)
-		if _, err := git(o.GitTimeout, "pull", "--ff-only"); err != nil {
+		if _, err := git(o.GitTimeout, "symbolic-ref", "-q", "HEAD"); err == nil {
+			fmt.Fprintf(o.Output, "git pull in %s\n", o.Dir)
+			if _, err := git(o.GitTimeout, "pull", "--ff-only"); err != nil {
+				return o.Dir, "", err
+			}
+		} else if err := returnToDefaultBranch(o, git); err != nil {
 			return o.Dir, "", err
 		}
 	} else {
@@ -243,9 +345,65 @@ func updateGit(ctx context.Context, o UpdateOptions) (string, string, error) {
 	return o.Dir, strings.TrimSpace(rev), nil
 }
 
+// returnToDefaultBranch handles a plain update of a checkout whose HEAD is
+// detached (typically by an earlier -ref): it fetches origin and switches to
+// the remote's default branch (origin/HEAD, else DefaultBranch), fast-forwarding
+// it. It refuses, leaving the checkout untouched, when tracked files have
+// uncommitted changes or when HEAD holds commits no branch or tag keeps.
+func returnToDefaultBranch(o UpdateOptions, git func(time.Duration, ...string) (string, error)) error {
+	status, err := git(o.GitTimeout, "status", "--porcelain", "--untracked-files=no")
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(status) != "" {
+		return fmt.Errorf("%s is not on a branch (HEAD is detached, e.g. by -ref) and has uncommitted changes; commit or stash them, then rerun update-templates, or pass -ref to pick a ref", o.Dir)
+	}
+	fmt.Fprintf(o.Output, "git fetch origin in %s\n", o.Dir)
+	if _, err := git(o.GitTimeout, "fetch", "origin"); err != nil {
+		return err
+	}
+	branch := DefaultBranch
+	if out, err := git(o.GitTimeout, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"); err == nil {
+		if b, ok := strings.CutPrefix(strings.TrimSpace(out), "origin/"); ok && b != "" {
+			branch = b
+		}
+	}
+	if strings.HasPrefix(branch, "-") {
+		return fmt.Errorf("invalid default branch %q", branch)
+	}
+	remote := "refs/remotes/origin/" + branch
+	if _, err := git(o.GitTimeout, "rev-parse", "--verify", "-q", remote); err != nil {
+		return fmt.Errorf("%s is not on a branch (HEAD is detached) and origin has no %s branch; check out a branch yourself (git switch <branch>) or pass -ref", o.Dir, branch)
+	}
+	// Commits made on the detached HEAD would become unreachable: refuse.
+	if out, err := git(o.GitTimeout, "for-each-ref", "--count=1", "--contains", "HEAD", "refs/heads", "refs/remotes", "refs/tags"); err != nil {
+		return err
+	} else if strings.TrimSpace(out) == "" {
+		return fmt.Errorf("%s is not on a branch and HEAD has commits that no branch or tag keeps; save them on a branch (git switch -c <name>) before updating", o.Dir)
+	}
+	fmt.Fprintf(o.Output, "HEAD is detached; switching %s to %s (origin/%s)\n", o.Dir, branch, branch)
+	if _, err := git(o.GitTimeout, "rev-parse", "--verify", "-q", "refs/heads/"+branch); err == nil {
+		// An existing local branch is only fast-forwarded, never reset.
+		if _, err := git(o.GitTimeout, "checkout", "-q", branch, "--"); err != nil {
+			return err
+		}
+		if _, err := git(o.GitTimeout, "merge", "--ff-only", "-q", remote); err != nil {
+			return fmt.Errorf("%w (local branch %s has diverged from origin/%s; reconcile it yourself)", err, branch, branch)
+		}
+		return nil
+	}
+	_, err = git(o.GitTimeout, "checkout", "-q", "--track", "-b", branch, "origin/"+branch, "--")
+	return err
+}
+
 // checkReplaceable refuses to replace a directory update-templates did not
-// create: it must be missing, empty, or carry the version marker.
+// create: it must be missing, empty, or carry the version marker. A directory
+// inside an archive install is never replaced, even with force: that would
+// put the whole archive in one of its own subfolders.
 func checkReplaceable(dir string, force bool) error {
+	if root := enclosingInstall(dir); root != "" {
+		return fmt.Errorf("refusing to replace %s: it is inside the templates installed at %s; update that directory instead (-templates %s)", dir, root, root)
+	}
 	fi, err := os.Lstat(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -267,6 +425,19 @@ func checkReplaceable(dir string, force bool) error {
 		return nil
 	}
 	return fmt.Errorf("refusing to replace %s: it is not empty and was not installed by update-templates (no %s marker); point -templates at another directory, or pass -force to replace it", dir, versionFile)
+}
+
+// Archive limits. A templates archive is a few MiB; the caps leave ample
+// headroom while keeping a broken mirror or a zip bomb from exhausting memory
+// or disk. A variable so tests can lower them.
+var archiveLimits = struct {
+	download int64 // compressed bytes downloaded
+	extract  int64 // uncompressed bytes written, counted as they are written
+	entries  int   // zip entries (files, directories, skipped symlinks)
+}{
+	download: 256 << 20,
+	extract:  512 << 20,
+	entries:  50_000,
 }
 
 func updateArchive(ctx context.Context, o UpdateOptions) (string, string, error) {
@@ -294,39 +465,75 @@ func updateArchive(ctx context.Context, o UpdateOptions) (string, string, error)
 	if resp.StatusCode != http.StatusOK {
 		return o.Dir, "", fmt.Errorf("download %s: HTTP %d", url, resp.StatusCode)
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 2<<30))
-	if err != nil {
-		return o.Dir, "", err
-	}
 
 	parent, name := filepath.Dir(o.Dir), filepath.Base(o.Dir)
 	if err := os.MkdirAll(parent, 0o755); err != nil {
 		return o.Dir, "", err
 	}
+	// Stream the archive to disk next to the destination rather than into
+	// memory, and give up once it exceeds the cap.
+	zf, err := os.CreateTemp(parent, "."+name+".zip-")
+	if err != nil {
+		return o.Dir, "", err
+	}
+	defer func() {
+		zf.Close()
+		os.Remove(zf.Name())
+	}()
+	size, err := download(resp, zf, archiveLimits.download)
+	if err != nil {
+		return o.Dir, "", fmt.Errorf("download %s: %w; %s left unchanged", url, err, o.Dir)
+	}
+
 	tmp, err := os.MkdirTemp(parent, "."+name+".new-")
 	if err != nil {
 		return o.Dir, "", err
 	}
-	if err := unzipStripTop(data, tmp); err != nil {
+	links, err := unzipStripTop(zf, size, tmp)
+	if err != nil {
 		os.RemoveAll(tmp)
-		return o.Dir, "", err
+		return o.Dir, "", fmt.Errorf("extract %s@%s: %w; %s left unchanged", o.Repo, o.Ref, err, o.Dir)
+	}
+	if len(links) > 0 {
+		fmt.Fprintf(o.Output, "skipped %d symlink(s) in the archive (an archive install never creates symlinks; a template that needs one works only from a git checkout): %s\n", len(links), summarizePaths(links, 5))
+	}
+	if !HasTemplates(tmp) {
+		os.RemoveAll(tmp)
+		return o.Dir, "", fmt.Errorf("the archive of %s@%s contains no vulnsuite templates (no contract file); check -repo and -ref; %s left unchanged", o.Repo, o.Ref, o.Dir)
 	}
 	version := o.Repo + "@" + o.Ref + " " + time.Now().UTC().Format(time.RFC3339)
 	if err := os.WriteFile(filepath.Join(tmp, versionFile), []byte(version+"\n"), 0o644); err != nil {
 		os.RemoveAll(tmp)
 		return o.Dir, "", err
 	}
-	if err := swapDir(tmp, o.Dir); err != nil {
+	if err := swapDir(tmp, o.Dir, o.Warn); err != nil {
 		os.RemoveAll(tmp)
 		return o.Dir, "", err
 	}
 	return o.Dir, version, nil
 }
 
+// download copies the response body to f, failing once it exceeds limit
+// bytes, and returns the number of bytes written.
+func download(resp *http.Response, f *os.File, limit int64) (int64, error) {
+	if resp.ContentLength > limit {
+		return 0, fmt.Errorf("archive is %d bytes, over the %d byte limit", resp.ContentLength, limit)
+	}
+	n, err := io.Copy(f, io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return n, err
+	}
+	if n > limit {
+		return n, fmt.Errorf("archive is over the %d byte limit", limit)
+	}
+	return n, nil
+}
+
 // swapDir moves newDir into place at dir. The previous dir is kept under a
 // unique sibling name until newDir is in place, restored if that fails, and
-// only then removed.
-func swapDir(newDir, dir string) error {
+// only then removed. Once newDir is in place the swap has succeeded: a
+// previous tree that cannot be removed is reported to warn, not returned as an error.
+func swapDir(newDir, dir string, warn io.Writer) error {
 	if _, err := os.Lstat(dir); errors.Is(err, os.ErrNotExist) {
 		return os.Rename(newDir, dir)
 	}
@@ -347,7 +554,10 @@ func swapDir(newDir, dir string) error {
 		}
 		return err
 	}
-	return os.RemoveAll(old)
+	if err := os.RemoveAll(old); err != nil {
+		fmt.Fprintf(warn, "warning: the templates were updated, but the previous copy could not be removed: %v; delete %s yourself\n", err, old)
+	}
+	return nil
 }
 
 // renameDir is os.Rename; a variable so tests can make the swap fail.
@@ -367,18 +577,37 @@ func Version(dir string) string {
 	return strings.TrimSpace(string(b))
 }
 
+// errExtractLimit is returned once the extracted bytes exceed the cap.
+var errExtractLimit = errors.New("archive expands beyond the size limit")
+
+// summarizePaths joins up to max paths, noting how many more there are.
+func summarizePaths(paths []string, max int) string {
+	if len(paths) <= max {
+		return strings.Join(paths, ", ")
+	}
+	return fmt.Sprintf("%s and %d more", strings.Join(paths[:max], ", "), len(paths)-max)
+}
+
 // unzipStripTop extracts a GitHub archive (single top-level folder) into dst.
 // Only directories and regular files are extracted: symlinks (and any other
-// special entries) are skipped, and entries escaping dst are rejected.
-func unzipStripTop(data []byte, dst string) error {
-	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+// special entries) are skipped, and entries escaping dst are rejected. The
+// number of entries and the total bytes written are capped by archiveLimits;
+// bytes are counted as written, whatever sizes the entry headers declare.
+// It returns the archive paths (top folder stripped) of the skipped symlinks.
+func unzipStripTop(r io.ReaderAt, size int64, dst string) ([]string, error) {
+	zr, err := zip.NewReader(r, size)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	if n := len(zr.File); n > archiveLimits.entries {
+		return nil, fmt.Errorf("archive has %d entries, over the %d entry limit", n, archiveLimits.entries)
 	}
 	if err := os.MkdirAll(dst, 0o755); err != nil {
-		return err
+		return nil, err
 	}
+	var links []string
 	root := filepath.Clean(dst) + string(os.PathSeparator)
+	budget := archiveLimits.extract
 	for _, f := range zr.File {
 		name := f.Name
 		if i := strings.Index(name, "/"); i >= 0 {
@@ -391,46 +620,60 @@ func unzipStripTop(data []byte, dst string) error {
 		}
 		target := filepath.Join(dst, filepath.FromSlash(name))
 		if !strings.HasPrefix(target, root) {
-			return errors.New("archive contains an unsafe path: " + f.Name)
+			return links, errors.New("archive contains an unsafe path: " + f.Name)
 		}
 		mode := f.Mode()
 		if mode.IsDir() {
 			if err := os.MkdirAll(target, 0o755); err != nil {
-				return err
+				return links, err
 			}
 			continue
 		}
 		if !mode.IsRegular() {
-			continue // symlink, device, ...: never materialise it
+			// symlink, device, ...: never materialise it
+			if mode&os.ModeSymlink != 0 {
+				links = append(links, name)
+			}
+			continue
 		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return err
+			return links, err
 		}
-		if err := extractFile(f, target); err != nil {
-			return err
+		n, err := extractFile(f, target, budget)
+		if err != nil {
+			if errors.Is(err, errExtractLimit) {
+				return links, fmt.Errorf("%w of %d bytes (at %s)", err, archiveLimits.extract, f.Name)
+			}
+			return links, err
 		}
+		budget -= n
 	}
-	return nil
+	return links, nil
 }
 
-func extractFile(f *zip.File, target string) error {
+// extractFile writes f to target, at most budget bytes; one byte more fails
+// with errExtractLimit. It returns the bytes written.
+func extractFile(f *zip.File, target string, budget int64) (int64, error) {
 	perm := os.FileMode(0o644)
 	if f.Mode()&0o111 != 0 {
 		perm = 0o755
 	}
 	rc, err := f.Open()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer rc.Close()
 	// O_EXCL: never follow or overwrite something already at target.
 	out, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, perm)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	_, err = io.Copy(out, rc)
+	n, err := io.Copy(out, io.LimitReader(rc, budget+1))
 	if cerr := out.Close(); err == nil {
 		err = cerr
 	}
-	return err
+	if err == nil && n > budget {
+		err = errExtractLimit
+	}
+	return n, err
 }

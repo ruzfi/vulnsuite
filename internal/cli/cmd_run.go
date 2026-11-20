@@ -7,13 +7,16 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
+	"time"
 
 	"github.com/ruzfi/vulnsuite/pkg/builder"
 	"github.com/ruzfi/vulnsuite/pkg/contract"
+	"github.com/ruzfi/vulnsuite/pkg/loader"
 	"github.com/ruzfi/vulnsuite/pkg/runner"
 	"github.com/ruzfi/vulnsuite/pkg/scanners"
 )
@@ -41,6 +44,29 @@ func (p portMapFlag) Set(v string) error {
 		return fmt.Errorf("container port %d is mapped more than once", cp)
 	}
 	(*p.m)[cp] = hp
+	return nil
+}
+
+// checkHostPortMap rejects -host-port-map keys that are not ports the target
+// publishes in host mode: such a pin would be silently ignored.
+func checkHostPortMap(m map[int]int, c *contract.Contract) error {
+	pubs := c.Service.HostPublishPorts()
+	published := map[int]bool{}
+	var list []string
+	for _, p := range pubs {
+		published[p.Container] = true
+		list = append(list, strconv.Itoa(p.Container))
+	}
+	keys := make([]int, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+	for _, k := range keys {
+		if !published[k] {
+			return usageError{fmt.Sprintf("-host-port-map %d=%d: %s does not publish container port %d (it publishes %s)", k, m[k], c.ID(), k, strings.Join(list, ", "))}
+		}
+	}
 	return nil
 }
 
@@ -91,6 +117,16 @@ type outcomeEntry struct {
 	State  string `json:"state,omitempty"`
 	Reason string `json:"reason"`
 	Detail string `json:"detail,omitempty"`
+	// Cause and Missing say, for a requires skip, which requirement the host
+	// does not meet (runner.Cause*) and what it lacks.
+	Cause   string   `json:"cause,omitempty"`
+	Missing []string `json:"missing,omitempty"`
+}
+
+// requiresSkip is the -summary entry of a target the host's requires
+// preflight skipped.
+func requiresSkip(id, state string, d runner.Decision) outcomeEntry {
+	return outcomeEntry{ID: id, State: state, Reason: reasonRequires, Detail: d.Reason, Cause: d.Cause, Missing: d.Missing}
 }
 
 // runSummary is `run -json -summary`: what started, what failed and what was
@@ -145,7 +181,7 @@ Exposure modes:
 			fs.StringVar(&platform, "platform", "", "target platform for builds, e.g. linux/amd64")
 			fs.StringVar(&readyTimeout, "ready-timeout", "", "override every template's healthcheck timeout, e.g. 120s")
 			fs.StringVar(&nucleiDir, "nuclei-templates", "", "nuclei-templates checkout used to resolve the scanner templates shown for each target")
-			fs.BoolVar(&ignoreRequires, "ignore-requires", false, "run even when the host does not meet a target's requires (arch/kvm/host_os)")
+			fs.BoolVar(&ignoreRequires, "ignore-requires", false, "run even when the host does not meet a target's requires (arch/kvm/host_os/cpu_flags; requires.probe is not run)")
 			fs.BoolVar(&allowHostAccess, "allow-host-access", false, "honor a template's host device passthrough and elevated capabilities (host-access primitives; only for templates you trust)")
 			fs.BoolVar(&summary, "summary", false, "with -json, print {targets, failed, skipped} instead of the bare array of started targets")
 		},
@@ -154,19 +190,23 @@ Exposure modes:
 				return usageError{"-summary shapes the -json output; add -json"}
 			}
 			// sum collects every selected target's fate for -summary. Once the
-			// selection is resolved it is emitted on every way out (success,
+			// selection is resolved the -json output (the summary, or the bare
+			// array of started targets) is emitted on every way out (success,
 			// failure, interrupt) except a usage error, so a pipeline always
 			// gets a document to parse.
 			sum := runSummary{Targets: []*runner.Handle{}, Failed: []outcomeEntry{}, Skipped: []outcomeEntry{}}
 			resolved, emitted := false, false
-			emitSummary := func() error {
+			emitOutput := func() error {
 				emitted = true
-				return g.emitJSON(sum)
+				if summary {
+					return g.emitJSON(sum)
+				}
+				return g.emitJSON(sum.Targets)
 			}
 			defer func() {
 				var ue usageError
-				if summary && resolved && !emitted && !errors.As(retErr, &ue) {
-					retErr = errors.Join(retErr, emitSummary())
+				if g.JSON && resolved && !emitted && !errors.As(retErr, &ue) {
+					retErr = errors.Join(retErr, emitOutput())
 				}
 			}()
 			skip := func(cs []*contract.Contract, state, reason, detail string) {
@@ -181,6 +221,9 @@ Exposure modes:
 			default:
 				return usageError{fmt.Sprintf("unknown -expose mode %q (internal, host or macvlan)", exp.Mode)}
 			}
+			if err := checkScannerDir("-nuclei-templates", nucleiDir); err != nil {
+				return err
+			}
 			if maxConcurrent < 1 {
 				return usageError{fmt.Sprintf("-max-concurrent must be at least 1, got %d", maxConcurrent)}
 			}
@@ -190,6 +233,25 @@ Exposure modes:
 			}
 			if pinned && exp.Mode != runner.ModeHost {
 				return usageError{"-host-port / -host-port-map need -expose host"}
+			}
+			// Flags of another exposure mode would be silently ignored.
+			if exp.Mode != runner.ModeHost && flagSet(fs, "bind") {
+				return usageError{fmt.Sprintf("-bind is used only by -expose host (the mode is %s)", exp.Mode)}
+			}
+			if exp.Mode != runner.ModeMacvlan {
+				for _, name := range []string{"parent", "ip", "subnet", "gateway"} {
+					if flagSet(fs, name) {
+						return usageError{fmt.Sprintf("-%s is used only by -expose macvlan (the mode is %s)", name, exp.Mode)}
+					}
+				}
+			}
+			var readyTimeoutD time.Duration
+			if readyTimeout != "" {
+				d, err := contract.ParseDuration(readyTimeout, 0)
+				if err != nil {
+					return usageError{"-ready-timeout: " + err.Error()}
+				}
+				readyTimeoutD = d
 			}
 			state, args, err := takeState(args)
 			if err != nil {
@@ -245,14 +307,15 @@ Exposure modes:
 			var skippedReq, skippedHost []string
 			platformFor := map[*contract.Contract]string{}
 			eligible := runnable[:0:0]
+			pf := &preflighter{ctx: ctx, g: g, eng: eng, host: host, noPull: noPull, noRead: ignoreRequires}
 			for _, c := range runnable {
 				if !c.Requires.Empty() {
-					d := runner.Preflight(c.Requires, host)
+					d := pf.decide(c.Requires)
 					switch {
 					case d.Skip() && !ignoreRequires:
 						g.printf("skip %s: %s\n", c.ID(), d.Reason)
 						skippedReq = append(skippedReq, c.ID())
-						skip([]*contract.Contract{c}, state, reasonRequires, d.Reason)
+						sum.Skipped = append(sum.Skipped, requiresSkip(c.ID(), state, d))
 						continue
 					case d.Skip() && ignoreRequires:
 						g.printf("%s does not meet requires (%s) -- running anyway (-ignore-requires)\n", c.ID(), d.Reason)
@@ -316,21 +379,24 @@ Exposure modes:
 			if multi && pinned {
 				return usageError{fmt.Sprintf("-host-port / -host-port-map pin one target's ports but %d targets would start (%s); select one target, or omit them for free ports", len(runnable), contractIDs(runnable))}
 			}
-
-			opts := runner.Options{Verify: !noVerify, AllowHostAccess: allowHostAccess, Build: builder.Options{Pull: !noPull, NoCache: noCache, Force: force, Platform: platform}}
-			if readyTimeout != "" {
-				d, err := contract.ParseDuration(readyTimeout, 0)
-				if err != nil {
-					return usageError{err.Error()}
+			if len(runnable) == 1 && len(exp.HostPortMap) > 0 {
+				if err := checkHostPortMap(exp.HostPortMap, runnable[0]); err != nil {
+					return err
 				}
-				opts.ReadyTimeout = d
 			}
+
+			opts := runner.Options{Verify: !noVerify, AllowHostAccess: allowHostAccess, IgnoreRequires: ignoreRequires, Build: builder.Options{Pull: !noPull, NoCache: noCache, Force: force, Platform: platform}}
+			opts.ReadyTimeout = readyTimeoutD
 			if !g.JSON && !g.Quiet {
 				opts.Build.Output = g.Stdout
 			}
+			// The index only feeds the "scanner templates" lines, which -q
+			// does not print: skip indexing the checkout then.
 			var idx *scanners.Index
-			if dir := scanners.ResolveDir(nucleiDir); dir != "" {
-				idx, _ = scanners.Load(dir)
+			if dir := scanners.ResolveDir(nucleiDir); dir != "" && !g.Quiet {
+				if idx, err = loadNucleiIndex(dir); err != nil {
+					return err
+				}
 			}
 			var handles []*runner.Handle
 			var failures []string
@@ -364,6 +430,13 @@ Exposure modes:
 						cancelled = true
 						break
 					}
+					// requires.probe: the host lacks something; a skip, not a failure.
+					if se, ok := runner.AsSkip(err); ok {
+						g.printf("skip %s: %s\n", c.ID(), se.Decision.Reason)
+						skippedReq = append(skippedReq, c.ID())
+						sum.Skipped = append(sum.Skipped, requiresSkip(c.ID(), state, se.Decision))
+						continue
+					}
 					g.errorf("  could not run %s: %v\n", c.ID(), err)
 					failures = append(failures, c.ID())
 					sum.Failed = append(sum.Failed, outcomeEntry{ID: c.ID(), State: state, Reason: reasonStart, Detail: err.Error()})
@@ -374,14 +447,10 @@ Exposure modes:
 					cancelled = true
 					break
 				}
-				verb := "reused"
-				switch {
-				case h.Image.Built:
-					verb = "built"
-				case h.Image.Pulled:
-					verb = "pulled"
+				g.printf("  image: %s (%s)\n", h.Image.Ref, resolvedVerb(h.Image))
+				for _, sr := range h.Image.Sidecars {
+					g.printf("  sidecar %s image: %s (%s)\n", sr.Sidecar, sr.Ref, resolvedVerb(sr))
 				}
-				g.printf("  image: %s (%s)\n", h.Image.Ref, verb)
 				if !h.Ready {
 					why := h.ReadyDetail
 					if why == "" {
@@ -431,15 +500,14 @@ Exposure modes:
 
 			sum.Targets = append(sum.Targets, handles...)
 			switch {
-			case summary:
-				if err := emitSummary(); err != nil {
-					return err
-				}
 			case g.JSON:
-				if err := g.emitJSON(handles); err != nil {
+				if err := emitOutput(); err != nil {
 					return err
 				}
 			default:
+				// The URLs are the command's output: -q drops the header and
+				// the hints, never the list (as with `vulnsuite -q targets`).
+				out := func(format string, a ...any) { fmt.Fprintf(g.Stdout, format, a...) }
 				g.printf("\nScan these with your probe:\n")
 				for _, h := range handles {
 					extra := ""
@@ -448,7 +516,7 @@ Exposure modes:
 					}
 					pts := h.PortTargets()
 					if len(pts) == 0 {
-						g.printf("  %-52s %s%s\n", fmt.Sprintf("%s [%s]", h.ID, h.State), h.ScannerTarget(), extra)
+						out("  %-52s %s%s\n", fmt.Sprintf("%s [%s]", h.ID, h.State), h.ScannerTarget(), extra)
 						continue
 					}
 					for _, pt := range pts {
@@ -457,7 +525,7 @@ Exposure modes:
 						if len(pts) > 1 {
 							note = fmt.Sprintf("  (container port %d)%s", pt.ContainerPort, extra)
 						}
-						g.printf("  %-52s %s%s\n", tag, pt.URL, note)
+						out("  %-52s %s%s\n", tag, pt.URL, note)
 					}
 				}
 				if handles[0].Exposure.Mode == runner.ModeInternal {
@@ -609,29 +677,52 @@ func cmdStop() *Command {
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
 			sel = append(sel, args...)
+			if pruneNet && len(sel) > 0 {
+				return usageError{"-prune-net removes the network only when stopping everything; drop the selectors, or run `vulnsuite stop -prune-net` once the rest is down"}
+			}
 			eng, err := g.Engine(ctx)
 			if err != nil {
 				return err
 			}
 			r := runner.New(eng)
 			var ids []string
+			var stopErrs []error
 			if len(sel) > 0 {
 				store, err := g.Store()
 				if err != nil {
 					return err
 				}
-				cs, _, err := gather(store, sel, false, variantsStop)
+				cs, loadErrs, err := gather(store, sel, false, variantsStop)
 				if err != nil {
 					return err
 				}
 				for _, c := range cs {
 					ids = append(ids, c.ID())
 				}
+				// A template that no longer loads (broken after an update,
+				// say) may still have a target running: stop it by the id
+				// its contract declares. Only when even that is unreadable
+				// is it an error, never a silent "nothing to stop".
+				for _, le := range loadErrs {
+					var e *loader.Error
+					id := ""
+					if errors.As(le, &e) {
+						id = loader.PeekID(e.Path)
+					}
+					if id == "" {
+						stopErrs = append(stopErrs, le)
+						continue
+					}
+					g.errorf("warning: %v; stopping %s by its declared id\n", le, id)
+					ids = append(ids, id)
+				}
+				if len(ids) == 0 {
+					return errors.Join(stopErrs...)
+				}
 			} else {
 				ids = []string{""}
 			}
 			removed := []string{} // -json prints [] (not null) when nothing ran
-			var stopErrs []error
 			for _, id := range ids {
 				names, err := r.StopAll(ctx, id)
 				removed = append(removed, names...)
@@ -683,6 +774,7 @@ func cmdPS() *Command {
 		Flags: func(fs *flag.FlagSet) {
 			fs.StringVar(&network, "network", runner.DefaultNetwork, "internal network name")
 		},
+		NoArgs: true,
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
 			eng, err := g.Engine(ctx)
 			if err != nil {
@@ -734,16 +826,28 @@ the subnet. Non-HTTP targets come out as host:port for network templates.`,
 			fs.StringVar(&by, "by", "auto", "address targets by: auto (published host binding if any, else container ip), ip, alias, or host")
 			fs.StringVar(&network, "network", runner.DefaultNetwork, "internal network name")
 		},
-		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
+		NoArgs: true,
+		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) (retErr error) {
 			switch by {
 			case "auto", "ip", "alias", "host":
 			default:
 				return usageError{fmt.Sprintf("unknown -by %q (auto, ip, alias or host)", by)}
 			}
-			store, err := g.Store()
-			if err != nil {
-				return err
+			type pair struct {
+				ID    string `json:"id"`
+				State string `json:"state"`
+				URL   string `json:"url"`
 			}
+			// With -json the list is printed on every way out but a usage
+			// error, like ps -json: [] when nothing is running or the engine
+			// is unreachable, the URLs resolved so far on a later failure.
+			pairs := []pair{}
+			emitted := false
+			defer func() {
+				if g.JSON && !emitted {
+					retErr = errors.Join(retErr, g.emitJSON(pairs))
+				}
+			}()
 			eng, err := g.Engine(ctx)
 			if err != nil {
 				return err
@@ -755,23 +859,49 @@ the subnet. Non-HTTP targets come out as host:port for network templates.`,
 			if len(rows) == 0 {
 				return fmt.Errorf("no targets running.  start some with:  vulnsuite run -t <selector>")
 			}
-			byID, err := store.ByID()
-			if err != nil {
-				return err
-			}
-			type pair struct {
-				ID    string `json:"id"`
-				State string `json:"state"`
-				URL   string `json:"url"`
-			}
-			var pairs []pair
-			for _, r := range rows {
+			// The published ports and schemes come from the container (recorded
+			// at run time), so a target whose template is outside the templates
+			// root, or no longer loads, is still addressable. Only containers
+			// from before that label fall back to the templates store.
+			var byID map[string]*contract.Contract
+			var storeRoot string
+			var storeErr error
+			loaded := false
+			portsOf := func(r runner.Target) ([]runner.PublishedPort, error) {
+				if r.Published != nil {
+					return r.Published, nil
+				}
+				if !loaded {
+					loaded = true
+					store, err := g.Store()
+					if err == nil {
+						storeRoot = store.Root
+						byID, err = store.ByID()
+					}
+					storeErr = err
+				}
+				if storeErr != nil {
+					return nil, fmt.Errorf("no ports recorded on the container and the templates store is unavailable: %v", storeErr)
+				}
 				c, ok := byID[r.ID]
 				if !ok {
-					g.errorf("skip %s: template not found in %s\n", r.ID, store.Root)
+					return nil, fmt.Errorf("no ports recorded on the container and the template is not in %s", storeRoot)
+				}
+				var out []runner.PublishedPort
+				for _, pp := range c.Service.HostPublishPorts() {
+					out = append(out, runner.PublishedPort{ContainerPort: pp.Container, Scheme: pp.Scheme()})
+				}
+				return out, nil
+			}
+			unresolved, noAddr := 0, 0
+			for _, r := range rows {
+				published, err := portsOf(r)
+				if err != nil {
+					g.errorf("skip %s [%s]: %v (restart it with `vulnsuite run` to record its ports)\n", r.ID, r.State, err)
+					unresolved++
 					continue
 				}
-				published := c.Service.HostPublishPorts()
+				before := len(pairs)
 				// host mode (explicit, or auto when the target has host bindings):
 				// one row per actual host binding, primary first.
 				if by == "host" || (by == "auto" && len(r.Ports) > 0) {
@@ -780,30 +910,47 @@ the subnet. Non-HTTP targets come out as host:port for network templates.`,
 						bind[pb.ContainerPort] = pb
 					}
 					for _, pp := range published {
-						pb, ok := bind[pp.Container]
+						pb, ok := bind[pp.ContainerPort]
 						if !ok {
 							continue
 						}
 						pairs = append(pairs, pair{r.ID, r.State,
-							runner.FormatTarget(pp.Scheme(), reportableHostIP(pb.HostIP), pb.HostPort)})
+							runner.FormatTarget(pp.Scheme, reportableHostIP(pb.HostIP), pb.HostPort)})
 					}
-					continue
+				} else {
+					// alias / ip (and auto with no host bindings): address each
+					// published container port at the alias or container IP.
+					for _, pp := range published {
+						host := r.IP
+						if by == "alias" {
+							host = runner.TargetAlias(r.ID, r.State)
+						}
+						if host == "" {
+							continue
+						}
+						pairs = append(pairs, pair{r.ID, r.State, runner.FormatTarget(pp.Scheme, host, pp.ContainerPort)})
+					}
 				}
-				// alias / ip (and auto with no host bindings): address each
-				// published container port at the alias or container IP.
-				for _, pp := range published {
-					host := r.IP
-					if by == "alias" {
-						host = runner.TargetAlias(r.ID, r.State)
-					}
-					if host == "" {
-						continue
-					}
-					pairs = append(pairs, pair{r.ID, r.State, runner.FormatTarget(pp.Scheme(), host, pp.Container)})
+				if len(pairs) == before {
+					noAddr++
 				}
 			}
 			if len(pairs) == 0 {
-				return fmt.Errorf("running targets have no resolvable address yet (try again in a moment, or -by alias)")
+				var why []string
+				if unresolved > 0 {
+					why = append(why, fmt.Sprintf("%d with no known ports (see above)", unresolved))
+				}
+				if noAddr > 0 {
+					hint := "no container ip on the network; try -by alias"
+					switch by {
+					case "host":
+						hint = "not published on the host; run with -expose host, or use -by ip / -by alias"
+					case "alias":
+						hint = "no published ports"
+					}
+					why = append(why, fmt.Sprintf("%d with no address -by %s (%s)", noAddr, by, hint))
+				}
+				return fmt.Errorf("no scannable address for the %d running target(s): %s", len(rows), strings.Join(why, "; "))
 			}
 			// -file is written whatever the output format, so
 			// `vulnsuite -json targets -file F && nuclei -l F` works.
@@ -817,6 +964,7 @@ the subnet. Non-HTTP targets come out as host:port for network templates.`,
 				}
 			}
 			if g.JSON {
+				emitted = true
 				return g.emitJSON(pairs)
 			}
 			if file != "" {
