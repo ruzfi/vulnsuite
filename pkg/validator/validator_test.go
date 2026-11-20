@@ -485,3 +485,54 @@ func TestMissingDockerfileOverlaid(t *testing.T) {
 		}
 	}
 }
+
+func TestVerificationRules(t *testing.T) {
+	v := &Validator{}
+	withMeta := func(meta, extra string) *contract.Contract {
+		return parse(t, strings.Replace(base, "metadata: { id: lint-demo,", "metadata: { "+meta+" id: lint-demo,", 1)+extra)
+	}
+	// default (verified, no requires): nothing
+	r := rules(v.Check(parse(t, base)))
+	for _, rule := range []string{"unverified-target", "verified-no-evidence", "verified-on-stale"} {
+		if _, bad := r[rule]; bad {
+			t.Errorf("plain contract: unexpected %s", rule)
+		}
+	}
+	// unverified: a warning, and every other rule still runs
+	r = rules(v.Check(withMeta("verification: unverified,", "")))
+	if r["unverified-target"] != Warning {
+		t.Error("unverified-target warning expected")
+	}
+	if r["identical-states"] != Warning {
+		t.Error("an unverified target must still get the other rules (identical-states)")
+	}
+	// explicitly verified, host-specific requires, no evidence
+	cpu := "requires: { cpu_flags: [avx512vbmi] }\n"
+	if rules(v.Check(withMeta("verification: verified,", cpu)))["verified-no-evidence"] != Warning {
+		t.Error("verified-no-evidence expected")
+	}
+	// the default does not trip it: only an explicit claim does
+	if _, bad := rules(v.Check(withMeta("", cpu)))["verified-no-evidence"]; bad {
+		t.Error("verified-no-evidence must need an explicit verification: verified")
+	}
+	stamp := func(flags, states string) string {
+		return `verification: verified, verified_on: { date: "2026-11-21", vulnsuite: v0.4.0, host: linux/amd64, cpu_flags: [` +
+			flags + `], states: [` + states + `] },`
+	}
+	r = rules(v.Check(withMeta(stamp("avx512vbmi", "vulnerable, patched"), cpu)))
+	for _, rule := range []string{"verified-no-evidence", "verified-on-stale"} {
+		if _, bad := r[rule]; bad {
+			t.Errorf("full stamp: unexpected %s", rule)
+		}
+	}
+	// a cpu flag added after the stamp, and a state the stamp names but the
+	// template dropped, are stale evidence
+	if rules(v.Check(withMeta(stamp("", "vulnerable"), cpu)))["verified-on-stale"] != Warning {
+		t.Error("verified-on-stale expected for an unchecked cpu flag")
+	}
+	noPatched := strings.Replace(base, "  patched:\n    verify: [ { http: { path: /, status_in: [404] } } ]\n", "", 1)
+	c := parse(t, strings.Replace(noPatched, "metadata: { id: lint-demo,", "metadata: { "+stamp("", "vulnerable, patched")+" id: lint-demo,", 1))
+	if rules(v.Check(c))["verified-on-stale"] != Warning {
+		t.Error("verified-on-stale expected for an undeclared state")
+	}
+}

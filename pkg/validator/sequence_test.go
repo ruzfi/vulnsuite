@@ -45,7 +45,7 @@ var (
 
 var sequenceRules = []string{"sequence-unbalanced-freeze", "exec-in-frozen-target", "network-step-while-frozen",
 	"unknown-sidecar", "sanitizer-without-log-dir", "sequence-no-assertion", "race-no-positive-control",
-	"sanitizer-log-path", "bad-regex", "undeclared-port"}
+	"sanitizer-log-path", "bad-regex", "undeclared-port", "sanitizer-while-frozen"}
 
 func TestSequenceRules(t *testing.T) {
 	with := func(steps []string, i int, s string) []string {
@@ -73,6 +73,8 @@ func TestSequenceRules(t *testing.T) {
 		{"net while frozen", logDir, with(goodVulnerable, 2, `net: { steps: [ { expect: x } ] }`), "network-step-while-frozen", Error},
 		{"http outside freeze", logDir, with(goodVulnerable, 0, `http: { path: /, status: 200 }`), "", ""},
 		{"sleep and expect while frozen", logDir, with(with(goodVulnerable, 2, "sleep: { ms: 50 }"), 3, "expect_log: x"), "", ""},
+		{"none while frozen", logDir, with(goodPatched, 2, "expect_sanitizer: none"), "sanitizer-while-frozen", Warning},
+		{"positive while frozen", logDir, with(goodVulnerable, 2, "expect_sanitizer: { kind: heap-use-after-free }"), "sanitizer-while-frozen", Warning},
 		{"unknown sidecar", logDir, with(goodVulnerable, 0, `exec: { container: dns, run: "true" }`), "unknown-sidecar", Error},
 		{"sanitizer without log_dir", "", goodVulnerable, "sanitizer-without-log-dir", Error},
 		{"none without log_dir", "", goodPatched, "sanitizer-without-log-dir", Error},

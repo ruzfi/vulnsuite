@@ -64,17 +64,21 @@ type listRow struct {
 	KEV       *bool    `json:"kev,omitempty"`
 	// KEVSource is where the KEV column came from and how old it is (the same
 	// for every row; per row so -json stays a plain array).
-	KEVSource  *kevSourceInfo `json:"kev_source,omitempty"`
-	Year       string         `json:"year,omitempty"`
-	Disclosed  string         `json:"disclosed,omitempty"`
-	States     []string       `json:"states"`
-	BuildKind  string         `json:"build_kind"`
-	Fidelity   string         `json:"fidelity"`
-	VulnRefs   []string       `json:"vuln_refs"`
-	Detection  string         `json:"detection,omitempty"`
-	DetectedBy []string       `json:"detected_by,omitempty"`
-	Tags       []string       `json:"tags,omitempty"`
-	HostAccess bool           `json:"host_access,omitempty"`
+	KEVSource *kevSourceInfo `json:"kev_source,omitempty"`
+	Year      string         `json:"year,omitempty"`
+	Disclosed string         `json:"disclosed,omitempty"`
+	States    []string       `json:"states"`
+	BuildKind string         `json:"build_kind"`
+	Fidelity  string         `json:"fidelity"`
+	// Verification is verified or unverified (metadata.verification, with
+	// its default), and VerifiedOn the evidence of the last verifying run.
+	Verification string               `json:"verification"`
+	VerifiedOn   *contract.VerifiedOn `json:"verified_on,omitempty"`
+	VulnRefs     []string             `json:"vuln_refs"`
+	Detection    string               `json:"detection,omitempty"`
+	DetectedBy   []string             `json:"detected_by,omitempty"`
+	Tags         []string             `json:"tags,omitempty"`
+	HostAccess   bool                 `json:"host_access,omitempty"`
 	// Requires is the template's requires block (absent when it has none).
 	Requires *contract.Requires `json:"requires,omitempty"`
 	Summary  string             `json:"summary"`
@@ -127,7 +131,7 @@ func cmdList() *Command {
 	return &Command{
 		Name: "list", Aliases: []string{"ls", "search"},
 		Short: "list and filter templates by class, KEV, product surface, CVE and year",
-		Usage: "[selector...] [-group H] [-variants] [-ref ID]... [-class C]... [-kev] [-category P] [-cve] [-year YYYY]",
+		Usage: "[selector...] [-group H] [-variants] [-ref ID]... [-class C]... [-kev] [-category P] [-cve] [-unverified] [-year YYYY]",
 		Long: `A selector is a folder, a contract file, or a template id (substring match
 when unique). A ref-shaped selector (CVE-..., GHSA-..., GO-..., VS-...) that
 matches no id/file/folder resolves against vuln_refs instead, so
@@ -148,6 +152,11 @@ from contract metadata (taxonomy v2) and shown as columns:
                web-servers, databases, network-services, iot, misc). Alias -product.
   -cve/-no-cve has / has no CVE id in vuln_refs (boolean; use -ref for a specific id)
   -kev/-no-kev on / not on the CISA Known Exploited Vulnerabilities catalog
+  -verified/-unverified
+               metadata.verification: unverified targets are statically valid
+               but nobody has run their states yet (VERIFIED shows "no"; a
+               date is the last ` + "`vulnsuite stamp`" + ` run, "yes" a verified target
+               with no recorded run)
   -year        disclosure year (metadata.disclosed, else the CVE-id year)
   -since       disclosed on or after this ISO date (YYYY-MM-DD)
 
@@ -277,7 +286,8 @@ gets a warning. Offline with neither present, KEV is shown as "?" and
 					Category:  store.Category(p), Severity: c.Metadata.Severity,
 					Class: c.Classes(), CVE: c.IsCVETracked(), Year: c.Year(), Disclosed: c.Metadata.Disclosed,
 					States: c.DeclaredStates(), BuildKind: c.BuildKind(contract.StateVulnerable),
-					Fidelity: c.Fidelity(), VulnRefs: c.Metadata.VulnRefs,
+					Fidelity: c.Fidelity(), Verification: c.Verification(), VerifiedOn: c.Metadata.VerifiedOn,
+					VulnRefs:  c.Metadata.VulnRefs,
 					Detection: c.Metadata.Detection, DetectedBy: c.Metadata.DetectedBy, Tags: c.Metadata.Tags,
 					HostAccess: runner.HostAccessReason(c) != "",
 					Summary:    c.Metadata.Summary, Path: p,
@@ -310,10 +320,10 @@ gets a warning. Offline with neither present, KEV is shown as "?" and
 				return nil
 			}
 			tw := tabwriter.NewWriter(g.Stdout, 2, 4, 2, ' ', 0)
-			fmt.Fprintln(tw, "ID\tCATEGORY\tGROUP\tSEV\tCLASS\tCVE\tKEV\tFIDELITY\tKIND\tREQUIRES\tREFS\tDETECTED BY")
+			fmt.Fprintln(tw, "ID\tCATEGORY\tGROUP\tSEV\tCLASS\tCVE\tKEV\tFIDELITY\tVERIFIED\tKIND\tREQUIRES\tREFS\tDETECTED BY")
 			for _, r := range rows {
 				if r.Error != "" {
-					fmt.Fprintf(tw, "%s\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t(unloadable: %s)\n", r.ID, r.Error)
+					fmt.Fprintf(tw, "%s\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t(unloadable: %s)\n", r.ID, r.Error)
 					continue
 				}
 				det := strings.Join(r.DetectedBy, ",")
@@ -333,9 +343,10 @@ gets a warning. Offline with neither present, KEV is shown as "?" and
 				if r.Requires != nil {
 					req = requiresText(*r.Requires)
 				}
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 					r.ID, dash(r.Category), groupCell(r, expanded), r.Severity, dash(strings.Join(r.Class, ",")),
-					yesNo(r.CVE), kevCell(r.KEV), r.Fidelity, kind, req, strings.Join(r.VulnRefs, ","), det)
+					yesNo(r.CVE), kevCell(r.KEV), r.Fidelity, verifiedCell(r.Verification, r.VerifiedOn), kind, req,
+					strings.Join(r.VulnRefs, ","), det)
 			}
 			tw.Flush()
 			g.printf("\n%d templates in %s\n", len(rows), store.Root)
@@ -406,6 +417,45 @@ func yesNo(b bool) string {
 		return "yes"
 	}
 	return "-"
+}
+
+// verifiedCell renders the VERIFIED column: "no" for an unverified target,
+// else the date of its last stamped run, or "yes" when none is recorded.
+func verifiedCell(verification string, on *contract.VerifiedOn) string {
+	switch {
+	case verification == contract.VerificationUnverified:
+		return "no"
+	case on != nil:
+		return on.Date
+	}
+	return "yes"
+}
+
+// verifiedText is the info line for a target's verification.
+func verifiedText(c *contract.Contract) string {
+	vo := c.Metadata.VerifiedOn
+	var out string
+	if c.IsUnverified() {
+		out = "no -- nobody has run this target's states yet (verification: unverified)"
+	} else {
+		out = "yes"
+	}
+	if vo != nil {
+		host := vo.Host
+		if vo.Platform != "" {
+			host += " running " + vo.Platform
+		}
+		if len(vo.CPUFlags) > 0 {
+			host += " with " + strings.Join(vo.CPUFlags, ",")
+		}
+		prefix := "last run"
+		if c.IsUnverified() {
+			prefix += " (before it was marked unverified)"
+		}
+		out += fmt.Sprintf("; %s %s: %s verified ok on %s, vulnsuite %s", prefix, vo.Date,
+			strings.Join(vo.States, "+"), host, vo.Vulnsuite)
+	}
+	return out
 }
 
 // kevCell renders the KEV column: yes/-, or "?" when the catalog is unavailable.

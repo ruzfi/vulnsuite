@@ -83,6 +83,47 @@ func addExposureFlags(fs *flag.FlagSet, exp *runner.Exposure) {
 	fs.StringVar(&exp.Gateway, "gateway", "", "gateway (macvlan mode)")
 }
 
+// checkExposureFlags rejects exposure flags that are invalid or that the
+// chosen mode would silently ignore. pinned reports a -host-port(-map) pin.
+func checkExposureFlags(fs *flag.FlagSet, exp runner.Exposure) (pinned bool, err error) {
+	switch exp.Mode {
+	case runner.ModeInternal, runner.ModeHost, runner.ModeMacvlan:
+	default:
+		return false, usageError{fmt.Sprintf("unknown -expose mode %q (internal, host or macvlan)", exp.Mode)}
+	}
+	pinned = exp.HostPort != 0 || len(exp.HostPortMap) > 0
+	if exp.HostPort < 0 || exp.HostPort > 65535 {
+		return false, usageError{fmt.Sprintf("-host-port must be 1..65535, got %d", exp.HostPort)}
+	}
+	if pinned && exp.Mode != runner.ModeHost {
+		return false, usageError{"-host-port / -host-port-map need -expose host"}
+	}
+	// Flags of another exposure mode would be silently ignored.
+	if exp.Mode != runner.ModeHost && flagSet(fs, "bind") {
+		return false, usageError{fmt.Sprintf("-bind is used only by -expose host (the mode is %s)", exp.Mode)}
+	}
+	if exp.Mode != runner.ModeMacvlan {
+		for _, name := range []string{"parent", "ip", "subnet", "gateway"} {
+			if flagSet(fs, name) {
+				return false, usageError{fmt.Sprintf("-%s is used only by -expose macvlan (the mode is %s)", name, exp.Mode)}
+			}
+		}
+	}
+	return pinned, nil
+}
+
+// parseReadyTimeout parses -ready-timeout (0 when unset).
+func parseReadyTimeout(v string) (time.Duration, error) {
+	if v == "" {
+		return 0, nil
+	}
+	d, err := contract.ParseDuration(v, 0)
+	if err != nil {
+		return 0, usageError{"-ready-timeout: " + err.Error()}
+	}
+	return d, nil
+}
+
 func reportVerify(g *Global, h *runner.Handle, indent string) {
 	switch {
 	case h.VerifyOK != nil && *h.VerifyOK:
@@ -216,10 +257,9 @@ Exposure modes:
 			}
 			// Flag mistakes are usage errors (exit 2), caught before any
 			// template is resolved or image pulled/built.
-			switch exp.Mode {
-			case runner.ModeInternal, runner.ModeHost, runner.ModeMacvlan:
-			default:
-				return usageError{fmt.Sprintf("unknown -expose mode %q (internal, host or macvlan)", exp.Mode)}
+			pinned, err := checkExposureFlags(fs, exp)
+			if err != nil {
+				return err
 			}
 			if err := checkScannerDir("-nuclei-templates", nucleiDir); err != nil {
 				return err
@@ -227,31 +267,9 @@ Exposure modes:
 			if maxConcurrent < 1 {
 				return usageError{fmt.Sprintf("-max-concurrent must be at least 1, got %d", maxConcurrent)}
 			}
-			pinned := exp.HostPort != 0 || len(exp.HostPortMap) > 0
-			if exp.HostPort < 0 || exp.HostPort > 65535 {
-				return usageError{fmt.Sprintf("-host-port must be 1..65535, got %d", exp.HostPort)}
-			}
-			if pinned && exp.Mode != runner.ModeHost {
-				return usageError{"-host-port / -host-port-map need -expose host"}
-			}
-			// Flags of another exposure mode would be silently ignored.
-			if exp.Mode != runner.ModeHost && flagSet(fs, "bind") {
-				return usageError{fmt.Sprintf("-bind is used only by -expose host (the mode is %s)", exp.Mode)}
-			}
-			if exp.Mode != runner.ModeMacvlan {
-				for _, name := range []string{"parent", "ip", "subnet", "gateway"} {
-					if flagSet(fs, name) {
-						return usageError{fmt.Sprintf("-%s is used only by -expose macvlan (the mode is %s)", name, exp.Mode)}
-					}
-				}
-			}
-			var readyTimeoutD time.Duration
-			if readyTimeout != "" {
-				d, err := contract.ParseDuration(readyTimeout, 0)
-				if err != nil {
-					return usageError{"-ready-timeout: " + err.Error()}
-				}
-				readyTimeoutD = d
+			readyTimeoutD, err := parseReadyTimeout(readyTimeout)
+			if err != nil {
+				return err
 			}
 			state, args, err := takeState(args)
 			if err != nil {

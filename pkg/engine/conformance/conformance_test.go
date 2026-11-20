@@ -623,7 +623,7 @@ var cases = []conformanceCase{
 		if err := p.ContainerPause(bg(t), "vs-a"); !contains(err, "already paused") {
 			t.Errorf("pausing a paused container = %v; want dockerd's \"is already paused\"", err)
 		}
-		if d, err := h.eng.ContainerInspect(bg(t), "vs-a"); err != nil || !d.Running {
+		if d, err := h.eng.ContainerInspect(bg(t), "vs-a"); err != nil || !d.Running || !d.Paused {
 			t.Errorf("a paused container inspects as %+v, %v; want it running (dockerd reports Running and Paused)", d, err)
 		}
 		if rows, err := h.eng.ContainerList(bg(t), false, "vs-a"); err != nil || len(rows) != 1 || rows[0].State != "paused" {
@@ -631,6 +631,9 @@ var cases = []conformanceCase{
 		}
 		if err := p.ContainerUnpause(bg(t), "vs-a"); err != nil {
 			t.Fatal(err)
+		}
+		if d, err := h.eng.ContainerInspect(bg(t), "vs-a"); err != nil || !d.Running || d.Paused {
+			t.Errorf("an unpaused container inspects as %+v, %v; want running, not paused", d, err)
 		}
 		if code, out, err := h.eng.ContainerExec(bg(t), "vs-a", "true", 5*time.Second); err != nil || code != 0 || out != "ok" {
 			t.Errorf("exec after unpause = %d, %q, %v; want 0, ok, nil", code, out, err)
