@@ -2,10 +2,13 @@ package conformance
 
 import (
 	"archive/tar"
+	"bytes"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -68,7 +71,16 @@ type stubContainer struct {
 	networks        map[string]*stubEndpoint // network name -> endpoint
 	started         bool
 	running         bool
+	paused          bool
 	exitCode        int
+	files           map[string]stubFile // absolute clean path -> file
+}
+
+// stubFile is a file in a stub container's filesystem: a regular file, a
+// directory (fs.ModeDir) or a symlink (fs.ModeSymlink, data its target).
+type stubFile struct {
+	mode fs.FileMode
+	data string
 }
 
 type stubPort struct {
@@ -222,7 +234,19 @@ func (d *daemon) exit(idOrName string, code int) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if c := d.container(idOrName); c != nil {
-		c.running, c.exitCode = false, code
+		c.running, c.paused, c.exitCode = false, false, code
+	}
+}
+
+// writeFile puts a file in a container's filesystem (see stubFile).
+func (d *daemon) writeFile(idOrName, p string, mode fs.FileMode, data string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if c := d.container(idOrName); c != nil {
+		if c.files == nil {
+			c.files = map[string]stubFile{}
+		}
+		c.files[path.Clean(p)] = stubFile{mode: mode, data: data}
 	}
 }
 
@@ -646,6 +670,11 @@ func (d *daemon) containers_(w http.ResponseWriter, r *http.Request, rest string
 	switch {
 	case action == "start" && r.Method == http.MethodPost:
 		d.mu.Lock()
+		if c.paused {
+			d.mu.Unlock()
+			apiError(w, http.StatusConflict, "cannot start a paused container, try unpause instead")
+			return
+		}
 		if c.running {
 			// dockerd: starting a running container is 304 Not Modified.
 			d.mu.Unlock()
@@ -691,12 +720,114 @@ func (d *daemon) containers_(w http.ResponseWriter, r *http.Request, rest string
 			apiError(w, http.StatusConflict, "container %s is not running", c.id)
 			return
 		}
+		if c.paused {
+			apiError(w, http.StatusConflict, "Container %s is paused, unpause the container before exec", c.name)
+			return
+		}
 		e := &stubExec{id: d.newID(), container: c.name, cmd: body.Cmd}
 		d.execs[e.id] = e
 		writeJSON(w, http.StatusCreated, map[string]string{"Id": e.id})
+	case action == "pause" && r.Method == http.MethodPost:
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		switch {
+		case !c.running:
+			apiError(w, http.StatusConflict, "container %s is not running", c.id)
+		case c.paused:
+			apiError(w, http.StatusConflict, "container %s is already paused", c.id)
+		default:
+			c.paused = true
+			w.WriteHeader(http.StatusNoContent)
+		}
+	case action == "unpause" && r.Method == http.MethodPost:
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if !c.paused {
+			// dockerd answers 500 here, not 409.
+			apiError(w, http.StatusInternalServerError, "Container %s is not paused", c.id)
+			return
+		}
+		c.paused = false
+		w.WriteHeader(http.StatusNoContent)
+	case action == "archive" && (r.Method == http.MethodHead || r.Method == http.MethodGet):
+		d.archive(w, r, c)
 	default:
 		apiError(w, http.StatusNotFound, "page not found")
 	}
+}
+
+// lstat returns the file at the clean path p: a written one, or a directory
+// implied by one below it.
+func (c *stubContainer) lstat(p string) (stubFile, bool) {
+	if f, ok := c.files[p]; ok {
+		return f, true
+	}
+	if p == "/" {
+		return stubFile{mode: fs.ModeDir | 0o755}, true
+	}
+	for q := range c.files {
+		if strings.HasPrefix(q, p+"/") {
+			return stubFile{mode: fs.ModeDir | 0o755}, true
+		}
+	}
+	return stubFile{}, false
+}
+
+// archive answers HEAD (stat) and GET (tar) /containers/{id}/archive like
+// dockerd: the stat of path in the X-Docker-Container-Path-Stat header, and a
+// tar whose entries are named after path's base name ("/" for the root).
+func (d *daemon) archive(w http.ResponseWriter, r *http.Request, c *stubContainer) {
+	p := r.URL.Query().Get("path")
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	f, ok := c.lstat(path.Clean(p))
+	if !ok {
+		apiError(w, http.StatusNotFound, "Could not find the file %s in container %s", p, c.name)
+		return
+	}
+	p = path.Clean(p)
+	root := path.Base(p)
+	st, _ := json.Marshal(map[string]any{"name": root, "size": len(f.data), "mode": uint32(f.mode), "mtime": "2026-01-01T00:00:00Z", "linkTarget": ""})
+	w.Header().Set("X-Docker-Container-Path-Stat", base64.StdEncoding.EncodeToString(st))
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	under := strings.TrimSuffix(p, "/") + "/"
+	entry := func(name string, f stubFile) {
+		h := &tar.Header{Name: name, Mode: int64(f.mode.Perm())}
+		switch {
+		case f.mode.IsDir():
+			h.Typeflag, h.Name = tar.TypeDir, strings.TrimSuffix(name, "/")+"/"
+		case f.mode&fs.ModeSymlink != 0:
+			h.Typeflag, h.Linkname = tar.TypeSymlink, f.data
+		default:
+			h.Typeflag, h.Size = tar.TypeReg, int64(len(f.data))
+		}
+		_ = tw.WriteHeader(h)
+		if h.Typeflag == tar.TypeReg {
+			_, _ = io.WriteString(tw, f.data)
+		}
+	}
+	entry(root, f)
+	if f.mode.IsDir() {
+		var names []string
+		for q := range c.files {
+			if strings.HasPrefix(q, under) {
+				names = append(names, q)
+			}
+		}
+		sort.Strings(names)
+		for _, q := range names {
+			entry(strings.TrimSuffix(root, "/")+"/"+strings.TrimPrefix(q, under), c.files[q])
+		}
+	}
+	_ = tw.Close()
+	w.Header().Set("Content-Type", "application/x-tar")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(buf.Bytes())
 }
 
 func (d *daemon) containerInspect(w http.ResponseWriter, c *stubContainer) {
@@ -704,6 +835,8 @@ func (d *daemon) containerInspect(w http.ResponseWriter, c *stubContainer) {
 	defer d.mu.Unlock()
 	status := "created"
 	switch {
+	case c.paused:
+		status = "paused"
 	case c.running:
 		status = "running"
 	case c.started:
@@ -731,7 +864,7 @@ func (d *daemon) containerInspect(w http.ResponseWriter, c *stubContainer) {
 		"Id":     c.id,
 		"Name":   "/" + c.name,
 		"Image":  d.images[imageKey(c.image)].idOr(c.image),
-		"State":  map[string]any{"Status": status, "Running": c.running, "ExitCode": c.exitCode},
+		"State":  map[string]any{"Status": status, "Running": c.running, "Paused": c.paused, "ExitCode": c.exitCode},
 		"Config": map[string]any{"Image": c.image, "Labels": c.labels},
 		"NetworkSettings": map[string]any{
 			"Networks": nets,
@@ -807,6 +940,8 @@ func (d *daemon) containerList(w http.ResponseWriter, r *http.Request) {
 		}
 		state, status := "created", "Created"
 		switch {
+		case c.paused:
+			state, status = "paused", "Up 2 seconds (Paused)"
 		case c.running:
 			state, status = "running", "Up 2 seconds"
 		case c.started:

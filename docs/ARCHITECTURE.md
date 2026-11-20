@@ -44,8 +44,13 @@ TLS handling and error typing come for free and track the daemon.
 only (it resolves `DOCKER_HOST`, `DOCKER_TLS_VERIFY` / `DOCKER_CERT_PATH` and
 docker contexts itself, the way the docker CLI does), kept as a fallback (`-engine api`) and as proof that the interface is
 small: everything the builder and runner need is build, pull, push, tag,
-create/start/remove/inspect/exec/logs/wait and networks. Both run the same
-end-to-end test. Podman's native API or a remote builder would be a third
+create/start/remove/inspect/exec/logs/wait and networks. Capabilities only
+some callers need are optional interfaces next to `Engine`, found by type
+assertion, so adding one never breaks another implementation: `Pauser`
+(`docker pause` / unpause, for freezing a target mid-race) and `FileReader`
+(stat a path and read a directory's files through the archive API, which
+works on paused and exited containers and needs nothing in the image). All
+three engines implement both. Both run the same end-to-end test. Podman's native API or a remote builder would be a third
 implementation, not a change to the callers.
 
 **The engine decides what "unreachable" means.** On Docker Desktop the host

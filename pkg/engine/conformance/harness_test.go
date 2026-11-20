@@ -2,6 +2,7 @@ package conformance
 
 import (
 	"fmt"
+	"io/fs"
 	"regexp"
 	"strings"
 	"testing"
@@ -269,6 +270,39 @@ func (h *harness) failImageRemove(t *testing.T, ref, msg string) {
 		return
 	}
 	h.fail(t, "DELETE", `^/images/`+regexp.QuoteMeta(ref)+`$`, 409, msg)
+}
+
+// seedFile puts a file, directory (mode with fs.ModeDir) or symlink (mode
+// with fs.ModeSymlink, data its target) into a created container.
+func (h *harness) seedFile(t *testing.T, container, path string, mode fs.FileMode, data string) {
+	t.Helper()
+	if h.f != nil {
+		if err := h.f.WriteFile(container, path, mode, data); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	h.d.writeFile(container, path, mode, data)
+}
+
+// pauser and fileReader return the engine's optional interfaces; every
+// engine in this module implements both.
+func (h *harness) pauser(t *testing.T) engine.Pauser {
+	t.Helper()
+	p, ok := h.eng.(engine.Pauser)
+	if !ok {
+		t.Fatalf("%s does not implement engine.Pauser", h.name)
+	}
+	return p
+}
+
+func (h *harness) fileReader(t *testing.T) engine.FileReader {
+	t.Helper()
+	r, ok := h.eng.(engine.FileReader)
+	if !ok {
+		t.Fatalf("%s does not implement engine.FileReader", h.name)
+	}
+	return r
 }
 
 func contains(err error, sub string) bool { return err != nil && strings.Contains(err.Error(), sub) }

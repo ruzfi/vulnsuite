@@ -5,8 +5,12 @@
 package engine
 
 import (
+	"archive/tar"
 	"context"
+	"errors"
+	"fmt"
 	"io"
+	"io/fs"
 	"strings"
 	"time"
 )
@@ -191,6 +195,135 @@ type Engine interface {
 	// NetworkConnect attaches an existing (created or running) container to a
 	// further network, resolvable there under aliases.
 	NetworkConnect(ctx context.Context, network, container string, aliases []string) error
+}
+
+// Pauser is implemented by engines that can freeze a container. It is
+// optional: callers type-assert an Engine to it and report the feature as
+// unsupported when that fails. All three engines in this module implement it.
+type Pauser interface {
+	// ContainerPause freezes every process of a running container with the
+	// cgroup freezer (`docker pause`). As in dockerd, pausing a missing,
+	// stopped or already paused container is an error. While it is paused,
+	// ContainerExec and ContainerStart fail; ContainerInspect still reports
+	// it running, ContainerList lists it as "paused", and ContainerRemove
+	// removes it.
+	ContainerPause(ctx context.Context, idOrName string) error
+	// ContainerUnpause thaws a paused container. Unpausing a missing
+	// container, or one that is not paused, is an error.
+	ContainerUnpause(ctx context.Context, idOrName string) error
+}
+
+// FileReader is implemented by engines that can read files out of a container
+// through the daemon's archive API (HEAD and GET /containers/{id}/archive). The
+// reads work on running, paused and exited containers and need nothing in the
+// image (no shell, no cat). It is optional, like Pauser.
+//
+// Paths are absolute paths in the container. What the archive holds is
+// written by the container, so implementations treat it as untrusted: see
+// DirFilesFromTar.
+type FileReader interface {
+	// ContainerStatPath returns the mode of path, as fs.FileMode bits (type,
+	// permissions, setuid/setgid and fs.ModeSticky). It does not follow a
+	// final symlink. A missing path is an error satisfying
+	// errors.Is(err, fs.ErrNotExist); a missing container is a different
+	// error.
+	ContainerStatPath(ctx context.Context, idOrName, path string) (fs.FileMode, error)
+	// ContainerReadDir returns the regular files directly in dir, by name.
+	// Subdirectories and their contents, symlinks (never followed), devices
+	// and other special files are left out. Each file's Data holds at most
+	// its first maxBytes bytes (none when maxBytes <= 0, which lists names
+	// and sizes only); Size is its full size, so a truncated file is one
+	// whose Data is shorter than Size. A missing dir is an error satisfying
+	// errors.Is(err, fs.ErrNotExist). A dir that is not a directory, a
+	// symlink to one included, is an error, and so is a directory holding
+	// more than MaxDirFiles regular files.
+	ContainerReadDir(ctx context.Context, idOrName, dir string, maxBytes int64) (map[string]FileContent, error)
+}
+
+// FileContent is a file read by FileReader.ContainerReadDir.
+type FileContent struct {
+	// Size is the file's size in the container.
+	Size int64
+	// Data is the file's content, cut to the caller's maxBytes.
+	Data []byte
+}
+
+// Truncated reports whether Data holds less than the whole file.
+func (f FileContent) Truncated() bool { return int64(len(f.Data)) < f.Size }
+
+// MaxDirFiles bounds how many files ContainerReadDir returns.
+const MaxDirFiles = 4096
+
+// DirFilesFromTar reads the regular files directly in a directory out of the
+// tar stream the archive API returns for it (GET /containers/{id}/archive).
+// root is the archive's root entry, the "name" in the daemon's path stat
+// header: the directory's base name ("asan" for /var/log/asan), or "/" for
+// the root directory. dockerd names entries root + "/" + relative path.
+//
+// The stream comes from the container and is untrusted: only entries whose
+// name is exactly root/<name>, with <name> a single path element, are taken,
+// so nothing can name a file outside dir or plant one through "..", an
+// absolute path or a nested path. Only regular files are read (a hard link to
+// a regular file already taken counts as one); symlinks are skipped, never
+// followed. Content is capped at maxBytes per file (see
+// FileReader.ContainerReadDir), duplicates keep the first entry, and more than
+// MaxDirFiles files is an error.
+func DirFilesFromTar(r io.Reader, root string, maxBytes int64) (map[string]FileContent, error) {
+	prefix := strings.TrimSuffix(root, "/") + "/"
+	if maxBytes < 0 {
+		maxBytes = 0
+	}
+	out := map[string]FileContent{}
+	tr := tar.NewReader(r)
+	for {
+		h, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return out, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("reading the container archive: %w", err)
+		}
+		name, ok := strings.CutPrefix(h.Name, prefix)
+		if !ok || !childName(name) {
+			continue
+		}
+		if _, dup := out[name]; dup {
+			continue
+		}
+		var fc FileContent
+		switch h.Typeflag {
+		case tar.TypeReg, tar.TypeRegA:
+			if h.Size < 0 {
+				continue
+			}
+			data, err := io.ReadAll(io.LimitReader(tr, maxBytes))
+			if err != nil {
+				return nil, fmt.Errorf("reading %s from the container archive: %w", name, err)
+			}
+			fc = FileContent{Size: h.Size, Data: data}
+		case tar.TypeLink:
+			target, ok := strings.CutPrefix(h.Linkname, prefix)
+			if !ok {
+				continue
+			}
+			src, ok := out[target]
+			if !ok {
+				continue
+			}
+			fc = FileContent{Size: src.Size, Data: append([]byte(nil), src.Data...)}
+		default:
+			continue
+		}
+		if len(out) == MaxDirFiles {
+			return nil, fmt.Errorf("the directory holds more than %d files", MaxDirFiles)
+		}
+		out[name] = fc
+	}
+}
+
+// childName reports whether name is a single, ordinary path element.
+func childName(name string) bool {
+	return name != "" && name != "." && name != ".." && !strings.ContainsAny(name, "/\x00")
 }
 
 // PlatformMatches reports whether an image built for imgOS/imgArch/imgVariant
