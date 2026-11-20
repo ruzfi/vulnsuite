@@ -528,7 +528,7 @@ func (f *Fake) ContainerInspect(ctx context.Context, id string) (*engine.Contain
 	if c == nil {
 		return nil, fmt.Errorf("no such container %s", id)
 	}
-	d := &engine.ContainerDetail{ID: c.ID, Name: c.Spec.Name, Image: c.Spec.Image, Running: c.Running, ExitCode: c.ExitCode, IPs: map[string]string{}, Ports: map[string]engine.HostBinding{}}
+	d := &engine.ContainerDetail{ID: c.ID, Name: c.Spec.Name, Image: c.Spec.Image, Running: c.Running, Paused: c.Paused, ExitCode: c.ExitCode, IPs: map[string]string{}, Ports: map[string]engine.HostBinding{}}
 	if c.Spec.Network != nil {
 		d.IPs[c.Spec.Network.Name] = c.IP
 	}

@@ -97,3 +97,27 @@ func TestDirFilesFromTarRootAndLimits(t *testing.T) {
 		t.Error("a truncated archive must be an error")
 	}
 }
+
+// The per-file cap times MaxDirFiles is no memory bound: the total is
+// (#131). Hard links count too, as they are copied.
+func TestDirFilesFromTarTotalCap(t *testing.T) {
+	chunk := strings.Repeat("a", 1<<20)
+	n := MaxDirBytes>>20 + 1
+	var es []entry
+	for i := 0; i < n; i++ {
+		es = append(es, entry{name: fmt.Sprintf("d/f%03d", i), data: chunk, typ: tar.TypeReg})
+	}
+	if _, err := DirFilesFromTar(tarStream(t, es...), "d", 1<<20); err == nil || !strings.Contains(err.Error(), "MiB") {
+		t.Fatalf("%d MiB = %v; want the total cap", n, err)
+	}
+	if got, err := DirFilesFromTar(tarStream(t, es[:n-1]...), "d", 1<<20); err != nil || len(got) != n-1 {
+		t.Fatalf("%d MiB = %d files, %v; want all of them", n-1, len(got), err)
+	}
+	links := []entry{es[0]}
+	for i := 1; i < n; i++ {
+		links = append(links, entry{name: fmt.Sprintf("d/l%03d", i), link: "d/f000", typ: tar.TypeLink})
+	}
+	if _, err := DirFilesFromTar(tarStream(t, links...), "d", 1<<20); err == nil {
+		t.Fatal("hard links to one big file must count toward the cap")
+	}
+}

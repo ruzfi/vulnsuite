@@ -722,6 +722,10 @@ func (v *Validator) sequences(c *contract.Contract) []Finding {
 					if step.ExpectSanitizer.Positive() {
 						positive = true
 					}
+					if frozen {
+						add(Warning, "sanitizer-while-frozen",
+							"%s: expect_sanitizer between freeze and resume watches a target that cannot write a report (`none` always holds there); move it after the resume", at)
+					}
 				case step.ExpectLog != nil:
 					logs = true
 				}
