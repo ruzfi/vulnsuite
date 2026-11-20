@@ -425,6 +425,21 @@
             "pattern": "^/dev/(kvm|net/tun|fuse|vhost-net|vhost-vsock|dri/(card|renderD)[0-9]+)$"
           },
           "description": "Host devices to pass through to the container (consent-gated by run -allow-host-access). Only /dev/kvm, /dev/net/tun, /dev/fuse, /dev/vhost-net, /dev/vhost-vsock and /dev/dri/cardN|renderDN are allowed; raw disk/memory and other host devices are rejected"
+        },
+        "sanitizer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "log_dir"
+          ],
+          "description": "Where a sanitizer-instrumented target writes its reports, for sequence expect_sanitizer steps. Point log_path at it (ASAN_OPTIONS=...:log_path=<log_dir>/asan). Not part of the image hash.",
+          "properties": {
+            "log_dir": {
+              "type": "string",
+              "pattern": "^(/([A-Za-z0-9_@%+=:,-][A-Za-z0-9._@%+=:,-]*|\\.[A-Za-z0-9_@%+=:,-][A-Za-z0-9._@%+=:,-]*|\\.\\.[A-Za-z0-9._@%+=:,-]+))+$",
+              "description": "Absolute, canonical directory in the target (no trailing /, no //, no . or .. segments, not /), a plain path: letters, digits and . _ @ % + = : , / -."
+            }
+          }
         }
       }
     },
@@ -640,68 +655,228 @@
       "additionalProperties": false,
       "properties": {
         "http": {
+          "$ref": "#/$defs/httpProbe"
+        },
+        "exec": {
+          "$ref": "#/$defs/execProbe"
+        },
+        "tcp": {
+          "$ref": "#/$defs/tcpProbe"
+        },
+        "net": {
+          "$ref": "#/$defs/netProbe"
+        },
+        "sequence": {
+          "$ref": "#/$defs/sequenceProbe"
+        }
+      }
+    },
+    "httpProbe": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "method": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "raw_path": {
+          "type": "string"
+        },
+        "headers": {
           "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "method": {
-              "type": "string"
-            },
-            "path": {
-              "type": "string"
-            },
-            "raw_path": {
-              "type": "string"
-            },
-            "headers": {
-              "type": "object",
-              "additionalProperties": {
-                "type": "string"
-              }
-            },
-            "body": {
-              "type": "string"
-            },
-            "status": {
-              "type": "integer"
-            },
-            "status_in": {
-              "type": "array",
-              "items": {
-                "type": "integer"
-              }
-            },
-            "body_matches": {
-              "type": "string"
-            },
-            "body_absent": {
-              "type": "string"
-            },
-            "timeout": {
-              "type": "number",
-              "exclusiveMinimum": 0
-            },
-            "header_matches": {
-              "type": "object",
-              "additionalProperties": {
-                "type": "string"
-              },
-              "description": "response header name -> regex the value must match (case-insensitive name)"
-            },
-            "header_absent": {
-              "type": "array",
-              "items": {
-                "type": "string"
-              },
-              "description": "response header names that must NOT be present"
-            },
-            "port": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 65535,
-              "description": "Target a non-primary container port (default: the primary port)."
-            }
+          "additionalProperties": {
+            "type": "string"
           }
         },
+        "body": {
+          "type": "string"
+        },
+        "status": {
+          "type": "integer"
+        },
+        "status_in": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "body_matches": {
+          "type": "string"
+        },
+        "body_absent": {
+          "type": "string"
+        },
+        "timeout": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "header_matches": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "response header name -> regex the value must match (case-insensitive name)"
+        },
+        "header_absent": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "response header names that must NOT be present"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Target a non-primary container port (default: the primary port)."
+        }
+      }
+    },
+    "execProbe": {
+      "type": "object",
+      "required": [
+        "run"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "run": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expect_exit": {
+          "type": "integer"
+        },
+        "stdout_matches": {
+          "type": "string"
+        },
+        "timeout": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      }
+    },
+    "tcpProbe": {
+      "type": "object",
+      "required": [
+        "port"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "send": {
+          "type": "string"
+        },
+        "banner_matches": {
+          "type": "string"
+        },
+        "timeout": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "closed": {
+          "type": "boolean",
+          "description": "Assert the port is NOT open (connection refused/unreachable is a pass)."
+        }
+      }
+    },
+    "netProbe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "steps"
+      ],
+      "description": "scripted TCP dialogue (send/expect steps over one connection) for multi-step protocols",
+      "properties": {
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "tls": {
+          "type": "boolean",
+          "description": "force TLS; without it the connection is TLS only when the probed port is declared protocol: https (the primary port when port is unset)"
+        },
+        "timeout": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "send": {
+                "type": "string"
+              },
+              "expect": {
+                "type": "string",
+                "description": "regex the response must match"
+              },
+              "expect_absent": {
+                "type": "string",
+                "description": "regex the response must NOT match"
+              },
+              "read": {
+                "type": "integer",
+                "description": "bytes to read after this step (default 4096)"
+              },
+              "no_read": {
+                "type": "boolean",
+                "description": "send without reading a response"
+              }
+            }
+          }
+        }
+      }
+    },
+    "sequenceProbe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "steps"
+      ],
+      "description": "Ordered steps run as one attempt, for race-condition targets: the core freezes and resumes the target between steps and reads the sanitizer reports and logs written during the attempt. `validate` checks that every freeze is resumed, that nothing runs in or connects to the target while it is frozen, and that the sequence asserts something.",
+      "properties": {
+        "attempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10,
+          "description": "attempts budget for harness flakes (default 1, at most 10)"
+        },
+        "min_hits": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10,
+          "description": "attempts that must hit for a sequence with a positive expect_sanitizer to pass (default 1, at most attempts)"
+        },
+        "timeout": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "seconds for one whole attempt (default 60)"
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/sequenceStep"
+          }
+        }
+      }
+    },
+    "sequenceStep": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 1,
+      "additionalProperties": false,
+      "properties": {
         "exec": {
           "type": "object",
           "required": [
@@ -722,88 +897,79 @@
             "timeout": {
               "type": "number",
               "exclusiveMinimum": 0
+            },
+            "container": {
+              "type": "string",
+              "description": "run in this sidecar (a service.sidecars name) instead of the target; empty = the target"
             }
           }
         },
-        "tcp": {
+        "freeze": {
           "type": "object",
-          "required": [
-            "port"
-          ],
           "additionalProperties": false,
-          "properties": {
-            "port": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 65535
-            },
-            "send": {
-              "type": "string"
-            },
-            "banner_matches": {
-              "type": "string"
-            },
-            "timeout": {
-              "type": "number",
-              "exclusiveMinimum": 0
-            },
-            "closed": {
-              "type": "boolean",
-              "description": "Assert the port is NOT open (connection refused/unreachable is a pass)."
-            }
-          }
+          "properties": {},
+          "description": "pause the target container (docker pause); never a sidecar. No options."
         },
-        "net": {
+        "resume": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {},
+          "description": "unpause the target container. No options."
+        },
+        "sleep": {
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "steps"
+            "ms"
           ],
-          "description": "scripted TCP dialogue (send/expect steps over one connection) for multi-step protocols",
           "properties": {
-            "port": {
+            "ms": {
               "type": "integer",
               "minimum": 1,
-              "maximum": 65535
+              "maximum": 10000
+            }
+          },
+          "description": "a fixed wait, in milliseconds (at most 10000)"
+        },
+        "expect_sanitizer": {
+          "description": "none: no sanitizer report may be written during the attempt; or { kind, frame }: a report of that bug class whose first stack has a frame matching the Go regexp frame. Needs service.sanitizer.log_dir.",
+          "oneOf": [
+            {
+              "const": "none"
             },
-            "tls": {
-              "type": "boolean",
-              "description": "force TLS; without it the connection is TLS only when the probed port is declared protocol: https (the primary port when port is unset)"
-            },
-            "timeout": {
-              "type": "number",
-              "exclusiveMinimum": 0
-            },
-            "steps": {
-              "type": "array",
-              "minItems": 1,
-              "items": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                  "send": {
-                    "type": "string"
-                  },
-                  "expect": {
-                    "type": "string",
-                    "description": "regex the response must match"
-                  },
-                  "expect_absent": {
-                    "type": "string",
-                    "description": "regex the response must NOT match"
-                  },
-                  "read": {
-                    "type": "integer",
-                    "description": "bytes to read after this step (default 4096)"
-                  },
-                  "no_read": {
-                    "type": "boolean",
-                    "description": "send without reading a response"
-                  }
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind"
+              ],
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "pattern": "^[a-z-]+$",
+                  "description": "the bug class, e.g. heap-use-after-free"
+                },
+                "frame": {
+                  "type": "string",
+                  "description": "Go regexp matched against the frames of the report's first stack"
                 }
               }
             }
-          }
+          ]
+        },
+        "expect_log": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Go regexp that must match the target's container log written during the attempt"
+        },
+        "http": {
+          "$ref": "#/$defs/httpProbe"
+        },
+        "tcp": {
+          "$ref": "#/$defs/tcpProbe"
+        },
+        "net": {
+          "$ref": "#/$defs/netProbe"
         }
       }
     }

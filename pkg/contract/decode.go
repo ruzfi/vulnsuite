@@ -54,6 +54,7 @@ type rawService struct {
 	CapAdd      []string          `yaml:"cap_add,omitempty"`
 	CapDrop     []string          `yaml:"cap_drop,omitempty"`
 	Devices     []string          `yaml:"devices,omitempty"`
+	Sanitizer   *Sanitizer        `yaml:"sanitizer,omitempty"`
 }
 
 type rawState struct {
@@ -157,6 +158,7 @@ func Parse(data []byte) (*Contract, error) {
 			CapAdd:      raw.Service.CapAdd,
 			CapDrop:     raw.Service.CapDrop,
 			Devices:     raw.Service.Devices,
+			Sanitizer:   raw.Service.Sanitizer,
 		},
 		States: map[string]*State{},
 	}
@@ -374,6 +376,14 @@ func (c *Contract) checkStructure(present map[string]any) error {
 	if s.Healthcheck.Timeout != "" && !timeoutRe.MatchString(s.Healthcheck.Timeout) {
 		return se("service/healthcheck/timeout", "must look like 60s or 5m")
 	}
+	if san := s.Sanitizer; san != nil {
+		if san.LogDir == "" {
+			return se("service/sanitizer/log_dir", "is required")
+		}
+		if err := checkLogDir(san.LogDir); err != nil {
+			return se("service/sanitizer/log_dir", "%q %v", san.LogDir, err)
+		}
+	}
 	seenSidecar := map[string]bool{}
 	for i, sc := range s.Sidecars {
 		if sc.Name == "" || sc.Image == "" {
@@ -516,10 +526,113 @@ func (c *Contract) checkStructure(present map[string]any) error {
 					return err
 				}
 			}
+			if p.Sequence != nil {
+				n++
+				if err := checkSequence(ploc+"/sequence", p.Sequence); err != nil {
+					return err
+				}
+			}
 			if n != 1 {
-				return se(ploc, "exactly one of http, exec, tcp, net must be set")
+				return se(ploc, "exactly one of http, exec, tcp, net, sequence must be set")
 			}
 		}
+	}
+	return nil
+}
+
+// sanitizerKindRe is an expect_sanitizer kind: a sanitizer's bug class as its
+// report names it, e.g. heap-use-after-free.
+var sanitizerKindRe = regexp.MustCompile(`^[a-z-]+$`)
+
+// checkSequence enforces a sequence probe's shape. The cross-step rules
+// (freeze/resume balance, what may run while frozen, sidecar names) are
+// semantic and live in package validator.
+func checkSequence(loc string, s *SequenceProbe) error {
+	if s.Attempts < 0 || s.Attempts > MaxSequenceAttempts {
+		return se(loc+"/attempts", "must be 1..%d", MaxSequenceAttempts)
+	}
+	if s.MinHits < 0 {
+		return se(loc+"/min_hits", "must be at least 1")
+	}
+	if s.MinHitCount() > s.AttemptCount() {
+		return se(loc+"/min_hits", "%d is more than attempts (%d)", s.MinHitCount(), s.AttemptCount())
+	}
+	if s.Timeout < 0 {
+		return se(loc+"/timeout", "must be greater than 0")
+	}
+	if len(s.Steps) == 0 {
+		return se(loc+"/steps", "at least one step is required")
+	}
+	for i, st := range s.Steps {
+		sloc := fmt.Sprintf("%s/steps/%d", loc, i)
+		if st.kinds() != 1 {
+			return se(sloc, "exactly one of exec, freeze, resume, sleep, expect_sanitizer, expect_log, http, tcp, net must be set")
+		}
+		switch {
+		case st.Exec != nil:
+			if st.Exec.Run == "" {
+				return se(sloc+"/exec/run", "is required")
+			}
+			if err := checkProbeNums(sloc+"/exec", 0, st.Exec.Timeout); err != nil {
+				return err
+			}
+		case st.Sleep != nil:
+			if st.Sleep.MS < 1 || st.Sleep.MS > MaxSleepMS {
+				return se(sloc+"/sleep/ms", "must be 1..%d", MaxSleepMS)
+			}
+		case st.ExpectSanitizer != nil:
+			if e := st.ExpectSanitizer; !e.None && !sanitizerKindRe.MatchString(e.Kind) {
+				if e.Kind == "" {
+					return se(sloc+"/expect_sanitizer/kind", "is required")
+				}
+				return se(sloc+"/expect_sanitizer/kind", "%q must match %s (the bug class, e.g. heap-use-after-free)", e.Kind, sanitizerKindRe)
+			}
+		case st.ExpectLog != nil:
+			if *st.ExpectLog == "" {
+				return se(sloc+"/expect_log", "must be a non-empty regexp")
+			}
+		case st.HTTP != nil:
+			if err := checkProbeNums(sloc+"/http", st.HTTP.Port, st.HTTP.Timeout); err != nil {
+				return err
+			}
+		case st.TCP != nil:
+			if st.TCP.Port == 0 {
+				return se(sloc+"/tcp/port", "is required")
+			}
+			if err := checkProbeNums(sloc+"/tcp", st.TCP.Port, st.TCP.Timeout); err != nil {
+				return err
+			}
+		case st.Net != nil:
+			if len(st.Net.Steps) == 0 {
+				return se(sloc+"/net/steps", "at least one step is required")
+			}
+			if err := checkProbeNums(sloc+"/net", st.Net.Port, st.Net.Timeout); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// checkLogDir validates service.sanitizer.log_dir: an absolute, canonical
+// directory in the target, written with overlay dest's characters.
+func checkLogDir(dir string) error {
+	if !destCharRe.MatchString(dir) {
+		return errors.New("must be a plain path (letters, digits and . _ @ % + = : , / -; no whitespace, quotes, $ or control characters)")
+	}
+	if !strings.HasPrefix(dir, "/") {
+		return errors.New("must be an absolute path in the target")
+	}
+	for _, seg := range strings.Split(dir, "/") {
+		if seg == ".." {
+			return errors.New("must not contain .. segments")
+		}
+	}
+	if dir == "/" {
+		return errors.New("must name a directory, not the root")
+	}
+	if path.Clean(dir) != dir {
+		return errors.New("must be canonical: no trailing /, no // and no . segments")
 	}
 	return nil
 }

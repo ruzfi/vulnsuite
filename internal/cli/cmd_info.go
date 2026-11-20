@@ -226,6 +226,13 @@ func probeSummary(p contract.Probe) string {
 		return fmt.Sprintf("exec %q stdout ~ /%s/", p.Exec.Run, p.Exec.StdoutMatches)
 	case "net":
 		return fmt.Sprintf("net :%d, %d-step dialogue", p.Net.Port, len(p.Net.Steps))
+	case "sequence":
+		s := p.Sequence
+		kinds := make([]string, 0, len(s.Steps))
+		for _, st := range s.Steps {
+			kinds = append(kinds, st.Kind())
+		}
+		return fmt.Sprintf("sequence x%d (min_hits %d): %s", s.AttemptCount(), s.MinHitCount(), strings.Join(kinds, ", "))
 	}
 	return p.Kind()
 }

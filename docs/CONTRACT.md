@@ -103,6 +103,7 @@ base: { kind: build, context: src, dockerfile: Dockerfile, build_args: {} }
 | `sidecars` | helper containers `{ name, image, digest, command, environment }` (names unique) started with each target state on a private network shared only with that state's target, reachable there by `name` in every exposure mode; each state gets its own sidecars (`command` sets the container command, e.g. a `server ...` arg list for a clustered node) |
 | `user` | run-as `uid` or `uid:gid` |
 | `cap_add` / `cap_drop` | Linux capabilities, e.g. `cap_drop: [ALL]` then `cap_add: [CAP_NET_BIND_SERVICE]` |
+| `sanitizer` | `{ log_dir: /var/log/asan }`: the directory a sanitizer-instrumented target writes its reports to, read by a `sequence`'s `expect_sanitizer` steps. An absolute, canonical plain path (the characters of `overlay[].dest`, no `..`, `.`, `//` or trailing `/`, not `/`). Point the runtime at it yourself (`ASAN_OPTIONS=...:log_path=/var/log/asan/asan`) and create it writable by every user in the image. Not part of the image hash |
 | `devices` | host devices to pass through; only `/dev/kvm`, `/dev/net/tun`, `/dev/fuse`, `/dev/vhost-net`, `/dev/vhost-vsock`, `/dev/dri/cardN`, `/dev/dri/renderDN` (canonical spelling). `run` needs `-allow-host-access` |
 
 ## `requires`
@@ -212,7 +213,7 @@ emulation platform, else the daemon's own), otherwise it is rebuilt.
 
 ## `verify` probes
 
-Exactly one kind per probe (`http`, `tcp`, `net` or `exec`). A probe `port` is
+Exactly one kind per probe (`http`, `tcp`, `net`, `exec` or `sequence`). A probe `port` is
 1-65535 and a `timeout` (seconds) is greater than 0; leave either out for the
 default (an explicit `port: 0` or `timeout: 0` is rejected). Probes are independent of any scanner: they
 demonstrate the *impact* from the advisory, not a matcher.
@@ -268,6 +269,65 @@ scheme). `https` ports skip certificate verification. A `status`-only
 assertion on the vulnerable state is a `weak-verify` warning: assert the body
 or a header.
 
+### `sequence`
+
+A `sequence` verifies a race-condition target: an ordered list of steps run as
+one attempt, in which the core freezes and resumes the target (`docker pause`)
+and reads the sanitizer reports and log lines written during the attempt.
+Sidecars are never frozen, so a driver sidecar can act on the frozen target's
+sockets. It is per state like any probe: patched writes its own sequence.
+This version parses and validates sequences, but `run` fails verify on one
+with `sequence probes are not supported by this version yet (#98)`; the
+executor is coming in a follow-up.
+
+```yaml
+service:
+  sidecars:
+    - { name: driver, image: ..., digest: ..., command: ["sleep", "infinity"] }
+  sanitizer: { log_dir: /var/log/asan }
+states:
+  vulnerable:
+    verify:
+      - sequence:
+          attempts: 3               # 1-10, default 1: a budget for harness flakes
+          min_hits: 1               # 1-attempts, default 1
+          timeout: 60               # seconds for one attempt, default 60
+          steps:
+            - exec: { container: driver, run: "/trigger.py setup" }
+            - freeze: {}
+            - exec: { container: driver, run: "/trigger.py fire" }
+            - resume: {}
+            - expect_sanitizer: { kind: heap-use-after-free, frame: "ngx_resolver_process_a" }
+  patched:
+    verify:
+      - sequence:
+          attempts: 3
+          steps:
+            - exec: { container: driver, run: "/trigger.py setup" }
+            - freeze: {}
+            - exec: { container: driver, run: "/trigger.py fire" }
+            - resume: {}
+            - expect_sanitizer: none
+            - expect_log: "writev\\(\\) failed .* while sending to client"
+```
+
+| Step | Meaning |
+| --- | --- |
+| `exec` | the `exec` probe (`run`, `expect_exit`, `stdout_matches`, `timeout`) plus an optional `container:`, a `service.sidecars` name to run it in; without it the command runs in the target. Only a sequence step takes `container` |
+| `freeze` | pause the target container. No options: `freeze: {}` |
+| `resume` | unpause it: `resume: {}` |
+| `sleep` | `{ ms: 100 }`, a fixed wait of 1-10000 ms |
+| `expect_sanitizer` | `none` (no report may be written during the attempt), or `{ kind, frame }`: a report of bug class `kind` (lower case, e.g. `heap-use-after-free`) whose first stack has a frame matching the Go regexp `frame` (optional). Needs `service.sanitizer.log_dir` |
+| `expect_log` | a Go regexp that must match the target's container log written during the attempt, e.g. the positive control on patched showing the race was reached |
+| `http`, `tcp`, `net` | the probes above, e.g. a readiness check; not while the target is frozen |
+
+`validate` checks that every `freeze` has a matching `resume` and none is
+nested, that nothing runs in the target (`exec` without `container`) or
+connects to it (`http`, `tcp`, `net`) while it is frozen, that `container`
+names a sidecar, and that the sequence asserts something: an
+`expect_sanitizer`, an `expect_log`, or an `exec` with `expect_exit` or
+`stdout_matches`.
+
 ### Paths
 
 Templates are untrusted input, so every file a template references must be its
@@ -313,7 +373,15 @@ rather than failed; use `-expose host` or scan from a container.
 | `path-escapes-template` | error | a referenced path resolves (through a symlink) outside the template folder |
 | `patch-needs-source` | error | a patch on an `image` base |
 | `empty-verify` | error | an http probe asserts nothing |
-| `bad-regex`, `bad-timeout` | error | malformed values |
+| `bad-regex`, `bad-timeout` | error | malformed values (`bad-regex` covers every regexp, a `sequence`'s `frame` and `expect_log` included) |
+| `sequence-unbalanced-freeze` | error | a `sequence` has a `freeze` without a `resume`, a nested `freeze`, or a `resume` without a `freeze` |
+| `exec-in-frozen-target` | error | an `exec` step without `container` (so in the target) between `freeze` and `resume` |
+| `network-step-while-frozen` | error | an `http`, `tcp` or `net` step between `freeze` and `resume` (it would block on the frozen target) |
+| `unknown-sidecar` | error | an `exec` step's `container` names no `service.sidecars` entry |
+| `sanitizer-without-log-dir` | error | an `expect_sanitizer` step without `service.sanitizer.log_dir` |
+| `sequence-no-assertion` | error | a `sequence` with no `expect_sanitizer`, `expect_log`, or `exec` with `expect_exit`/`stdout_matches` |
+| `race-no-positive-control` | warning | a `sequence` with `expect_sanitizer: none` and no `expect_log`: a clean result may only mean the race was never reached |
+| `sanitizer-log-path` | warning | with `service.sanitizer.log_dir` set, `ASAN_OPTIONS` in `service.environment` or a state's `environment` has a `log_path` whose reports do not land directly in `log_dir` |
 | `duplicate-id` | error | two templates share an id |
 | `group-no-primary`, `group-multiple-primaries` | error | a multi-member group has zero or more than one `primary` |
 | `group-duplicate-variant`, `group-variant-missing` | error | two members share a `variant`, or a non-primary member has none |
@@ -321,7 +389,7 @@ rather than failed; use `-expose host` or scan from a container.
 | `group-multi-category` | warning | a group spans more than one product surface |
 | `group-divergent-refs` | warning | members of a group cite differing `vuln_refs` |
 | `no-ports` | error | `service` declares no ports |
-| `undeclared-port` | warning | `healthcheck.tcp.port` or a verify probe's `port` is not declared in `service.ports` (usually a typo; a `tcp` probe with `closed: true` is exempt) |
+| `undeclared-port` | warning | `healthcheck.tcp.port` or a verify probe's (or `sequence` step's) `port` is not declared in `service.ports` (usually a typo; a `tcp` probe with `closed: true` is exempt) |
 | `shadowed-contract` | warning | the template folder holds a second contract file (`contract.yaml`, `contract.yml`, `template.yaml`); only the first is loaded |
 | `no-patched`, `no-verify`, `weak-verify`, `identical-states` | warning | the template proves less than it could (`identical-states`: vulnerable and patched have the same image, build inputs, command, sidecar images and seed) |
 | `source-no-diff` | warning | a source base with a `patched` state where no state has a patch or overlay, so both build the same commit |

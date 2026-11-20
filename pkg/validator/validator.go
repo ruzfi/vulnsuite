@@ -74,6 +74,7 @@ func (v *Validator) Check(c *contract.Contract) []Finding {
 	out = append(out, v.fidelity(c)...)
 	out = append(out, v.requires(c)...)
 	out = append(out, v.hostAccess(c)...)
+	out = append(out, v.sequences(c)...)
 	return out
 }
 
@@ -510,6 +511,15 @@ func (v *Validator) verify(c *contract.Contract) []Finding {
 						}
 					}
 				}
+			case "sequence":
+				for j, step := range p.Sequence.Steps {
+					for _, re := range sequenceStepRegexes(step) {
+						if _, err := regexp.Compile(re); err != nil {
+							out = append(out, Finding{Error, c.ID(), "bad-regex",
+								fmt.Sprintf("%s: verify probe #%d step #%d (%s): %v", name, i+1, j+1, step.Kind(), err)})
+						}
+					}
+				}
 			}
 		}
 	}
@@ -564,10 +574,192 @@ func (v *Validator) portRefs(c *contract.Contract) []Finding {
 				check(where, p.TCP.Port)
 			case p.Net != nil:
 				check(where, p.Net.Port)
+			case p.Sequence != nil:
+				for j, step := range p.Sequence.Steps {
+					where := fmt.Sprintf("%s: verify probe #%d (sequence) step #%d (%s)", name, i+1, j+1, step.Kind())
+					switch {
+					case step.HTTP != nil:
+						check(where, step.HTTP.Port)
+					case step.TCP != nil && !step.TCP.Closed:
+						check(where, step.TCP.Port)
+					case step.Net != nil:
+						check(where, step.Net.Port)
+					}
+				}
 			}
 		}
 	}
 	return out
+}
+
+// sequenceStepRegexes returns the non-empty regexps a sequence step uses.
+func sequenceStepRegexes(st contract.SequenceStep) []string {
+	var res []string
+	switch {
+	case st.Exec != nil:
+		res = append(res, st.Exec.StdoutMatches)
+	case st.ExpectSanitizer != nil:
+		res = append(res, st.ExpectSanitizer.Frame)
+	case st.ExpectLog != nil:
+		res = append(res, *st.ExpectLog)
+	case st.HTTP != nil:
+		res = append(res, st.HTTP.BodyMatches, st.HTTP.BodyAbsent)
+		for _, k := range sortedKeys(st.HTTP.HeaderMatches) {
+			res = append(res, st.HTTP.HeaderMatches[k])
+		}
+	case st.TCP != nil:
+		res = append(res, st.TCP.BannerMatches)
+	case st.Net != nil:
+		for _, ns := range st.Net.Steps {
+			res = append(res, ns.Expect, ns.ExpectAbsent)
+		}
+	}
+	out := res[:0]
+	for _, re := range res {
+		if re != "" {
+			out = append(out, re)
+		}
+	}
+	return out
+}
+
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// sequences checks the cross-step and cross-field rules of sequence probes:
+// every freeze is resumed, nothing execs in or connects to the target while it
+// is frozen, exec steps name declared sidecars, expect_sanitizer has a log
+// directory to read, and each sequence asserts something (with a positive
+// control when it expects no sanitizer report). It also warns when
+// ASAN_OPTIONS sends reports outside service.sanitizer.log_dir.
+func (v *Validator) sequences(c *contract.Contract) []Finding {
+	var out []Finding
+	add := func(level Level, rule, format string, args ...any) {
+		out = append(out, Finding{level, c.ID(), rule, fmt.Sprintf(format, args...)})
+	}
+	sidecars := map[string]bool{}
+	for _, sc := range c.Service.Sidecars {
+		sidecars[sc.Name] = true
+	}
+	hasLogDir := c.Service.Sanitizer != nil && c.Service.Sanitizer.LogDir != ""
+	for _, name := range c.DeclaredStates() {
+		for i, p := range c.States[name].Verify {
+			if p.Sequence == nil {
+				continue
+			}
+			where := fmt.Sprintf("%s: verify probe #%d (sequence)", name, i+1)
+			frozen, unbalanced := false, ""
+			sanitizer, positive, logs, asserts := false, false, false, false
+			for j, step := range p.Sequence.Steps {
+				at := fmt.Sprintf("%s step #%d", where, j+1)
+				switch {
+				case step.Freeze != nil:
+					if frozen && unbalanced == "" {
+						unbalanced = fmt.Sprintf("%s: freeze while the target is already frozen (no nested freeze)", at)
+					}
+					frozen = true
+				case step.Resume != nil:
+					if !frozen && unbalanced == "" {
+						unbalanced = fmt.Sprintf("%s: resume without a freeze before it", at)
+					}
+					frozen = false
+				case step.Exec != nil:
+					if step.Exec.Asserts() {
+						asserts = true
+					}
+					if !step.Exec.InTarget() && !sidecars[step.Exec.Container] {
+						add(Error, "unknown-sidecar", "%s: exec container %q names no service sidecar", at, step.Exec.Container)
+					}
+					if frozen && step.Exec.InTarget() {
+						add(Error, "exec-in-frozen-target",
+							"%s: exec runs in the target between freeze and resume, which the engine refuses on a paused container; run it in a sidecar (container: <name>) or after resume", at)
+					}
+				case step.IsNetwork():
+					if frozen {
+						add(Error, "network-step-while-frozen",
+							"%s: %s step between freeze and resume would block on the frozen target; move it before the freeze or after the resume", at, step.Kind())
+					}
+				case step.ExpectSanitizer != nil:
+					sanitizer = true
+					if step.ExpectSanitizer.Positive() {
+						positive = true
+					}
+				case step.ExpectLog != nil:
+					logs = true
+				}
+			}
+			if frozen && unbalanced == "" {
+				unbalanced = where + ": freeze without a matching resume (the target would stay paused)"
+			}
+			if unbalanced != "" {
+				add(Error, "sequence-unbalanced-freeze", "%s", unbalanced)
+			}
+			if sanitizer && !hasLogDir {
+				add(Error, "sanitizer-without-log-dir",
+					"%s: expect_sanitizer needs service.sanitizer.log_dir, the directory the target's sanitizer writes its reports to", where)
+			}
+			if !sanitizer && !logs && !asserts {
+				add(Error, "sequence-no-assertion",
+					"%s: no expect_sanitizer, expect_log or exec step with expect_exit/stdout_matches; the sequence would prove nothing", where)
+			}
+			if sanitizer && !positive && !logs {
+				add(Warning, "race-no-positive-control",
+					"%s: expect_sanitizer: none without an expect_log; a clean result may only mean the race was never reached, so match a log line that shows it was", where)
+			}
+		}
+	}
+	if hasLogDir {
+		dir := c.Service.Sanitizer.LogDir
+		check := func(where string, env map[string]string) {
+			opts, ok := env["ASAN_OPTIONS"]
+			if !ok {
+				return
+			}
+			lp, ok := asanLogPath(opts)
+			if !ok || logPathIn(lp, dir) {
+				return
+			}
+			add(Warning, "sanitizer-log-path",
+				"%s ASAN_OPTIONS log_path=%s writes reports outside service.sanitizer.log_dir %s, where they are not read; use log_path=%s/<prefix>", where, lp, dir, dir)
+		}
+		check("service.environment", c.Service.Environment)
+		for _, name := range c.DeclaredStates() {
+			check("states."+name+".environment", c.States[name].Environment)
+		}
+	}
+	return out
+}
+
+// asanLogPath returns the last log_path in a sanitizer options string. The
+// sanitizer runtime splits options on ':', ',' and whitespace, and the last
+// occurrence of a flag wins.
+func asanLogPath(opts string) (string, bool) {
+	var lp string
+	found := false
+	for _, f := range strings.FieldsFunc(opts, func(r rune) bool {
+		return r == ':' || r == ',' || r == ' ' || r == '\t' || r == '\n'
+	}) {
+		if val, ok := strings.CutPrefix(f, "log_path="); ok {
+			lp, found = strings.Trim(val, `"'`), true
+		}
+	}
+	return lp, found
+}
+
+// logPathIn reports whether reports written with log_path lp (the runtime
+// appends .<pid>) land directly in dir.
+func logPathIn(lp, dir string) bool {
+	if !strings.HasPrefix(lp, "/") {
+		return false // stderr, stdout or a path relative to an unknown cwd
+	}
+	clean := path.Clean(lp)
+	return clean != dir && path.Dir(clean) == dir
 }
 
 // shadowed reports other contract files in the template's folder: discovery

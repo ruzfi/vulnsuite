@@ -190,13 +190,14 @@ type NetProbe struct {
 // Probe proves a target is genuinely in its declared state. Exactly one of the
 // kinds is set.
 type Probe struct {
-	HTTP *HTTPProbe `yaml:"http,omitempty" json:"http,omitempty"`
-	Exec *ExecProbe `yaml:"exec,omitempty" json:"exec,omitempty"`
-	TCP  *TCPProbe  `yaml:"tcp,omitempty" json:"tcp,omitempty"`
-	Net  *NetProbe  `yaml:"net,omitempty" json:"net,omitempty"`
+	HTTP     *HTTPProbe     `yaml:"http,omitempty" json:"http,omitempty"`
+	Exec     *ExecProbe     `yaml:"exec,omitempty" json:"exec,omitempty"`
+	TCP      *TCPProbe      `yaml:"tcp,omitempty" json:"tcp,omitempty"`
+	Net      *NetProbe      `yaml:"net,omitempty" json:"net,omitempty"`
+	Sequence *SequenceProbe `yaml:"sequence,omitempty" json:"sequence,omitempty"`
 }
 
-// Kind returns "http", "exec", "tcp" or "" when nothing is set.
+// Kind returns "http", "exec", "tcp", "net", "sequence" or "" when nothing is set.
 func (p Probe) Kind() string {
 	switch {
 	case p.HTTP != nil:
@@ -207,8 +208,204 @@ func (p Probe) Kind() string {
 		return "tcp"
 	case p.Net != nil:
 		return "net"
+	case p.Sequence != nil:
+		return "sequence"
 	}
 	return ""
+}
+
+// Sequence limits and defaults.
+const (
+	DefaultSequenceAttempts = 1
+	MaxSequenceAttempts     = 10
+	DefaultSequenceMinHits  = 1
+	DefaultSequenceTimeout  = 60 * time.Second
+	MaxSleepMS              = 10000
+)
+
+// SequenceProbe is an ordered list of steps run as one attempt, repeated up to
+// Attempts times, for targets whose flaw is a race: the core freezes and
+// resumes the target between steps and reads sanitizer reports and logs
+// written during the attempt. Zero values mean the defaults.
+type SequenceProbe struct {
+	Attempts int            `yaml:"attempts,omitempty" json:"attempts,omitempty"` // 1..10, default 1
+	MinHits  int            `yaml:"min_hits,omitempty" json:"min_hits,omitempty"` // 1..attempts, default 1
+	Timeout  float64        `yaml:"timeout,omitempty" json:"timeout,omitempty"`   // seconds per attempt, default 60
+	Steps    []SequenceStep `yaml:"steps" json:"steps"`
+}
+
+// AttemptCount is Attempts, defaulted.
+func (s SequenceProbe) AttemptCount() int {
+	if s.Attempts <= 0 {
+		return DefaultSequenceAttempts
+	}
+	return s.Attempts
+}
+
+// MinHitCount is MinHits, defaulted.
+func (s SequenceProbe) MinHitCount() int {
+	if s.MinHits <= 0 {
+		return DefaultSequenceMinHits
+	}
+	return s.MinHits
+}
+
+// TimeoutDuration is the bound on one attempt, defaulted.
+func (s SequenceProbe) TimeoutDuration() time.Duration {
+	if s.Timeout <= 0 {
+		return DefaultSequenceTimeout
+	}
+	return time.Duration(s.Timeout * float64(time.Second))
+}
+
+// SequenceStep is one step of a sequence. Exactly one of the kinds is set.
+type SequenceStep struct {
+	Exec            *SequenceExec    `yaml:"exec,omitempty" json:"exec,omitempty"`
+	Freeze          *FreezeStep      `yaml:"freeze,omitempty" json:"freeze,omitempty"`
+	Resume          *ResumeStep      `yaml:"resume,omitempty" json:"resume,omitempty"`
+	Sleep           *SleepStep       `yaml:"sleep,omitempty" json:"sleep,omitempty"`
+	ExpectSanitizer *ExpectSanitizer `yaml:"expect_sanitizer,omitempty" json:"expect_sanitizer,omitempty"`
+	ExpectLog       *string          `yaml:"expect_log,omitempty" json:"expect_log,omitempty"` // Go regexp
+	HTTP            *HTTPProbe       `yaml:"http,omitempty" json:"http,omitempty"`
+	TCP             *TCPProbe        `yaml:"tcp,omitempty" json:"tcp,omitempty"`
+	Net             *NetProbe        `yaml:"net,omitempty" json:"net,omitempty"`
+}
+
+// Kind returns the step's kind ("exec", "freeze", "resume", "sleep",
+// "expect_sanitizer", "expect_log", "http", "tcp", "net"), or "" when nothing
+// is set.
+func (s SequenceStep) Kind() string {
+	switch {
+	case s.Exec != nil:
+		return "exec"
+	case s.Freeze != nil:
+		return "freeze"
+	case s.Resume != nil:
+		return "resume"
+	case s.Sleep != nil:
+		return "sleep"
+	case s.ExpectSanitizer != nil:
+		return "expect_sanitizer"
+	case s.ExpectLog != nil:
+		return "expect_log"
+	case s.HTTP != nil:
+		return "http"
+	case s.TCP != nil:
+		return "tcp"
+	case s.Net != nil:
+		return "net"
+	}
+	return ""
+}
+
+// kinds counts the kinds set on the step (exactly one is valid).
+func (s SequenceStep) kinds() int {
+	n := 0
+	for _, set := range []bool{s.Exec != nil, s.Freeze != nil, s.Resume != nil, s.Sleep != nil,
+		s.ExpectSanitizer != nil, s.ExpectLog != nil, s.HTTP != nil, s.TCP != nil, s.Net != nil} {
+		if set {
+			n++
+		}
+	}
+	return n
+}
+
+// IsNetwork reports whether the step reaches the target over the network.
+func (s SequenceStep) IsNetwork() bool { return s.HTTP != nil || s.TCP != nil || s.Net != nil }
+
+// SequenceExec is an exec step: an exec probe, run in the target or, with
+// Container, in the named sidecar.
+type SequenceExec struct {
+	ExecProbe `yaml:",inline"`
+	Container string `yaml:"container,omitempty" json:"container,omitempty"` // a sidecar name; empty = the target
+}
+
+// InTarget reports whether the command runs in the target container.
+func (e SequenceExec) InTarget() bool { return e.Container == "" }
+
+// Asserts reports whether the step states an expectation of its own (an exit
+// code or an stdout match), as opposed to only driving the target.
+func (e SequenceExec) Asserts() bool { return e.ExpectExit != nil || e.StdoutMatches != "" }
+
+// FreezeStep pauses the target container (never a sidecar). No options in v1.
+type FreezeStep struct{}
+
+// ResumeStep unpauses the target container. No options in v1.
+type ResumeStep struct{}
+
+// SleepStep waits a fixed time.
+type SleepStep struct {
+	MS int `yaml:"ms" json:"ms"` // 1..MaxSleepMS
+}
+
+// SanitizerNone is the scalar form of expect_sanitizer: no report expected.
+const SanitizerNone = "none"
+
+// ExpectSanitizer asserts on the sanitizer reports written during an attempt:
+// either none at all (None, written `expect_sanitizer: none`), or one of class
+// Kind whose first stack has a frame matching the Go regexp Frame.
+type ExpectSanitizer struct {
+	None  bool   `yaml:"-" json:"-"`
+	Kind  string `yaml:"kind" json:"kind"`
+	Frame string `yaml:"frame,omitempty" json:"frame,omitempty"`
+}
+
+// Positive reports whether the step expects a report (a hit), not its absence.
+func (e ExpectSanitizer) Positive() bool { return !e.None }
+
+// rawExpectSanitizer is the mapping form of expect_sanitizer.
+type rawExpectSanitizer struct {
+	Kind  string `yaml:"kind"`
+	Frame string `yaml:"frame,omitempty"`
+}
+
+// UnmarshalYAML accepts the scalar none or a {kind, frame} mapping.
+func (e *ExpectSanitizer) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var s string
+	if err := unmarshal(&s); err == nil {
+		if s != SanitizerNone {
+			return fmt.Errorf("expect_sanitizer must be %q or a mapping { kind, frame }, got %q", SanitizerNone, s)
+		}
+		*e = ExpectSanitizer{None: true}
+		return nil
+	}
+	var m map[string]any
+	if err := unmarshal(&m); err != nil {
+		return fmt.Errorf("expect_sanitizer must be %q or a mapping { kind, frame }", SanitizerNone)
+	}
+	var raw rawExpectSanitizer
+	if err := unmarshal(&raw); err != nil {
+		return fmt.Errorf("expect_sanitizer: %w", err) // e.g. an unknown key
+	}
+	*e = ExpectSanitizer{Kind: raw.Kind, Frame: raw.Frame}
+	return nil
+}
+
+// MarshalYAML writes the scalar none or the mapping.
+func (e ExpectSanitizer) MarshalYAML() (interface{}, error) {
+	if e.None {
+		return SanitizerNone, nil
+	}
+	return rawExpectSanitizer{Kind: e.Kind, Frame: e.Frame}, nil
+}
+
+// MarshalJSON writes "none" or {"kind", "frame"}.
+func (e ExpectSanitizer) MarshalJSON() ([]byte, error) {
+	if e.None {
+		return json.Marshal(SanitizerNone)
+	}
+	return json.Marshal(struct {
+		Kind  string `json:"kind"`
+		Frame string `json:"frame,omitempty"`
+	}{e.Kind, e.Frame})
+}
+
+// Sanitizer is service.sanitizer: where the target's sanitizer runtime writes
+// its reports, which a sequence's expect_sanitizer steps read.
+type Sanitizer struct {
+	// LogDir is an absolute, canonical directory in the target. The template
+	// points log_path (e.g. ASAN_OPTIONS=log_path=<LogDir>/asan) into it.
+	LogDir string `yaml:"log_dir" json:"log_dir"`
 }
 
 // OverlayFile is a file from the template folder written into the image.
@@ -380,6 +577,10 @@ type Service struct {
 	CapAdd      []string          `yaml:"cap_add,omitempty" json:"cap_add,omitempty"`
 	CapDrop     []string          `yaml:"cap_drop,omitempty" json:"cap_drop,omitempty"`
 	Devices     []string          `yaml:"devices,omitempty" json:"devices,omitempty"`
+	// Sanitizer, when set, names the directory a sanitizer-instrumented
+	// target writes its reports to (for sequence expect_sanitizer steps). It
+	// is read at run time and is not part of any image's content hash.
+	Sanitizer *Sanitizer `yaml:"sanitizer,omitempty" json:"sanitizer,omitempty"`
 }
 
 // PrimaryPort is the port a scanner should be pointed at: the first HTTP port,
