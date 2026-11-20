@@ -736,6 +736,13 @@ var cases = []conformanceCase{
 		if err != nil {
 			t.Fatal(err)
 		}
+		for name, f := range got {
+			if f.ModTime.IsZero() && h.f != nil {
+				t.Errorf("the fake reports no modification time for %s", name)
+			}
+			f.ModTime = time.Time{} // compared below by content only
+			got[name] = f
+		}
 		want := map[string]engine.FileContent{
 			"asan.12": {Size: 24, Data: []byte("ERROR: AddressSanitizer\n")},
 			"asan.13": {Size: 100, Data: []byte(big[:32])},

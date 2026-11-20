@@ -406,8 +406,11 @@ yours) — there too, `-expose host -bind <daemon address>` gives you a scannabl
 URL. The healthcheck then runs inside the target (it checks that the port
 listens, or, for an `http` healthcheck, asks `curl` when the image has it), so
 seeds still wait for the service; an image without a shell is taken as ready
-once it runs. `exec` verify probes still run, since they need no network path:
-a failing one fails verify, and the network probes are reported as skipped.
+once it runs. `exec` and `sequence` verify probes still run, since they need
+no network path: a failing one fails verify, and the network probes are
+reported as skipped. A `sequence` reports each attempt (`hit`, `pass`, `not
+reached` or `fail`) in its verify line and in `-json` under the probe's
+`attempts`; see [`sequence`](CONTRACT.md#sequence).
 
 ## Scanning the fleet (Nuclei or anything else)
 

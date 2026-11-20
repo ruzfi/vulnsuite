@@ -23,7 +23,7 @@ contract.yaml ───────► Contract ─────────► i
 | `pkg/validator` | Semantic lint: is the template *wrong* rather than malformed (unpinned base, missing files, identical states, weak probes, ...). Pure functions over contracts. |
 | `pkg/engine` | The `Engine` interface the rest of the system builds and runs on. `engine/moby` implements it with the official Moby SDK (`github.com/moby/moby/client`, the default); `engine/docker` implements the same thing against the Engine HTTP API with `net/http` only; `engine/engines` picks one by name; `engine/registryauth` resolves registry credentials for both; `engine/enginetest` is an in-memory fake for tests. |
 | `pkg/builder` | Turns a (contract, state) into a local image: pull for `image` kinds, a generated overlay Dockerfile for `overlay`, a git checkout + patch for `source`, the template's own context for `build`. Build contexts are streamed to the daemon as tar (never held in memory whole), honouring `.dockerignore`; `ResolveAll` runs them in parallel with a bounded worker pool. `Publish` tags and pushes to a registry. |
-| `pkg/runner` | Starts a resolved image with the hardening baseline and the chosen exposure, waits for readiness, runs the state's probes, and manages the fleet (`Running`, `StopAll`). Stateless: the fleet is discovered by the `dev.vulnsuite.*` container labels (id, state, role, network), so there is no bookkeeping file to drift. Each target state gets its own sidecars on a private network. |
+| `pkg/runner` | Starts a resolved image with the hardening baseline and the chosen exposure, waits for readiness, runs the state's probes (including the `sequence` executor: freeze/resume through the engine's optional `Pauser`, exec in sidecars, sanitizer reports read through `FileReader`, restarts between attempts), and manages the fleet (`Running`, `StopAll`). Stateless: the fleet is discovered by the `dev.vulnsuite.*` container labels (id, state, role, network), so there is no bookkeeping file to drift. Each target state gets its own sidecars on a private network. |
 | `pkg/probes` | Raw-socket HTTP, TCP and exec probes plus readiness helpers. Deliberately not `net/http` on the client side so encoded traversal payloads reach the wire unchanged. |
 | `pkg/templates` | Where the templates directory is, and `update-templates` (git pull, or a GitHub archive download). |
 | `internal/cli` | The commands. A tiny subcommand layer over `flag`; every command gets the global flags; `-json` output is on stdout with progress on stderr. |
@@ -59,8 +59,8 @@ hard-coding an OS check, the runner classifies the first connection attempt:
 *refused* means routable but not up yet (keep waiting), a timeout / no route
 means unreachable. Then the healthcheck runs inside the target through the
 engine's exec (a listening socket in `/proc/net/tcp`, or `curl` for an `http`
-healthcheck), and so do the `exec` verify probes; the network probes are
-skipped with an explanation.
+healthcheck), and so do the `exec` and `sequence` verify probes; the network
+probes are skipped with an explanation.
 
 **State environment is baked into built images.** So a published image is a
 complete vulnerable (or patched) target on its own; the runner also passes
