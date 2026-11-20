@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -85,7 +86,7 @@ func TestResolveBuildsSidecar(t *testing.T) {
 	if bl.Dockerfile != "Dockerfile" || bl.BuildArgs["V"] != "2" {
 		t.Fatalf("build options: %+v", bl)
 	}
-	if _, ok := bl.Files["run.sh"]; !ok || bl.Modes["run.sh"]&0o111 == 0 {
+	if _, ok := bl.Files["run.sh"]; !ok || (runtime.GOOS != "windows" && bl.Modes["run.sh"]&0o111 == 0) {
 		t.Fatalf("run.sh missing or not executable in the context: %v %o", bl.Files, bl.Modes["run.sh"])
 	}
 	for _, gone := range []string{"debug.log", ".git/HEAD"} {

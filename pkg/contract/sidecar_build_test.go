@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -108,11 +109,14 @@ func TestSidecarTag(t *testing.T) {
 	}
 	changed := map[string]string{
 		"script content":  tag(ctx, withFiles(map[string]string{"sidecars/driver/run.sh": "+x:#!/bin/sh\necho bye\n"})),
-		"exec bit":        tag(ctx, withFiles(map[string]string{"sidecars/driver/run.sh": "#!/bin/sh\necho hi\n"})),
 		"new file":        tag(ctx, withFiles(map[string]string{"sidecars/driver/extra": "x"})),
 		"Dockerfile":      tag(ctx, withFiles(map[string]string{"sidecars/driver/Dockerfile": "FROM alpine\nCOPY run.sh /run.sh\n"})),
 		"dockerfile path": tag("{ context: sidecars/driver, dockerfile: Dockerfile.alt }", withFiles(map[string]string{"sidecars/driver/Dockerfile.alt": "FROM busybox\nCOPY run.sh /run.sh\n"})),
 		"build args":      tag(`{ context: sidecars/driver, build_args: { V: "2" } }`, driverFiles),
+	}
+	// The exec bit only exists where the filesystem keeps one.
+	if runtime.GOOS != "windows" {
+		changed["exec bit"] = tag(ctx, withFiles(map[string]string{"sidecars/driver/run.sh": "#!/bin/sh\necho hi\n"}))
 	}
 	for what, got := range changed {
 		if got == base {
