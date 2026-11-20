@@ -392,3 +392,43 @@ func TestInvalidRegexFailsProbe(t *testing.T) {
 		t.Fatalf("valid patterns: %s", r.Detail)
 	}
 }
+
+// Until the sequence executor lands (#98), a sequence probe fails with a clear
+// detail and never touches the target.
+func TestRunSequenceUnsupported(t *testing.T) {
+	called := false
+	tgt := Target{Container: "c", Exec: func(context.Context, string, string, time.Duration) (int, string, error) {
+		called = true
+		return 0, "", nil
+	}}
+	p := contract.Probe{Sequence: &contract.SequenceProbe{Steps: []contract.SequenceStep{
+		{Exec: &contract.SequenceExec{ExecProbe: contract.ExecProbe{Run: "true", ExpectExit: new(int)}}},
+	}}}
+	r := Run(context.Background(), p, tgt)
+	if r.OK || r.Kind != "sequence" || r.Detail != SequenceUnsupported || r.Transport || called {
+		t.Fatalf("result = %+v, exec called %v", r, called)
+	}
+	if !strings.Contains(r.Detail, "#98") {
+		t.Fatalf("detail %q", r.Detail)
+	}
+	ok, rs := RunAll(context.Background(), []contract.Probe{p}, tgt)
+	if ok || !strings.HasPrefix(FormatResults(rs), "FAIL sequence probes are not supported") {
+		t.Fatalf("RunAll = %v %q", ok, FormatResults(rs))
+	}
+}
+
+// A sequence step's bad regexp is reported like any other probe's.
+func TestRunSequenceBadRegex(t *testing.T) {
+	bad := "("
+	for _, st := range []contract.SequenceStep{
+		{ExpectLog: &bad},
+		{ExpectSanitizer: &contract.ExpectSanitizer{Kind: "heap-use-after-free", Frame: bad}},
+		{Exec: &contract.SequenceExec{ExecProbe: contract.ExecProbe{Run: "x", StdoutMatches: bad}}},
+		{Net: &contract.NetProbe{Steps: []contract.NetStep{{Expect: bad}}}},
+	} {
+		r := Run(context.Background(), contract.Probe{Sequence: &contract.SequenceProbe{Steps: []contract.SequenceStep{st}}}, Target{})
+		if r.OK || !strings.Contains(r.Detail, "invalid regex in sequence probe steps[0]") {
+			t.Errorf("%s: %+v", st.Kind(), r)
+		}
+	}
+}

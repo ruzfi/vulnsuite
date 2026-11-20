@@ -165,19 +165,29 @@ type checker struct {
 	anchors map[string]ast.Node
 }
 
-var commandType = reflect.TypeOf(Command(nil))
+var (
+	commandType         = reflect.TypeOf(Command(nil))
+	expectSanitizerType = reflect.TypeOf(ExpectSanitizer{})
+)
 
-// probeTypes are the verify-probe structs whose port and timeout the schema
-// bounds (port 1..65535, timeout > 0). Their Go fields are plain numbers where
-// 0 means "the default", so an explicit `port: 0` or `timeout: 0` cannot be
-// told apart from an absent key after decoding; checkNodeType rejects it here,
-// where the key's presence is still visible.
+// probeTypes are the verify-probe structs whose port, timeout and counts the
+// schema bounds (port 1..65535, timeout > 0, attempts/min_hits/ms >= 1).
+// Their Go fields are plain numbers where 0 means "the default", so an
+// explicit `port: 0` or `timeout: 0` cannot be told apart from an absent key
+// after decoding; checkNodeType rejects it here, where the key's presence is
+// still visible.
 var probeTypes = map[reflect.Type]bool{
-	reflect.TypeOf(HTTPProbe{}): true,
-	reflect.TypeOf(ExecProbe{}): true,
-	reflect.TypeOf(TCPProbe{}):  true,
-	reflect.TypeOf(NetProbe{}):  true,
+	reflect.TypeOf(HTTPProbe{}):     true,
+	reflect.TypeOf(ExecProbe{}):     true,
+	reflect.TypeOf(TCPProbe{}):      true,
+	reflect.TypeOf(NetProbe{}):      true,
+	reflect.TypeOf(SequenceProbe{}): true,
+	reflect.TypeOf(SequenceExec{}):  true,
+	reflect.TypeOf(SleepStep{}):     true,
 }
+
+// positiveKeys are the probe keys checkPositive bounds.
+var positiveKeys = map[string]bool{"port": true, "timeout": true, "attempts": true, "min_hits": true, "ms": true}
 
 // checkPositive rejects an explicit non-positive probe port or timeout.
 func (c checker) checkPositive(n ast.Node, key, loc string) error {
@@ -200,6 +210,8 @@ func (c checker) checkPositive(n ast.Node, key, loc string) error {
 		return se(loc, "must be 1..65535")
 	case key == "timeout" && v <= 0:
 		return se(loc, "must be greater than 0")
+	case (key == "attempts" || key == "min_hits" || key == "ms") && v < 1:
+		return se(loc, "must be at least 1")
 	}
 	return nil
 }
@@ -319,6 +331,17 @@ func (c checker) checkNodeType(n ast.Node, t reflect.Type, loc string) error {
 	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
+	if t == expectSanitizerType {
+		// The scalar none (its value is checked by the decoder) or a
+		// { kind, frame } mapping.
+		if isString(n) {
+			return nil
+		}
+		if _, ok := mappingEntries(n); !ok {
+			return typeErr(loc, "none or a mapping", n)
+		}
+		return c.checkNodeType(n, reflect.TypeOf(rawExpectSanitizer{}), loc)
+	}
 	switch t.Kind() {
 	case reflect.String:
 		if !isString(n) {
@@ -389,7 +412,7 @@ func (c checker) checkNodeType(n ast.Node, t reflect.Type, loc string) error {
 			if err := c.checkNodeType(e.Value, f.Type, join(loc, key)); err != nil {
 				return err
 			}
-			if probeTypes[t] && (key == "port" || key == "timeout") {
+			if probeTypes[t] && positiveKeys[key] {
 				if err := c.checkPositive(e.Value, key, join(loc, key)); err != nil {
 					return err
 				}
@@ -421,10 +444,18 @@ func (c checker) checkMerge(v ast.Node, t reflect.Type, loc string) error {
 	return nil
 }
 
+// fieldByYAMLName finds the field a YAML key decodes into, looking through
+// embedded structs tagged `yaml:",inline"`.
 func fieldByYAMLName(t reflect.Type, name string) (reflect.StructField, bool) {
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
-		tag, _, _ := strings.Cut(f.Tag.Get("yaml"), ",")
+		tag, opts, _ := strings.Cut(f.Tag.Get("yaml"), ",")
+		if f.Anonymous && tag == "" && opts == "inline" && f.Type.Kind() == reflect.Struct {
+			if inner, ok := fieldByYAMLName(f.Type, name); ok {
+				return inner, true
+			}
+			continue
+		}
 		if tag == name && tag != "-" {
 			return f, true
 		}

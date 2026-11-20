@@ -1269,16 +1269,17 @@ func (r *Runner) runProbes(ctx context.Context, c *contract.Contract, st *contra
 	h.VerifyDetail = probes.FormatResults(results)
 }
 
-// runExecProbesOnly verifies a target this machine cannot reach. exec probes
-// need no network path (they run inside the target through the engine), so
-// they run; the network probes are skipped and why says why. A failed exec
-// probe fails verify. When every probe is an exec probe and all pass, verify
-// passes; when network probes were skipped, the result is partial and VerifyOK
-// stays nil (not verified), with the exec results in the detail.
+// runExecProbesOnly verifies a target this machine cannot reach. exec and
+// sequence probes need no network path (they run through the engine and on
+// the private sidecar network), so they run; the network probes are skipped
+// and why says why. A failed exec or sequence probe fails verify. When every
+// probe is one of those and all pass, verify passes; when network probes were
+// skipped, the result is partial and VerifyOK stays nil (not verified), with
+// the in-container results in the detail.
 func (r *Runner) runExecProbesOnly(ctx context.Context, st *contract.State, h *Handle, exec probes.ExecFunc, why string) {
 	var execs []contract.Probe
 	for _, p := range st.Verify {
-		if p.Kind() == "exec" {
+		if k := p.Kind(); k == "exec" || k == "sequence" {
 			execs = append(execs, p)
 		}
 	}

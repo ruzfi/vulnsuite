@@ -48,6 +48,8 @@ var decoderOnly = map[string]string{
 	"sidecar-duplicate.yaml": "uniqueItems compares whole objects; sidecar names being unique cannot be expressed",
 	"disclosed-feb-30.yaml": "the pattern bounds month 01-12 and day 01-31, but whether a day exists in its month " +
 		"(Feb 30, Apr 31, Feb 29 outside a leap year) needs a calendar; the decoder parses the date",
+	"sequence-min-hits-over-attempts.yaml": "min_hits must not exceed attempts, a comparison of two sibling values " +
+		"that JSON Schema has no keyword for",
 }
 
 func loadSchema(t *testing.T) map[string]any {

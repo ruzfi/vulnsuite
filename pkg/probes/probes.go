@@ -366,6 +366,10 @@ func secs(f float64, def time.Duration) time.Duration {
 	return time.Duration(f * float64(time.Second))
 }
 
+// SequenceUnsupported is the verify detail of a sequence probe in this
+// version, which parses and validates sequences but cannot run them yet.
+const SequenceUnsupported = "sequence probes are not supported by this version yet (#98)"
+
 // Run executes one probe against the target.
 func Run(ctx context.Context, p contract.Probe, t Target) Result {
 	started := time.Now()
@@ -387,6 +391,11 @@ func Run(ctx context.Context, p contract.Probe, t Target) Result {
 		ok, detail, err = runTCP(ctx, p.TCP, t)
 	case "net":
 		ok, detail, err = runNet(ctx, p.Net, t)
+	case "sequence":
+		// Fail rather than skip: a target whose only proof is a sequence must
+		// not be reported as verified (or silently unverified) until the
+		// executor lands.
+		ok, detail = false, SequenceUnsupported
 	default:
 		err = fmt.Errorf("unknown probe kind %q", p.Kind())
 	}
@@ -833,6 +842,30 @@ func checkPatterns(p contract.Probe) error {
 		for i, st := range p.Net.Steps {
 			fs = append(fs, field{fmt.Sprintf("steps[%d].expect", i), st.Expect},
 				field{fmt.Sprintf("steps[%d].expect_absent", i), st.ExpectAbsent})
+		}
+	case p.Sequence != nil:
+		for i, st := range p.Sequence.Steps {
+			pre := fmt.Sprintf("steps[%d].", i)
+			switch {
+			case st.Exec != nil:
+				fs = append(fs, field{pre + "exec.stdout_matches", st.Exec.StdoutMatches})
+			case st.ExpectSanitizer != nil:
+				fs = append(fs, field{pre + "expect_sanitizer.frame", st.ExpectSanitizer.Frame})
+			case st.ExpectLog != nil:
+				fs = append(fs, field{pre + "expect_log", *st.ExpectLog})
+			case st.HTTP != nil:
+				fs = append(fs, field{pre + "http.body_matches", st.HTTP.BodyMatches}, field{pre + "http.body_absent", st.HTTP.BodyAbsent})
+				for _, name := range slices.Sorted(maps.Keys(st.HTTP.HeaderMatches)) {
+					fs = append(fs, field{pre + "http.header_matches." + name, st.HTTP.HeaderMatches[name]})
+				}
+			case st.TCP != nil:
+				fs = append(fs, field{pre + "tcp.banner_matches", st.TCP.BannerMatches})
+			case st.Net != nil:
+				for j, ns := range st.Net.Steps {
+					fs = append(fs, field{fmt.Sprintf("%snet.steps[%d].expect", pre, j), ns.Expect},
+						field{fmt.Sprintf("%snet.steps[%d].expect_absent", pre, j), ns.ExpectAbsent})
+				}
+			}
 		}
 	}
 	for _, f := range fs {

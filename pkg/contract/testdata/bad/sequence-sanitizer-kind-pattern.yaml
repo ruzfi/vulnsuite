@@ -1,0 +1,21 @@
+# want: must match
+apiVersion: vulnsuite/v1
+kind: Target
+metadata:
+  id: demo-sequence
+  summary: demo
+base:
+  kind: image
+  image: nginx:1.27
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+service:
+  ports: [ { container: 80, protocol: http } ]
+  sanitizer: { log_dir: /var/log/asan }
+  sidecars:
+    - { name: driver, image: python:3.13-slim }
+states:
+  vulnerable:
+    verify:
+      - sequence:
+          steps:
+            - expect_sanitizer: { kind: Heap_UAF }
