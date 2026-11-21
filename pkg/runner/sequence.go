@@ -2,7 +2,9 @@ package runner
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -48,8 +50,14 @@ const (
 	// in every engine (they cap a read at 1 MiB or more), so the log written
 	// during an attempt is an exact slice. Past it the runner compares tails.
 	logExactLimit = 768 << 10
-	// logTailLines is how many trailing log lines a tail comparison reads.
+	// logTailLines is how many trailing log lines a tail comparison reads at
+	// most (fewer when that many lines would not fit under logExactLimit).
 	logTailLines = 2000
+	// finalReportTimeout bounds the last read of the log_dir in an attempt
+	// that stopped early.
+	finalReportTimeout = 5 * time.Second
+	// killStepTimeout bounds the exec that kills a step left running.
+	killStepTimeout = 5 * time.Second
 )
 
 // errNoPause is the verify detail of a sequence with freeze on an engine that
@@ -60,6 +68,7 @@ const errNoPause = "this engine cannot pause containers, so freeze cannot run"
 type sequenceExec struct {
 	r    *Runner
 	c    *contract.Contract
+	st   *contract.State
 	h    *Handle
 	exec probes.ExecFunc
 	// net returns the target for network steps, or why there is none from
@@ -68,8 +77,8 @@ type sequenceExec struct {
 }
 
 // sequenceFunc is the probes.SequenceFunc of a target state.
-func (r *Runner) sequenceFunc(c *contract.Contract, h *Handle, exec probes.ExecFunc) probes.SequenceFunc {
-	x := &sequenceExec{r: r, c: c, h: h, exec: exec, net: func() (probes.Target, string) { return r.networkTarget(c, h, exec) }}
+func (r *Runner) sequenceFunc(c *contract.Contract, st *contract.State, h *Handle, exec probes.ExecFunc) probes.SequenceFunc {
+	x := &sequenceExec{r: r, c: c, st: st, h: h, exec: exec, net: func() (probes.Target, string) { return r.networkTarget(c, h, exec) }}
 	return x.run
 }
 
@@ -100,10 +109,10 @@ func (x *sequenceExec) run(ctx context.Context, s *contract.SequenceProbe) probe
 		if ctx.Err() != nil {
 			break
 		}
-		restarted := false
+		restarted, note := false, ""
 		if i > 1 {
 			var err error
-			if restarted, err = x.ensureRunning(ctx); err != nil {
+			if restarted, note, err = x.ensureRunning(ctx); err != nil {
 				// No later attempt can run either.
 				for j := i; j <= n; j++ {
 					attempts = append(attempts, probes.SequenceAttempt{Attempt: j, Outcome: probes.OutcomeNotReached, Detail: err.Error()})
@@ -114,6 +123,9 @@ func (x *sequenceExec) run(ctx context.Context, s *contract.SequenceProbe) probe
 		}
 		a := x.attempt(ctx, s, i)
 		a.Restarted = restarted
+		if note != "" {
+			a.Detail += "; " + note
+		}
 		attempts = append(attempts, a)
 		switch a.Outcome {
 		case probes.OutcomeHit:
@@ -139,10 +151,13 @@ func (x *sequenceExec) run(ctx context.Context, s *contract.SequenceProbe) probe
 	// (halt_on_error=1). A target that does not come back is reported here
 	// and, through h.Ready, fails the run as not ready.
 	if len(attempts) > 0 && ctx.Err() == nil {
-		if restarted, err := x.ensureRunning(ctx); err != nil {
+		if restarted, note, err := x.ensureRunning(ctx); err != nil {
 			detail += "; afterwards " + err.Error()
 		} else if restarted {
 			detail += "; the target was restarted afterwards"
+			if note != "" {
+				detail += "; " + note
+			}
 		}
 	}
 	return probes.Result{OK: ok, Detail: detail, Attempts: attempts}
@@ -180,6 +195,15 @@ func sequenceDetail(positive bool, minHits int, st seqStats, attempts []probes.S
 func hasPositiveSanitizer(s *contract.SequenceProbe) bool {
 	for _, st := range s.Steps {
 		if st.ExpectSanitizer != nil && st.ExpectSanitizer.Positive() {
+			return true
+		}
+	}
+	return false
+}
+
+func hasNoneSanitizer(s *contract.SequenceProbe) bool {
+	for _, st := range s.Steps {
+		if st.ExpectSanitizer != nil && st.ExpectSanitizer.None {
 			return true
 		}
 	}
@@ -255,20 +279,22 @@ func octalMode(m fs.FileMode) string {
 }
 
 // ensureRunning starts the target again when it exited during the previous
-// attempt (e.g. a server built with halt_on_error=1) and waits for it to be
-// ready, as Run does. A target still running is watched for exitSettle
-// first, in case it is on its way down. It reports whether it restarted the
-// target.
-func (x *sequenceExec) ensureRunning(ctx context.Context) (bool, error) {
+// attempt (e.g. a server built with halt_on_error=1), waits for it to be
+// ready with Run's readiness timeout, and runs the state's seed steps again,
+// as Run does. A target still running is watched for exitSettle first, in
+// case it is on its way down. It reports whether it restarted the target;
+// note says which seed step failed after the restart (not an error: a seed
+// that is not idempotent may fail on state the target kept on disk).
+func (x *sequenceExec) ensureRunning(ctx context.Context) (restarted bool, note string, err error) {
 	if err := x.unpauseIfPaused(ctx); err != nil {
-		return false, err
+		return false, "", err
 	}
 	var det *engine.ContainerDetail
 	deadline := time.Now().Add(exitSettle)
 	for {
 		var err error
 		if det, err = x.r.Engine.ContainerInspect(ctx, x.h.Container); err != nil {
-			return false, fmt.Errorf("the target is gone: %v", err)
+			return false, "", fmt.Errorf("the target is gone: %v", err)
 		}
 		if !det.Running || !time.Now().Before(deadline) || ctx.Err() != nil {
 			break
@@ -276,18 +302,25 @@ func (x *sequenceExec) ensureRunning(ctx context.Context) (bool, error) {
 		sleepCtx(ctx, min(exitPoll, time.Until(deadline)))
 	}
 	if det.Running {
-		return false, nil
+		return false, "", nil
 	}
 	code := det.ExitCode
 	if err := x.r.Engine.ContainerStart(ctx, x.h.Container); err != nil {
-		return false, fmt.Errorf("the target exited with code %d and could not be started again: %v", code, err)
+		return false, "", fmt.Errorf("the target exited with code %d and could not be started again: %v", code, err)
 	}
 	x.r.refreshAddress(ctx, x.h)
-	x.r.awaitReady(ctx, x.c, x.h, 0)
+	x.r.awaitReady(ctx, x.c, x.h, x.h.readyTimeout)
 	if !x.h.Ready {
-		return true, fmt.Errorf("the target exited with code %d and was not ready after a restart: %s", code, x.h.ReadyDetail)
+		return true, "", fmt.Errorf("the target exited with code %d and was not ready after a restart: %s", code, x.h.ReadyDetail)
 	}
-	return true, nil
+	if x.st != nil {
+		for _, res := range x.r.runSeeds(ctx, x.st, x.h) {
+			if !res.OK {
+				return true, fmt.Sprintf("seed step %q failed after the restart: %s", res.Run, res.Error), nil
+			}
+		}
+	}
+	return true, "", nil
 }
 
 // unpauseIfPaused unpauses a target an earlier attempt left paused (an
@@ -533,8 +566,17 @@ steps:
 				container = SidecarContainerName(x.c.ID(), x.h.State, st.Exec.Container)
 			}
 			e := st.Exec.ExecProbe
-			r := probes.Run(ctx, contract.Probe{Exec: &e}, probes.Target{Container: container, Exec: x.exec})
+			pidFile := stepPIDFile()
+			tracked := func(ctx context.Context, container, command string, timeout time.Duration) (int, string, error) {
+				return x.exec(ctx, container, trackStepPID(command, pidFile), timeout)
+			}
+			r := probes.Run(ctx, contract.Probe{Exec: &e}, probes.Target{Container: container, Exec: tracked})
 			if !r.OK {
+				// A step that timed out, or was cut off by the attempt
+				// timeout or the freeze cap, is still running: the daemon
+				// cannot kill an exec, and it could finish during the next
+				// attempt and count there.
+				x.killStep(parent, container, pidFile)
 				as.notReached = stepFailed(i, st, errors.New(sidecarDetail(st.Exec, r.Detail)))
 				break steps
 			}
@@ -612,6 +654,18 @@ steps:
 		}
 	}
 
+	if as.notReached != "" && as.noneFail == "" && as.snapshot != nil && hasNoneSanitizer(s) && parent.Err() == nil {
+		// A step stopped the attempt before its expect_sanitizer: none ran
+		// (or after it), often because the target aborted with a report.
+		// That report is still a report during the attempt, and the next
+		// attempt's snapshot would hide it: read the log_dir once more.
+		rctx, rcancel := context.WithTimeout(context.WithoutCancel(parent), finalReportTimeout)
+		if reports, err := x.newReports(rctx, as.snapshot); err == nil && len(reports) > 0 {
+			as.noneFail = fmt.Sprintf("sanitizer report: %s (the attempt stopped early: %s)", reports[0].Summary(), as.notReached)
+		}
+		rcancel()
+	}
+
 	// A report on patched is decisive whatever else happened; otherwise a
 	// race that was not shown to run decides nothing.
 	switch {
@@ -630,6 +684,31 @@ steps:
 		}
 	}
 	return a
+}
+
+// stepPIDFile is a fresh path for an exec step's PID file.
+func stepPIDFile() string {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return "/tmp/.vulnsuite-step-" + hex.EncodeToString(b[:])
+}
+
+// trackStepPID wraps an exec step's command so that its PID is in pidFile
+// while it runs (and the file is gone once it ended), for killStep. The
+// command still runs under sh -c with the same output and exit code.
+func trackStepPID(command, pidFile string) string {
+	f := shellQuote(pidFile)
+	return fmt.Sprintf(`sh -c %s & p=$!; echo "$p" > %s; wait "$p"; rc=$?; rm -f %s; exit "$rc"`, shellQuote(command), f, f)
+}
+
+// killStep kills an exec step that may still be running, by its PID file,
+// on a context of its own (the attempt's may be over).
+func (x *sequenceExec) killStep(parent context.Context, container, pidFile string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), killStepTimeout)
+	defer cancel()
+	f := shellQuote(pidFile)
+	_, _, _ = x.r.Engine.ContainerExec(ctx, container,
+		fmt.Sprintf(`p=$(cat %s 2>/dev/null) && kill -9 "$p" 2>/dev/null; rm -f %s`, f, f), killStepTimeout)
 }
 
 // sidecarDetail names the sidecar an exec step ran in.
@@ -776,6 +855,8 @@ type logMark struct {
 	exact  bool
 	// tail is the log's last lines then, for a log too long to read whole.
 	tail []string
+	// tailLines is how many lines a tail read asks for (see readTail).
+	tailLines int
 }
 
 // markLogs records the log's length (or, for a long log, its tail).
@@ -787,11 +868,26 @@ func (x *sequenceExec) markLogs(ctx context.Context) (*logMark, error) {
 	if len(full) < logExactLimit {
 		return &logMark{offset: len(full), exact: true, tail: lastLines(full, logTailLines)}, nil
 	}
-	t, err := x.r.Engine.ContainerLogs(ctx, x.h.Container, logTailLines)
+	t, n, err := x.readTail(ctx, logTailLines)
 	if err != nil {
 		return nil, err
 	}
-	return &logMark{tail: lastLines(t, logTailLines)}, nil
+	return &logMark{tail: lastLines(t, n), tailLines: n}, nil
+}
+
+// readTail reads the log's last n lines, asking for fewer while the read
+// does not fit under logExactLimit: an engine keeps only the first 1 MiB (or
+// more) of a read, so a tail of long lines would lose its newest lines and
+// what is new could not be told from what is old. It returns the lines read
+// and how many it asked for.
+func (x *sequenceExec) readTail(ctx context.Context, n int) (string, int, error) {
+	for {
+		t, err := x.r.Engine.ContainerLogs(ctx, x.h.Container, n)
+		if err != nil || len(t) < logExactLimit || n <= 1 {
+			return t, n, err
+		}
+		n = max(1, n/4)
+	}
 }
 
 // logsSince returns what the target logged after m.
@@ -805,7 +901,11 @@ func (x *sequenceExec) logsSince(ctx context.Context, m *logMark) (string, error
 			return full[m.offset:], nil
 		}
 	}
-	t, err := x.r.Engine.ContainerLogs(ctx, x.h.Container, logTailLines)
+	n := m.tailLines
+	if n == 0 {
+		n = logTailLines
+	}
+	t, _, err := x.readTail(ctx, n)
 	if err != nil {
 		return "", err
 	}
