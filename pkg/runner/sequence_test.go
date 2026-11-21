@@ -50,6 +50,8 @@ type seqFix struct {
 
 	mu   sync.Mutex
 	logs string
+	// kills is every exec that killed a step left running.
+	kills []string
 	// onExec answers an exec of a trigger (anything but the in-container
 	// healthcheck); nil = exit 0.
 	onExec func(container, cmd string) (int, string, error)
@@ -93,6 +95,15 @@ func newSeqFix(t *testing.T) *seqFix {
 	f.fe.ExecFn = func(container, cmd string) (int, string, error) {
 		if strings.Contains(cmd, "/proc/net/tcp") {
 			return 0, "", nil // the in-container healthcheck: listening
+		}
+		if isStepKill(cmd) {
+			f.mu.Lock()
+			f.kills = append(f.kills, container+": "+cmd)
+			f.mu.Unlock()
+			return 0, "", nil
+		}
+		if orig, _, ok := untrackStepPID(cmd); ok {
+			cmd = orig // a sequence exec step, as the template wrote it
 		}
 		f.mu.Lock()
 		fn := f.onExec
@@ -146,16 +157,22 @@ func (f *seqFix) exec() probes.ExecFunc {
 func (f *seqFix) run(ctx context.Context, s *contract.SequenceProbe) probes.Result {
 	f.t.Helper()
 	return probes.Run(ctx, contract.Probe{Sequence: s}, probes.Target{Container: f.target, Exec: f.exec(),
-		Sequence: f.r.sequenceFunc(f.c, f.h, f.exec())})
+		Sequence: f.r.sequenceFunc(f.c, f.c.States[f.h.State], f.h, f.exec())})
 }
 
 // calls is the fake's pause/exec/unpause log without healthcheck execs.
 func (f *seqFix) calls() []string {
 	var out []string
 	for _, c := range f.fe.Calls {
-		if !strings.Contains(c, "/proc/net/tcp") {
-			out = append(out, c)
+		if strings.Contains(c, "/proc/net/tcp") || isStepKill(c) {
+			continue
 		}
+		if prefix, cmd, ok := strings.Cut(c, ": "); ok {
+			if orig, _, ok := untrackStepPID(cmd); ok {
+				c = prefix + ": " + orig
+			}
+		}
+		out = append(out, c)
 	}
 	return out
 }
@@ -189,6 +206,9 @@ func (f *seqFix) assertThawed() {
 		f.t.Error("the fake still has the target paused")
 	}
 }
+
+// isStepKill reports whether cmd (or an exec call) is killStep's.
+func isStepKill(cmd string) bool { return strings.Contains(cmd, `p=$(cat '/tmp/.vulnsuite-step-`) }
 
 func execStep(container, run string) contract.SequenceStep {
 	return contract.SequenceStep{Exec: &contract.SequenceExec{ExecProbe: contract.ExecProbe{Run: run}, Container: container}}
@@ -722,6 +742,9 @@ func TestRunSequenceUnreachable(t *testing.T) {
 				return nil
 			}
 			fe.ExecFn = func(_, cmd string) (int, string, error) {
+				if orig, _, ok := untrackStepPID(cmd); ok {
+					cmd = orig
+				}
 				if cmd == "/trigger fire" {
 					_ = fe.WriteFile(target, seqLogDir+"/asan.7", 0o644, asanResolverUAF)
 				}

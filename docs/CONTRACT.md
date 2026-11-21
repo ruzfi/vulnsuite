@@ -68,7 +68,7 @@ directories once.
 | `fidelity` | | `real` = runs the genuine affected software (the default and strongly preferred); `simulated` = a hand-written stand-in that reproduces the behaviour. Only use `simulated` when no public image or buildable upstream source reproduces the flaw (bare-OS/device/protocol sims). |
 | `detected_by` | | the scanner templates/scripts that detect this target, as `<scanner>:<id>`. Known scanners: `nuclei:` (template id, e.g. `nuclei:CVE-2021-41773`, `nuclei:laravel-env`) and `nmap:` (NSE script, e.g. `nmap:http-aspnet-debug`). Declaring one means "this should fire on vulnerable and stay silent on patched". A bare id (no `scanner:`) defaults to nuclei. |
 | `verification` | | `verified` (the default): someone ran every state on a host that can run it and verify passed. `unverified`: the contract is statically sound but nobody has run it yet, e.g. it needs hardware no maintainer has. `validate` warns (`unverified-target`; an error under `-strict`) and still runs every other rule; `list -unverified` selects such targets, and works as a suite filter line. |
-| `verified_on` | | evidence of the last run in which every listed state verified ok: `date` (`YYYY-MM-DD`), `vulnsuite` (version), `host` (the daemon's `os/arch`), optional `platform` (when the image ran under emulation) and `cpu_flags` (the `requires.cpu_flags` the host was checked to have), and `states`. Written by [`vulnsuite stamp`](USAGE.md#recording-that-a-target-was-verified-stamp), not by hand: a hand-edited stamp shows up in review as one with no run output behind it. |
+| `verified_on` | | evidence of the last run in which every listed state verified ok: `date` (`YYYY-MM-DD`), `vulnsuite` (version), `host` (the daemon's `os/arch`), optional `platform` (when the image ran under emulation) and `cpu_flags` (the `requires.cpu_flags` the host was checked to have), and `states`. One run per host and image platform: a single run is a mapping, runs on several hosts a list of them (vulnsuite v0.5.0 reads only the mapping). Written by [`vulnsuite stamp`](USAGE.md#recording-that-a-target-was-verified-stamp), not by hand: a hand-edited stamp shows up in review as one with no run output behind it. |
 | `detection` | | `scanner`: the `detected_by` entries are **verified** (you ran the scanner against both states); `custom-only`: no public scanner template exists, the target tests your own detection. Unset with `detected_by` present = declared, not yet verified. Unset with nothing declared = a detection gap (`validate` warns; write a template and contribute it upstream). |
 
 ## `base`
@@ -388,7 +388,7 @@ attempt `timeout`:
 | `freeze` / `resume` | `docker pause` / `unpause` of the target container, never a sidecar |
 | `sleep` | waits, cut short by the attempt timeout |
 | `http`, `tcp`, `net` | against the same address the other probes use. When this machine cannot reach the target (internal mode on Docker Desktop, macvlan, a remote daemon's loopback) the step cannot run and the attempt is not reached, with the same explanation as skipped network probes |
-| `expect_sanitizer` | reads the files in `log_dir` that are new or changed since the attempt started (only the appended part of a file that grew; at most 1 MiB per file, so a file that was already past 1 MiB yields nothing new; at most 4096 files and 64 MiB in all, past which the attempt is not reached) and parses every `ERROR: <Name>Sanitizer: <description>` report in them. `kind` matches the report's `SUMMARY` class or a word of its description (`attempting double-free` is a `double-free`); `frame` must match a frame of the report's first stack (the faulting access, up to the first blank line), written as `func file:line`. A report is written after resume, so the step waits up to 5 s for a matching one; `none` watches the whole 5 s and fails on the first report |
+| `expect_sanitizer` | reads the files in `log_dir` that are new or changed since the attempt started (only the appended part of a file that grew; at most 1 MiB per file, so a file that was already past 1 MiB yields nothing new; at most 4096 files and 64 MiB in all, past which the attempt is not reached) and parses every `ERROR: <Name>Sanitizer: <description>` report in them (AddressSanitizer, LeakSanitizer, and others in that format), and every `WARNING: ThreadSanitizer:` or `WARNING: MemorySanitizer:` report. `kind` matches the report's `SUMMARY` class or a word of its description (`attempting double-free` is a `double-free`). A ThreadSanitizer class is its words joined by `-` (`data race` is `data-race`, `lock-order-inversion`), and a LeakSanitizer report's class is `leak`; `frame` must match a frame of the report's first stack (the faulting access, up to the first blank line), written as `func file:line`. A report is written after resume, so the step waits up to 5 s for a matching one; `none` watches the whole 5 s and fails on the first report |
 | `expect_log` | the regexp (dot matches newline) against what the target logged since the attempt started, waiting up to 5 s for it |
 
 Every attempt ends as exactly one of:
@@ -401,7 +401,9 @@ Every attempt ends as exactly one of:
   failure ends the attempt; later steps do not run;
 - **fail**: an `expect_sanitizer` did not hold. A report during an attempt
   with `expect_sanitizer: none` is a fail even when the attempt was otherwise
-  not reached.
+  not reached: when a step stops the attempt early (the target aborted with
+  its report, so a later `exec` or `expect_log` failed), `log_dir` is read
+  once more and a new report fails the attempt.
 
 A sequence with a positive `expect_sanitizer` passes once `min_hits` attempts
 hit, and fails as soon as that can no longer happen. One without passes on its
@@ -430,8 +432,12 @@ The core guarantees:
   earlier attempt left paused is unpaused before the next one.
 - **Restart between attempts**: when the target exited during an attempt (an
   ASan build with `halt_on_error=1` aborts after its report), it is started
-  again and its healthcheck waited for before the next attempt; the attempt
-  shows `(target restarted)`. A target that cannot be started again makes the
+  again, its healthcheck waited for (as long as `-ready-timeout` when set,
+  as for the first start) and its `seed` steps run again before the next
+  attempt; the attempt shows `(target restarted)`. A seed step that fails
+  after a restart is noted in the attempt's detail (`seed step "..." failed
+  after the restart`) but does not stop the sequence: a seed that is not
+  idempotent may fail on state the target kept on disk. A target that cannot be started again makes the
   remaining attempts not reached. The same check runs once more after the
   last attempt, so later verify probes and your scanner find the target up
   (the detail ends with `the target was restarted afterwards`); a target
@@ -512,7 +518,7 @@ rather than failed; use `-expose host` or scan from a container.
 | `fidelity-unset` | warning | metadata.fidelity is not set (real or simulated) |
 | `unverified-target` | warning | `verification: unverified`: nobody has run the target's states yet (`vulnsuite stamp` records a run) |
 | `verified-no-evidence` | warning | `verification: verified` is set, `requires` needs specific hardware (`cpu_flags` or `probe`), and `verified_on` records no run |
-| `verified-on-stale` | warning | `verified_on` names a state the template no longer declares, or misses a `requires.cpu_flags` entry added since the run |
+| `verified-on-stale` | warning | a `verified_on` run names a state the template no longer declares, does not cover a state declared since, or misses a `requires.cpu_flags` entry added since the run (checked per run; the finding names the host when there are several) |
 | `simulated-on-image-base` | warning | fidelity: simulated but the base is a prebuilt image |
 | `kvm-without-requires` | warning | service.devices has /dev/kvm but requires.kvm is not set |
 | `cpu-flags-with-emulation` | warning | requires.emulation is true but requires.cpu_flags is set, which rules emulation out |

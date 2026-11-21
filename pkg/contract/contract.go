@@ -21,12 +21,14 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -736,9 +738,111 @@ type Metadata struct {
 	// contract that is statically sound but that nobody has run yet (it
 	// needs hardware no maintainer has, say). validate warns on unverified.
 	Verification string `yaml:"verification,omitempty" json:"verification,omitempty"`
-	// VerifiedOn is the evidence of the last run that verified every state.
-	// `vulnsuite stamp` writes it; it is not meant to be edited by hand.
-	VerifiedOn *VerifiedOn `yaml:"verified_on,omitempty" json:"verified_on,omitempty"`
+	// VerifiedOn is the evidence of the last run that verified every state,
+	// one per host and platform it was run on. `vulnsuite stamp` writes it;
+	// it is not meant to be edited by hand.
+	VerifiedOn VerifiedRuns `yaml:"verified_on,omitempty" json:"verified_on,omitempty"`
+}
+
+// VerifiedRuns is metadata.verified_on: the last fully verifying run on each
+// host and platform. A contract writes a single run as a mapping (the form
+// vulnsuite v0.5.0 reads) and several as a list of them; both decode here,
+// and both encode back in the same form.
+type VerifiedRuns []VerifiedOn
+
+// UnmarshalYAML accepts one run as a mapping or several as a list.
+func (r *VerifiedRuns) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var shape any
+	if err := unmarshal(&shape); err != nil {
+		return err
+	}
+	switch shape.(type) {
+	case nil:
+		*r = nil
+	case []any:
+		list := []VerifiedOn{}
+		if err := unmarshal(&list); err != nil {
+			return err
+		}
+		*r = list
+	case map[string]any:
+		var one VerifiedOn
+		if err := unmarshal(&one); err != nil {
+			return err
+		}
+		*r = VerifiedRuns{one}
+	default:
+		return errors.New("verified_on must be a mapping (one run) or a list of them (one per host)")
+	}
+	return nil
+}
+
+// MarshalYAML writes one run as a mapping and several as a list.
+func (r VerifiedRuns) MarshalYAML() (interface{}, error) {
+	if len(r) == 1 {
+		return r[0], nil
+	}
+	return []VerifiedOn(r), nil
+}
+
+// MarshalJSON mirrors the contract: one run is an object, several an array.
+func (r VerifiedRuns) MarshalJSON() ([]byte, error) {
+	switch len(r) {
+	case 0:
+		return []byte("null"), nil
+	case 1:
+		return json.Marshal(r[0])
+	}
+	return json.Marshal([]VerifiedOn(r))
+}
+
+// List returns the runs as a plain slice, never nil: an empty one when none
+// is recorded.
+func (r VerifiedRuns) List() []VerifiedOn {
+	if r == nil {
+		return []VerifiedOn{}
+	}
+	return []VerifiedOn(r)
+}
+
+// Latest returns the most recent run (the later entry on the same day), or
+// nil when none is recorded.
+func (r VerifiedRuns) Latest() *VerifiedOn {
+	var latest *VerifiedOn
+	for i := range r {
+		if latest == nil || r[i].Date >= latest.Date {
+			latest = &r[i]
+		}
+	}
+	return latest
+}
+
+// With returns the runs with vo recorded: it replaces the run on the same
+// host and platform in place, or else is appended. r is not modified.
+func (r VerifiedRuns) With(vo VerifiedOn) VerifiedRuns {
+	out := slices.Clone(r)
+	for i := range out {
+		if out[i].SameHost(vo) {
+			out[i] = vo
+			return out
+		}
+	}
+	return append(out, vo)
+}
+
+// SameHost reports whether v and o ran on the same host and image platform,
+// so that the later one supersedes the earlier.
+func (v VerifiedOn) SameHost(o VerifiedOn) bool {
+	return v.Host == o.Host && v.Platform == o.Platform
+}
+
+// RanOn describes where the run happened: the host, and the image platform
+// when it ran under emulation.
+func (v VerifiedOn) RanOn() string {
+	if v.Platform != "" {
+		return v.Host + " running " + v.Platform
+	}
+	return v.Host
 }
 
 // VerifiedOn records when, with which vulnsuite and on what host every state
@@ -831,6 +935,9 @@ type Contract struct {
 	// absolute, both set by the loader.
 	Folder     string `yaml:"-" json:"folder"`
 	SourcePath string `yaml:"-" json:"source_path"`
+	// SourceData is the contract file as the loader read it, so that
+	// StampSource can tell whether the file changed since.
+	SourceData []byte `yaml:"-" json:"-"`
 }
 
 // ID is a shortcut for Metadata.ID.

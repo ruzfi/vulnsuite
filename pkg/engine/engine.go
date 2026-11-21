@@ -216,6 +216,28 @@ type Pauser interface {
 	ContainerUnpause(ctx context.Context, idOrName string) error
 }
 
+// ImagePlatformer is implemented by engines that can report the platform a
+// local image was built or pulled for. It is optional, like Pauser.
+type ImagePlatformer interface {
+	// ImagePlatform returns ref's platform as the daemon reports it,
+	// "os/arch" or "os/arch/variant" ("" when the daemon reports no
+	// architecture). A missing image is an error.
+	ImagePlatform(ctx context.Context, ref string) (string, error)
+}
+
+// JoinPlatform renders os, arch and variant as "os/arch[/variant]", or ""
+// when arch is empty.
+func JoinPlatform(os, arch, variant string) string {
+	if arch == "" {
+		return ""
+	}
+	p := os + "/" + arch
+	if variant != "" {
+		p += "/" + variant
+	}
+	return p
+}
+
 // FileReader is implemented by engines that can read files out of a container
 // through the daemon's archive API (HEAD and GET /containers/{id}/archive). The
 // reads work on running, paused and exited containers and need nothing in the
@@ -305,7 +327,7 @@ func DirFilesFromTar(r io.Reader, root string, maxBytes int64) (map[string]FileC
 		}
 		var fc FileContent
 		switch h.Typeflag {
-		case tar.TypeReg, tar.TypeRegA:
+		case tar.TypeReg: // the reader turns the legacy TypeRegA into TypeReg
 			if h.Size < 0 {
 				continue
 			}

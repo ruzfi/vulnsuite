@@ -91,16 +91,30 @@ func (v *Validator) verification(c *contract.Contract) []Finding {
 				"` on a host that meets its requires to verify it and record the evidence"})
 	}
 	hostSpecific := len(c.Requires.CPUFlags) > 0 || c.Requires.Probe != nil
-	if m.Verification == contract.VerificationVerified && hostSpecific && m.VerifiedOn == nil {
+	if m.Verification == contract.VerificationVerified && hostSpecific && len(m.VerifiedOn) == 0 {
 		out = append(out, Finding{Warning, c.ID(), "verified-no-evidence",
 			"verification: verified, but requires needs specific hardware and verified_on records no run; " +
 				"run `vulnsuite stamp` on such a host, or set verification: unverified"})
 	}
-	if vo := m.VerifiedOn; vo != nil {
+	// Each run is checked on its own: a run on one host going stale says
+	// nothing about the others.
+	for _, vo := range m.VerifiedOn {
+		run := "the verified_on run"
+		if len(m.VerifiedOn) > 1 {
+			run += " on " + vo.RanOn()
+		}
 		for _, st := range vo.States {
 			if !c.HasState(st) {
 				out = append(out, Finding{Warning, c.ID(), "verified-on-stale",
-					fmt.Sprintf("verified_on lists state %q, which the template no longer declares; re-run `vulnsuite stamp`", st)})
+					fmt.Sprintf("%s lists state %q, which the template no longer declares; re-run `vulnsuite stamp`", run, st)})
+			}
+		}
+		// stamp runs every declared state, so a state the run did not
+		// cover was added after it and has never been run.
+		for _, st := range c.DeclaredStates() {
+			if !slices.Contains(vo.States, st) {
+				out = append(out, Finding{Warning, c.ID(), "verified-on-stale",
+					fmt.Sprintf("%s does not cover state %q, declared since; re-run `vulnsuite stamp`", run, st)})
 			}
 		}
 		var unchecked []string
@@ -111,8 +125,8 @@ func (v *Validator) verification(c *contract.Contract) []Finding {
 		}
 		if len(unchecked) > 0 && !c.IsUnverified() {
 			out = append(out, Finding{Warning, c.ID(), "verified-on-stale",
-				fmt.Sprintf("requires.cpu_flags %s were not part of the verified_on run; re-run `vulnsuite stamp` on a host that has them",
-					strings.Join(unchecked, ", "))})
+				fmt.Sprintf("requires.cpu_flags %s were not part of %s; re-run `vulnsuite stamp` on a host that has them",
+					strings.Join(unchecked, ", "), run)})
 		}
 	}
 	return out

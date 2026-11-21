@@ -33,6 +33,21 @@ func (c *Client) ImageExists(ctx context.Context, ref, platform string) (bool, e
 	return engine.PlatformMatches(platform, img.Os, img.Architecture, img.Variant), nil
 }
 
+// ImagePlatform implements engine.ImagePlatformer.
+func (c *Client) ImagePlatform(ctx context.Context, ref string) (string, error) {
+	var img struct {
+		Os           string `json:"Os"`
+		Architecture string `json:"Architecture"`
+		Variant      string `json:"Variant"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, "/images/"+url.PathEscape(ref)+"/json", nil, nil, &img); err != nil {
+		return "", err
+	}
+	return engine.JoinPlatform(img.Os, img.Architecture, img.Variant), nil
+}
+
+var _ engine.ImagePlatformer = (*Client)(nil)
+
 // splitRef splits "repo:tag", "repo@sha256:..." or "repo" into (fromImage, tag)
 // as the /images/create endpoint wants them.
 func splitRef(ref string) (string, string) {

@@ -8,15 +8,19 @@ import (
 	"github.com/ruzfi/vulnsuite/pkg/probes"
 )
 
-// SanitizerReport is one report parsed from a sanitizer log (ASan's format;
-// other sanitizers that write the same `ERROR: <Name>Sanitizer: <kind>` header
-// parse the same way).
+// SanitizerReport is one report parsed from a sanitizer log: an
+// `ERROR: <Name>Sanitizer: <description>` header (AddressSanitizer,
+// LeakSanitizer, and others in the same format), or the
+// `WARNING: ThreadSanitizer: ...` / `WARNING: MemorySanitizer: ...` header
+// those two print.
 type SanitizerReport struct {
 	// Sanitizer is the runtime's name, e.g. "AddressSanitizer".
 	Sanitizer string
 	// Kind is the bug class: the SUMMARY line's (e.g. "heap-use-after-free",
-	// "double-free") when the report has one, else the first word of the
-	// ERROR line's description.
+	// "double-free", "data-race") when the report has one, else taken from
+	// the header's description: its first word, its leading words joined by
+	// "-" for ThreadSanitizer ("data race" is "data-race"), and "leak" for
+	// LeakSanitizer.
 	Kind string
 	// Description is the ERROR line after "<Sanitizer>: ".
 	Description string
@@ -39,15 +43,22 @@ type StackFrame struct {
 }
 
 var (
-	sanErrorRe   = regexp.MustCompile(`ERROR: ([A-Za-z]*Sanitizer): (.*)$`)
-	sanSummaryRe = regexp.MustCompile(`^SUMMARY: ([A-Za-z]*Sanitizer): (\S+)`)
-	sanFrameRe   = regexp.MustCompile(`^\s*#\d+\s+0x[0-9a-fA-F]+\s*(.*)$`)
+	// ThreadSanitizer and MemorySanitizer head their reports with WARNING;
+	// other sanitizers' WARNING lines are notices, not reports.
+	sanErrorRe   = regexp.MustCompile(`(?:ERROR: ([A-Za-z]*Sanitizer)|WARNING: (ThreadSanitizer|MemorySanitizer)): (.*)$`)
+	sanSummaryRe = regexp.MustCompile(`^SUMMARY: ([A-Za-z]*Sanitizer): (.*)$`)
+	sanWordRe    = regexp.MustCompile(`^[A-Za-z][A-Za-z_-]*$`)
+	// A frame: "#0 0x4a1 in f /src/x.c:12" (ASan, MSan), or without the
+	// address, "#0 f /src/x.c:12 (bin+0x4a1)" (ThreadSanitizer).
+	sanFrameRe   = regexp.MustCompile(`^\s*#\d+\s+(?:0x[0-9a-fA-F]+(?:\s+|$))?(.*)$`)
+	sanModuleRe  = regexp.MustCompile(`\s+\([^()\s]+\+0x[0-9a-fA-F]+\)$`)
 	sanBuildIDRe = regexp.MustCompile(`\s+\(BuildId: [0-9a-fA-F]+\)\s*$`)
 )
 
 // ParseSanitizerReports reads every report in a sanitizer log: each starts at
-// an `ERROR: <Sanitizer>: <description>` line (the `==pid==` prefix is
-// optional), and its first stack is the first run of `#N 0x...` frame lines
+// an `ERROR: <Sanitizer>: <description>` line, or a ThreadSanitizer or
+// MemorySanitizer `WARNING: <Sanitizer>: <description>` line (the `==pid==`
+// prefix is optional), and its first stack is the first run of `#N 0x...` frame lines
 // after it, up to the first line that is not a frame (the blank line before
 // the next section). A report cut short (still being written, or capped)
 // yields what is there.
@@ -68,12 +79,9 @@ func ParseSanitizerReports(text string) []SanitizerReport {
 		line = strings.TrimRight(line, "\r")
 		if m := sanErrorRe.FindStringSubmatch(line); m != nil {
 			flush()
-			desc := strings.TrimSpace(m[2])
-			kind := ""
-			if f := strings.Fields(desc); len(f) > 0 {
-				kind = f[0]
-			}
-			cur = &SanitizerReport{Sanitizer: m[1], Kind: kind, Description: desc}
+			san := m[1] + m[2]
+			desc := strings.TrimSpace(m[3])
+			cur = &SanitizerReport{Sanitizer: san, Kind: headerKind(san, desc), Description: desc}
 			inStack, stackDone = false, false
 			continue
 		}
@@ -81,7 +89,13 @@ func ParseSanitizerReports(text string) []SanitizerReport {
 			continue
 		}
 		if m := sanSummaryRe.FindStringSubmatch(strings.TrimSpace(line)); m != nil {
-			cur.summaryKind = m[2]
+			// "heap-use-after-free /src/x.c:12 in f", "data race ...";
+			// LeakSanitizer's "64 byte(s) leaked ..." names no class.
+			words := 1
+			if m[1] == "ThreadSanitizer" {
+				words = -1
+			}
+			cur.summaryKind = phraseKind(m[2], words)
 			continue
 		}
 		if stackDone {
@@ -100,11 +114,48 @@ func ParseSanitizerReports(text string) []SanitizerReport {
 	return out
 }
 
+// headerKind is a report's bug class from its header's description, for a
+// report without a SUMMARY line (cut short, or a sanitizer that writes none).
+func headerKind(sanitizer, desc string) string {
+	switch sanitizer {
+	case "LeakSanitizer":
+		return "leak" // "detected memory leaks"
+	case "ThreadSanitizer":
+		return phraseKind(desc, -1) // "data race (pid=7)"
+	}
+	return phraseKind(desc, 1)
+}
+
+// phraseKind joins the leading words of s with "-", at most max of them (all
+// when max < 0): a word is letters, digits after the first, "-" and "_". It
+// stops at the first other token (a path, a number, "(pid=7)") and at the
+// words "on", "at" and "in" ("SEGV on unknown address"). "" when s does not
+// start with a word.
+func phraseKind(s string, max int) string {
+	var words []string
+	for _, w := range strings.Fields(s) {
+		if max >= 0 && len(words) == max {
+			break
+		}
+		if !sanWordRe.MatchString(w) || w == "on" || w == "at" || w == "in" {
+			break
+		}
+		words = append(words, w)
+	}
+	return strings.Join(words, "-")
+}
+
 // parseFrame splits a frame's text after its address: "in func loc",
 // "in func(args) loc", or an unsymbolized "(module+0xoff)".
 func parseFrame(s string) StackFrame {
 	s = strings.TrimSpace(sanBuildIDRe.ReplaceAllString(s, ""))
 	s = strings.TrimPrefix(s, "in ")
+	// ThreadSanitizer adds the module and offset after the source location:
+	// "worker /src/race.c:12:5 (race+0x1234)". Keep them only when they are
+	// the whole location.
+	if loc := sanModuleRe.ReplaceAllString(s, ""); loc != s && strings.Contains(loc, " ") {
+		s = loc
+	}
 	f := StackFrame{Text: s}
 	if i := strings.LastIndexByte(s, ' '); i >= 0 {
 		f.Func, f.Location = strings.TrimSpace(s[:i]), s[i+1:]

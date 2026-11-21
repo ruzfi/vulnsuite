@@ -188,6 +188,9 @@ type Handle struct {
 	// Seeds is the outcome of each of the state's seed steps, in order. Seeds
 	// run only once the target is ready; otherwise each is recorded as skipped.
 	Seeds []SeedResult `json:"seeds,omitempty"`
+	// readyTimeout is Options.ReadyTimeout, for a sequence probe that
+	// restarts the target between attempts.
+	readyTimeout time.Duration
 }
 
 // SeedResult is the outcome of one seed step.
@@ -630,6 +633,7 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 		}
 	}
 
+	h.readyTimeout = opts.ReadyTimeout
 	r.awaitReady(ctx, c, h, opts.ReadyTimeout)
 	r.seed(ctx, st, h)
 	if opts.Verify {
@@ -661,6 +665,12 @@ func pickIP(ips map[string]string, prefer, exclude string) string {
 // outcome. A step that fails stops the rest: later steps usually build on it.
 // When the target is not ready nothing runs; every step is recorded as skipped.
 func (r *Runner) seed(ctx context.Context, st *contract.State, h *Handle) {
+	h.Seeds = append(h.Seeds, r.runSeeds(ctx, st, h)...)
+}
+
+// runSeeds runs the state's seed steps and returns each outcome (see seed).
+func (r *Runner) runSeeds(ctx context.Context, st *contract.State, h *Handle) []SeedResult {
+	var results []SeedResult
 	stopped := ""
 	if !h.Ready {
 		stopped = "target not ready"
@@ -669,7 +679,7 @@ func (r *Runner) seed(ctx context.Context, st *contract.State, h *Handle) {
 		res := SeedResult{Run: step.Run}
 		if stopped != "" {
 			res.Skipped, res.ExitCode, res.Error = true, -1, "skipped: "+stopped
-			h.Seeds = append(h.Seeds, res)
+			results = append(results, res)
 			continue
 		}
 		code, out, err := r.Engine.ContainerExec(ctx, h.Container, step.Run, 2*time.Minute)
@@ -686,8 +696,9 @@ func (r *Runner) seed(ctx context.Context, st *contract.State, h *Handle) {
 			res.Output = tail(out, 512)
 			stopped = "an earlier seed step failed"
 		}
-		h.Seeds = append(h.Seeds, res)
+		results = append(results, res)
 	}
+	return results
 }
 
 // seedDetail summarises failed or skipped seed steps for the verify detail.
@@ -1238,7 +1249,7 @@ func (r *Runner) runProbes(ctx context.Context, c *contract.Contract, st *contra
 	exec := func(ctx context.Context, container, command string, timeout time.Duration) (int, string, error) {
 		return r.Engine.ContainerExec(ctx, container, command, timeout)
 	}
-	seq := r.sequenceFunc(c, h, exec)
+	seq := r.sequenceFunc(c, st, h, exec)
 	tgt, why := r.networkTarget(c, h, exec)
 	if why != "" {
 		r.runExecProbesOnly(ctx, st, h, probes.Target{Container: h.Container, Exec: exec, Sequence: seq}, why)

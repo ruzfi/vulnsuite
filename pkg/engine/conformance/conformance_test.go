@@ -159,6 +159,23 @@ var cases = []conformanceCase{
 		mustExist(t, h, img, "linux/x86_64", true)
 		mustExist(t, h, img, "linux/arm64", false)
 	}},
+	{"image_platform", func(t *testing.T, h *harness) {
+		ip, ok := h.eng.(engine.ImagePlatformer)
+		if !ok {
+			t.Fatalf("%s does not implement engine.ImagePlatformer", h.name)
+		}
+		h.seedImage(img, "linux/arm64/v8")
+		h.seedImage(imgB, "")
+		if got, err := ip.ImagePlatform(bg(t), img); err != nil || got != "linux/arm64/v8" {
+			t.Errorf("ImagePlatform(%s) = %q, %v; want linux/arm64/v8", img, got, err)
+		}
+		if got, err := ip.ImagePlatform(bg(t), imgB); err != nil || got != "linux/amd64" {
+			t.Errorf("ImagePlatform(%s) = %q, %v; want the host's linux/amd64", imgB, got, err)
+		}
+		if got, err := ip.ImagePlatform(bg(t), "registry.example/vs/missing:1"); err == nil {
+			t.Errorf("ImagePlatform of a missing image = %q, nil; want an error", got)
+		}
+	}},
 	{"image_exists_normalises_reference", func(t *testing.T, h *harness) {
 		// The daemon resolves a reference before looking it up: a bare name
 		// is :latest, and a Docker Hub name may be spelt in full.

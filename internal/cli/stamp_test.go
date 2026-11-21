@@ -110,7 +110,7 @@ func TestStampWritesEvidenceWhenEveryStateVerifies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	vo := c.Metadata.VerifiedOn
+	vo := c.Metadata.VerifiedOn.Latest()
 	if c.IsUnverified() || vo == nil || vo.Host != "linux/amd64" || strings.Join(vo.States, ",") != "vulnerable,patched" ||
 		strings.Join(vo.CPUFlags, ",") != "avx512vbmi" || vo.Vulnsuite == "" || vo.Date == "" {
 		t.Fatalf("stamped metadata: %+v %+v\n%s", c.Metadata, vo, data)
@@ -201,6 +201,122 @@ func TestListAndInfoShowVerification(t *testing.T) {
 	}
 	code, out, _ = run(t, nil, "-T", root, "-json", "info", "plain-demo")
 	if code != ExitOK || !strings.Contains(out, `"verification": "verified"`) {
+		t.Fatalf("info -json: %d\n%s", code, out)
+	}
+}
+
+// Stamping on a second host keeps the first host's run; list, info and
+// list -json show both.
+func TestStampOnSecondHostKeepsFirst(t *testing.T) {
+	root, path := stampRoot(t)
+	if code, out, errOut := run(t, stampEngine(t), "-T", root, "stamp", "-expose", "host", "-t", "stamp-demo"); code != ExitOK ||
+		!strings.Contains(out, "stamped stamp-demo on linux/amd64") {
+		t.Fatalf("stamp on amd64: %d\n%s\n%s", code, out, errOut)
+	}
+	arm := stampEngine(t)
+	arm.HostInfo.Arch = "arm64"
+	if code, out, errOut := run(t, arm, "-T", root, "stamp", "-expose", "host", "-t", "stamp-demo"); code != ExitOK ||
+		!strings.Contains(out, "stamped stamp-demo on linux/arm64") ||
+		!strings.Contains(out, "note: verified_on now records runs on 2 hosts, written as a list; vulnsuite v0.5.0 and older cannot read that form") {
+		t.Fatalf("stamp on arm64: %d\n%s\n%s", code, out, errOut)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := contract.Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hosts []string
+	for _, r := range c.Metadata.VerifiedOn {
+		hosts = append(hosts, r.Host)
+	}
+	if strings.Join(hosts, ",") != "linux/amd64,linux/arm64" {
+		t.Fatalf("runs on %v:\n%s", hosts, data)
+	}
+	code, out, _ := run(t, nil, "-T", root, "info", "stamp-demo")
+	if code != ExitOK || !strings.Contains(out, "last runs") || !strings.Contains(out, "on linux/amd64 with avx512vbmi") ||
+		!strings.Contains(out, "on linux/arm64 with avx512vbmi") {
+		t.Fatalf("info: %d\n%s", code, out)
+	}
+	code, out, _ = run(t, nil, "-T", root, "-json", "list", "-verified")
+	var rows []struct {
+		ID           string                `json:"id"`
+		VerifiedOn   []contract.VerifiedOn `json:"verified_on"`
+		VerifiedRuns []contract.VerifiedOn `json:"verified_runs"`
+	}
+	if code != ExitOK || json.Unmarshal([]byte(out), &rows) != nil {
+		t.Fatalf("list -json: %d\n%s", code, out)
+	}
+	found := false
+	for _, r := range rows {
+		found = found || r.ID == "stamp-demo" && len(r.VerifiedOn) == 2 && len(r.VerifiedRuns) == 2
+	}
+	if !found {
+		t.Fatalf("list -json must carry both runs of stamp-demo as an array:\n%s", out)
+	}
+	if _, vout, _ := run(t, nil, "-T", root, "validate", "-t", "stamp-demo"); strings.Contains(vout, "verified-on") {
+		t.Fatalf("validate after two stamps:\n%s", vout)
+	}
+}
+
+// #137: an image for another platform than the daemon's, run without any
+// requires asking for emulation, is recorded with its platform, not as a
+// native run on the host.
+func TestStampRecordsEmulationWithoutRequires(t *testing.T) {
+	root, _ := stampRoot(t)
+	path := filepath.Join(root, "misc", "plain-demo", "contract.yaml")
+	fe := stampEngine(t)
+	fe.HostInfo.Arch = "arm64"
+	fe.Images["busybox:1"] = true
+	fe.ImagePlatforms["busybox:1"] = "linux/amd64"
+	code, out, errOut := run(t, fe, "-T", root, "stamp", "-expose", "host", "-no-pull", "-t", "plain-demo")
+	if code != ExitOK || !strings.Contains(out, "stamped plain-demo on linux/arm64 running linux/amd64:") {
+		t.Fatalf("stamp: %d\n%s\n%s", code, out, errOut)
+	}
+	data, _ := os.ReadFile(path)
+	c, err := contract.Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vo := c.Metadata.VerifiedOn.Latest(); vo == nil || vo.Host != "linux/arm64" || vo.Platform != "linux/amd64" {
+		t.Fatalf("verified_on %+v\n%s", vo, data)
+	}
+	// A native image records no platform.
+	fe = stampEngine(t)
+	fe.Images["busybox:1"] = true
+	fe.ImagePlatforms["busybox:1"] = "linux/amd64"
+	if code, out, errOut := run(t, fe, "-T", root, "stamp", "-expose", "host", "-no-pull", "-t", "plain-demo"); code != ExitOK ||
+		!strings.Contains(out, "stamped plain-demo on linux/amd64:") {
+		t.Fatalf("native stamp: %d\n%s\n%s", code, out, errOut)
+	}
+}
+
+// #137: the file changed during the run (an edited probe) is not stamped;
+// list -json and info -json carry verified_runs as an array even with no run.
+func TestStampRefusesContractChangedDuringRun(t *testing.T) {
+	root, path := stampRoot(t)
+	fe := stampEngine(t)
+	exec := fe.ExecFn
+	edited := false
+	fe.ExecFn = func(container, command string) (int, string, error) {
+		if !edited {
+			edited = true
+			data, _ := os.ReadFile(path)
+			_ = os.WriteFile(path, []byte(strings.Replace(string(data), "^patched$", "^patched!$", 1)), 0o644)
+		}
+		return exec(container, command)
+	}
+	code, out, errOut := run(t, fe, "-T", root, "stamp", "-expose", "host", "-t", "stamp-demo")
+	if code == ExitOK || !strings.Contains(errOut, "the contract changed since it was loaded") {
+		t.Fatalf("stamp: %d\n%s\n%s", code, out, errOut)
+	}
+	if data, _ := os.ReadFile(path); strings.Contains(string(data), "verified_on") {
+		t.Fatalf("stamped a changed contract:\n%s", data)
+	}
+	code, out, _ = run(t, nil, "-T", root, "-json", "info", "plain-demo")
+	if code != ExitOK || !strings.Contains(out, `"verified_runs": []`) {
 		t.Fatalf("info -json: %d\n%s", code, out)
 	}
 }

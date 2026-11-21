@@ -157,6 +157,27 @@ func (f *Fake) ImageExists(ctx context.Context, ref, platform string) (bool, err
 	return ok && f.platformOK(key, platform), nil
 }
 
+// ImagePlatform implements engine.ImagePlatformer: the platform recorded for
+// the image in ImagePlatforms, else the host's (HostInfo).
+func (f *Fake) ImagePlatform(ctx context.Context, ref string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key, ok := f.image(ref)
+	if !ok {
+		//lint:ignore ST1005 dockerd's message, verbatim
+		return "", fmt.Errorf("No such image: %s", ref)
+	}
+	if p := f.ImagePlatforms[key]; p != "" {
+		return p, nil
+	}
+	return engine.JoinPlatform(f.HostInfo.OS, f.HostInfo.Arch, ""), nil
+}
+
+var _ engine.ImagePlatformer = (*Fake)(nil)
+
 // normalizeRef is the name a daemon resolves an image reference to, so that
 // "busybox", "busybox:latest" and "docker.io/library/busybox:latest" are one
 // image. A reference that does not parse is returned unchanged.
@@ -283,6 +304,7 @@ func (f *Fake) ImageBuild(ctx context.Context, opts engine.BuildOptions, out io.
 		if name == "" {
 			name = "Dockerfile"
 		}
+		//lint:ignore ST1005 dockerd's message, verbatim
 		return fmt.Errorf("Cannot locate specified Dockerfile: %s", name)
 	}
 	if f.FailBuild != "" {
@@ -772,6 +794,7 @@ func (f *Fake) ContainerPause(ctx context.Context, id string) error {
 	c := f.byIDOrName(id)
 	switch {
 	case c == nil:
+		//lint:ignore ST1005 dockerd's message, verbatim
 		return fmt.Errorf("No such container: %s", id)
 	case !c.Running:
 		return fmt.Errorf("container %s is not running", c.ID)
@@ -794,6 +817,7 @@ func (f *Fake) ContainerUnpause(ctx context.Context, id string) error {
 	c := f.byIDOrName(id)
 	switch {
 	case c == nil:
+		//lint:ignore ST1005 dockerd's message, verbatim
 		return fmt.Errorf("No such container: %s", id)
 	case !c.Paused:
 		return fmt.Errorf("Container %s is not paused", c.ID)
@@ -851,6 +875,7 @@ func (f *Fake) archivePath(id, p string) (*Container, string, File, error) {
 	}
 	c := f.byIDOrName(id)
 	if c == nil {
+		//lint:ignore ST1005 dockerd's message, verbatim
 		return nil, "", File{}, fmt.Errorf("No such container: %s", id)
 	}
 	p = path.Clean(p)

@@ -47,7 +47,7 @@ type Engine struct {
 // named by DOCKER_CONTEXT or currentContext, then the local socket defaults
 // (including the Docker Desktop, OrbStack and Colima per-user sockets).
 func New(host string) (*Engine, error) {
-	opts := []client.Opt{client.FromEnv, client.WithAPIVersionNegotiation()}
+	opts := []client.Opt{client.FromEnv} // the client negotiates the API version by default
 	switch {
 	case host != "":
 		opts = append(opts, client.WithHost(host))
@@ -152,6 +152,17 @@ func (e *Engine) ImageExists(ctx context.Context, ref, platform string) (bool, e
 	}
 	return engine.PlatformMatches(platform, img.Os, img.Architecture, img.Variant), nil
 }
+
+// ImagePlatform implements engine.ImagePlatformer.
+func (e *Engine) ImagePlatform(ctx context.Context, ref string) (string, error) {
+	img, err := e.cli.ImageInspect(ctx, ref)
+	if err != nil {
+		return "", err
+	}
+	return engine.JoinPlatform(img.Os, img.Architecture, img.Variant), nil
+}
+
+var _ engine.ImagePlatformer = (*Engine)(nil)
 
 func (e *Engine) ImagePull(ctx context.Context, ref, platform string, out io.Writer) error {
 	po := client.ImagePullOptions{RegistryAuth: registryauth.ForContext(ctx, ref)}

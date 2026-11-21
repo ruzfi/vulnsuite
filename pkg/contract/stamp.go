@@ -1,14 +1,17 @@
 package contract
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var (
@@ -16,19 +19,23 @@ var (
 	plainScalarRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/+-]*$`)
 )
 
-// Stamp records vo as the contract's metadata.verified_on and marks it
-// verification: verified. It edits only those lines of data, so the rest of
-// a hand-written contract (comments, quoting, key order) is left as it was,
-// and it re-parses the result to prove that nothing else changed. It needs
-// metadata to be a block mapping (not a {flow} one).
+// Stamp records vo in the contract's metadata.verified_on and marks it
+// verification: verified. vo replaces the run recorded for the same host and
+// platform and keeps the runs on others: one run is written as a mapping
+// (the form vulnsuite v0.5.0 reads), several as a list. It edits only those
+// lines of data, so the rest of a hand-written contract (comments, quoting,
+// key order) is left as it was, and it re-parses the result to prove that
+// nothing else changed. It needs metadata to be a block mapping (not a
+// {flow} one).
 func Stamp(data []byte, vo VerifiedOn) ([]byte, error) {
 	before, err := Parse(data)
 	if err != nil {
 		return nil, err
 	}
-	if err := vo.check(); err != nil {
+	if err := vo.check("verified_on"); err != nil {
 		return nil, err
 	}
+	want := before.Metadata.VerifiedOn.With(vo)
 	nl := "\n"
 	if strings.Contains(string(data), "\r\n") {
 		nl = "\r\n"
@@ -76,22 +83,29 @@ func Stamp(data []byte, vo VerifiedOn) ([]byte, error) {
 		return strings.TrimSpace(k)
 	}
 
-	block := renderVerifiedOn(vo, pad, strings.Repeat(" ", 2*child))
+	// verification may come before or after verified_on: rewrite it first,
+	// in place. A comment on its line goes with it: it says why the target
+	// was unverified, which the stamp makes stale.
+	for i := start + 1; i < end; i++ {
+		if keyAt(i) == "verification" {
+			lines[i] = pad + "verification: " + VerificationVerified
+		}
+	}
+	block := renderVerifiedRuns(want, pad, strings.Repeat(" ", child))
 	var out []string
 	replaced := false
 	for i := start + 1; i < end; i++ {
 		switch keyAt(i) {
-		case "verification":
-			lines[i] = pad + "verification: " + VerificationVerified
 		case "verified_on":
 			// Its value runs until the next line that is content at the
-			// key's own indentation or less; trailing blank and shallower
-			// comment lines stay where they are.
+			// key's own indentation or less, except the items of a list
+			// written at the key's indentation; trailing blank and
+			// shallower comment lines stay where they are.
 			j := i + 1
-			for j < end && !(isContent(lines[j]) && indentOf(lines[j]) <= child) {
+			for j < end && !(isContent(lines[j]) && indentOf(lines[j]) <= child && !isItemAt(lines[j], child)) {
 				j++
 			}
-			for j > i+1 && !isDeeper(lines[j-1], child) {
+			for j > i+1 && !isDeeper(lines[j-1], child) && !isItemAt(lines[j-1], child) {
 				j--
 			}
 			out = append(append(append(out, lines[:i]...), block...), lines[j:]...)
@@ -118,7 +132,7 @@ func Stamp(data []byte, vo VerifiedOn) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("the stamped contract does not parse (%v); add verified_on by hand", err)
 	}
-	if after.Metadata.VerifiedOn == nil || !reflect.DeepEqual(*after.Metadata.VerifiedOn, vo) {
+	if !reflect.DeepEqual(after.Metadata.VerifiedOn, want) {
 		return nil, errors.New("could not place verified_on in metadata; add it by hand")
 	}
 	if after.IsUnverified() {
@@ -133,26 +147,59 @@ func Stamp(data []byte, vo VerifiedOn) ([]byte, error) {
 }
 
 // StampFile applies Stamp to the contract at path, replacing the file
-// atomically and keeping its mode.
+// atomically and keeping its mode. A symlinked contract is written through
+// the link.
 func StampFile(path string, vo VerifiedOn) error {
-	data, err := os.ReadFile(path)
+	return stampFile(path, vo, nil)
+}
+
+// StampSource stamps the file c was loaded from (c.SourcePath), after
+// checking that it still holds the contract that ran: apart from
+// metadata.verification and verified_on, which another stamp may have
+// written meanwhile, it must parse to the same contract as c.SourceData,
+// the bytes the loader read. A contract with no SourceData is stamped
+// unchecked, as StampFile does.
+func StampSource(c *Contract, vo VerifiedOn) error {
+	return stampFile(c.SourcePath, vo, c.SourceData)
+}
+
+func stampFile(path string, vo VerifiedOn, loaded []byte) error {
+	real, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return err
+	}
+	unlock, err := lockStamp(real)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	defer unlock()
+	data, err := os.ReadFile(real)
+	if err != nil {
+		return err
+	}
+	if loaded != nil && !bytes.Equal(data, loaded) {
+		if err := sameButEvidence(loaded, data); err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
 	}
 	out, err := Stamp(data, vo)
 	if err != nil {
 		return fmt.Errorf("%s: %w", path, err)
 	}
-	st, err := os.Stat(path)
+	st, err := os.Stat(real)
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".stamp-*")
+	tmp, err := os.CreateTemp(filepath.Dir(real), ".stamp-*")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(tmp.Name())
 	if _, err := tmp.Write(out); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -162,23 +209,91 @@ func StampFile(path string, vo VerifiedOn) error {
 	if err := os.Chmod(tmp.Name(), st.Mode().Perm()); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), path)
+	return os.Rename(tmp.Name(), real)
 }
 
-func renderVerifiedOn(vo VerifiedOn, pad, pad2 string) []string {
+// sameButEvidence reports, as an error, that now is not the contract loaded
+// was, comparing everything but metadata.verification and verified_on.
+func sameButEvidence(loaded, now []byte) error {
+	const changed = "the contract changed since it was loaded, so the run does not prove it; run stamp again"
+	a, err := Parse(loaded)
+	if err != nil {
+		return errors.New(changed)
+	}
+	b, err := Parse(now)
+	if err != nil {
+		return fmt.Errorf("%s (it no longer parses: %v)", changed, err)
+	}
+	a.Metadata.Verification, b.Metadata.Verification = "", ""
+	a.Metadata.VerifiedOn, b.Metadata.VerifiedOn = nil, nil
+	if !reflect.DeepEqual(a, b) {
+		return errors.New(changed)
+	}
+	return nil
+}
+
+// stampLockWait is how long a stamp waits for another one writing the same
+// file; a lock older than stampLockStale was left by a stamp that died.
+var (
+	stampLockWait  = 10 * time.Second
+	stampLockStale = time.Minute
+)
+
+// lockStamp takes the lock file next to path, so that two stamps of one
+// file (say, on two hosts sharing a checkout) cannot both read it and the
+// later write lose the earlier's run.
+func lockStamp(path string) (func(), error) {
+	lock := filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".stamp-lock")
+	deadline := time.Now().Add(stampLockWait)
+	for {
+		f, err := os.OpenFile(lock, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err == nil {
+			f.Close()
+			return func() { os.Remove(lock) }, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return nil, err
+		}
+		if st, serr := os.Stat(lock); serr == nil && time.Since(st.ModTime()) > stampLockStale {
+			os.Remove(lock)
+			continue
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("another stamp is writing this file (remove %s if none is)", lock)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// renderVerifiedRuns writes the verified_on key at pad, its content one step
+// deeper: a mapping for one run, a list of mappings for several.
+func renderVerifiedRuns(runs VerifiedRuns, pad, step string) []string {
+	out := []string{pad + "verified_on:"}
+	inner := pad + step
+	if len(runs) == 1 {
+		return append(out, renderRun(runs[0], inner, inner)...)
+	}
+	for _, vo := range runs {
+		out = append(out, renderRun(vo, inner+"- ", inner+"  ")...)
+	}
+	return out
+}
+
+// renderRun writes one run's fields, the first prefixed with first and the
+// rest with rest.
+func renderRun(vo VerifiedOn, first, rest string) []string {
 	out := []string{
-		pad + "verified_on:",
-		pad2 + "date: " + strconv.Quote(vo.Date),
-		pad2 + "vulnsuite: " + yamlScalar(vo.Vulnsuite),
-		pad2 + "host: " + yamlScalar(vo.Host),
+		first + "date: " + strconv.Quote(vo.Date),
+		rest + "vulnsuite: " + yamlScalar(vo.Vulnsuite),
+		rest + "host: " + yamlScalar(vo.Host),
 	}
 	if vo.Platform != "" {
-		out = append(out, pad2+"platform: "+yamlScalar(vo.Platform))
+		out = append(out, rest+"platform: "+yamlScalar(vo.Platform))
 	}
 	if len(vo.CPUFlags) > 0 {
-		out = append(out, pad2+"cpu_flags: "+flowList(vo.CPUFlags))
+		out = append(out, rest+"cpu_flags: "+flowList(vo.CPUFlags))
 	}
-	return append(out, pad2+"states: "+flowList(vo.States))
+	return append(out, rest+"states: "+flowList(vo.States))
 }
 
 // yamlScalar writes s plain when that cannot be misread, else double-quoted
@@ -205,6 +320,11 @@ func indentOf(l string) int { return len(l) - len(strings.TrimLeft(l, " ")) }
 func isContent(l string) bool {
 	t := strings.TrimSpace(l)
 	return t != "" && !strings.HasPrefix(t, "#")
+}
+
+// isItemAt reports whether l is a list item ("- ...") indented exactly col.
+func isItemAt(l string, col int) bool {
+	return indentOf(l) == col && (strings.HasPrefix(l[col:], "- ") || strings.TrimSpace(l[col:]) == "-")
 }
 
 // isDeeper reports whether l is a content or comment line indented past col.

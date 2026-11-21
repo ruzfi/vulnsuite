@@ -169,11 +169,65 @@ func TestParseSanitizerReportsSeveralAndPartial(t *testing.T) {
 	}
 	// Other sanitizers with the same header parse too.
 	ub := ParseSanitizerReports("==5==ERROR: LeakSanitizer: detected memory leaks\n\nDirect leak of 7 byte(s)\n    #0 0x1 in malloc\n")
-	if len(ub) != 1 || ub[0].Sanitizer != "LeakSanitizer" || ub[0].Kind != "detected" || !ub[0].MatchesKind("detected") {
+	if len(ub) != 1 || ub[0].Sanitizer != "LeakSanitizer" || ub[0].Kind != "leak" || !ub[0].MatchesKind("leak") || !ub[0].MatchesKind("detected") {
 		t.Fatalf("LeakSanitizer report %+v", ub)
 	}
 	if !strings.Contains(rs[0].Description, "on address 0x602000000010") {
 		t.Errorf("description %q", rs[0].Description)
+	}
+}
+
+// ThreadSanitizer and MemorySanitizer head their reports with WARNING, and
+// LeakSanitizer's SUMMARY ("64 byte(s) leaked") names no bug class (#136).
+func TestParseWarningSanitizersAndLeakSummary(t *testing.T) {
+	for _, tc := range []struct {
+		name, text, sanitizer, kind, frame string
+		match                              []string
+	}{
+		{"tsan data race",
+			"==================\nWARNING: ThreadSanitizer: data race (pid=7)\n  Write of size 4 at 0x7b04 by thread T2:\n    #0 worker /src/race.c:12:5 (race+0x1234)\n    #1 <null> <null> (libtsan.so.2+0x5d6)\n\n  Previous read of size 4 at 0x7b04 by thread T1:\n    #0 reader /src/race.c:20 (race+0x99)\n\nSUMMARY: ThreadSanitizer: data race /src/race.c:12:5 in worker\n",
+			"ThreadSanitizer", "data-race", "worker race.c:12:5", []string{"data-race", "race"}},
+		{"tsan heap-use-after-free",
+			"WARNING: ThreadSanitizer: heap-use-after-free (pid=7)\nSUMMARY: ThreadSanitizer: heap-use-after-free /src/x.c:3 in f\n",
+			"ThreadSanitizer", "heap-use-after-free", "", []string{"heap-use-after-free"}},
+		{"tsan cut short",
+			"WARNING: ThreadSanitizer: lock-order-inversion (potential deadlock) (pid=7)\n",
+			"ThreadSanitizer", "lock-order-inversion", "", []string{"lock-order-inversion"}},
+		{"msan",
+			"==9==WARNING: MemorySanitizer: use-of-uninitialized-value\n    #0 0x4a1 in main /src/m.c:8:7\n\nSUMMARY: MemorySanitizer: use-of-uninitialized-value /src/m.c:8:7 in main\n",
+			"MemorySanitizer", "use-of-uninitialized-value", "main m.c:8:7", []string{"use-of-uninitialized-value"}},
+		{"lsan summary without a class",
+			"==5==ERROR: LeakSanitizer: detected memory leaks\n\nDirect leak of 64 byte(s) in 1 object(s) allocated from:\n    #0 0x1 in malloc\n\nSUMMARY: AddressSanitizer: 64 byte(s) leaked in 1 allocation(s).\n",
+			"LeakSanitizer", "leak", "malloc", []string{"leak", "detected"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rs := ParseSanitizerReports(tc.text)
+			if len(rs) != 1 {
+				t.Fatalf("%d reports: %+v", len(rs), rs)
+			}
+			r := rs[0]
+			if r.Sanitizer != tc.sanitizer || r.Kind != tc.kind {
+				t.Fatalf("sanitizer %q kind %q, want %q %q", r.Sanitizer, r.Kind, tc.sanitizer, tc.kind)
+			}
+			for _, k := range tc.match {
+				if !r.MatchesKind(k) {
+					t.Errorf("MatchesKind(%q) = false", k)
+				}
+			}
+			if tc.frame != "" && (len(r.Frames) == 0 || r.Frames[0].String() != tc.frame) {
+				t.Errorf("frames %+v, want first %q", r.Frames, tc.frame)
+			}
+		})
+	}
+	// Other sanitizers' WARNING lines are notices, not reports.
+	for _, notice := range []string{
+		"==1==WARNING: AddressSanitizer failed to allocate 0x10000 bytes",
+		"==1==WARNING: ASan is ignoring requested __asan_handle_no_return",
+		"WARNING: AddressSanitizer: something odd",
+	} {
+		if rs := ParseSanitizerReports(notice + "\n"); len(rs) != 0 {
+			t.Errorf("%q parsed as a report: %+v", notice, rs)
+		}
 	}
 }
 
