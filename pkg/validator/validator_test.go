@@ -535,4 +535,18 @@ func TestVerificationRules(t *testing.T) {
 	if rules(v.Check(c))["verified-on-stale"] != Warning {
 		t.Error("verified-on-stale expected for an undeclared state")
 	}
+	// Runs on several hosts are checked one by one, and the finding names
+	// the host whose run is stale.
+	two := `verification: verified, verified_on: [` +
+		`{ date: "2026-11-21", vulnsuite: v0.5.0, host: linux/amd64, cpu_flags: [avx512vbmi], states: [vulnerable, patched] }, ` +
+		`{ date: "2026-10-02", vulnsuite: v0.5.0, host: linux/arm64, states: [vulnerable, patched] }],`
+	var stale []string
+	for _, f := range v.Check(withMeta(two, cpu)) {
+		if f.Rule == "verified-on-stale" {
+			stale = append(stale, f.Message)
+		}
+	}
+	if len(stale) != 1 || !strings.Contains(stale[0], "on linux/arm64") {
+		t.Errorf("want one stale finding for the arm64 run, got %q", stale)
+	}
 }

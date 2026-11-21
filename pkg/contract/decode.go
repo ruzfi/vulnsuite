@@ -202,9 +202,33 @@ func Parse(data []byte) (*Contract, error) {
 	return c, nil
 }
 
-// check enforces metadata.verified_on's schema rules.
-func (v *VerifiedOn) check() error {
+// check enforces metadata.verified_on's schema rules: every run is well
+// formed, and no two ran on the same host and platform (the later stamp
+// replaces the earlier).
+func (r VerifiedRuns) check() error {
 	const loc = "metadata/verified_on"
+	if r != nil && len(r) == 0 {
+		return se(loc, "must record at least one run (or be left out)")
+	}
+	for i, v := range r {
+		at := loc
+		if len(r) > 1 {
+			at = fmt.Sprintf("%s/%d", loc, i)
+		}
+		if err := v.check(at); err != nil {
+			return err
+		}
+		for _, prev := range r[:i] {
+			if prev.SameHost(v) {
+				return se(at+"/host", "a run on %s is recorded more than once; keep one run per host and platform", v.RanOn())
+			}
+		}
+	}
+	return nil
+}
+
+// check enforces the schema rules of one verified_on run at loc.
+func (v *VerifiedOn) check(loc string) error {
 	if _, err := time.Parse(time.DateOnly, v.Date); err != nil || len(v.Date) != len(time.DateOnly) {
 		return se(loc+"/date", "%q must be an ISO date (YYYY-MM-DD)", v.Date)
 	}
@@ -293,10 +317,8 @@ func (c *Contract) checkStructure(present map[string]any, sidecarKeys []map[stri
 	if m.Verification != "" && !verifications[m.Verification] {
 		return se("metadata/verification", "%q is not one of verified, unverified", m.Verification)
 	}
-	if m.VerifiedOn != nil {
-		if err := m.VerifiedOn.check(); err != nil {
-			return err
-		}
+	if err := m.VerifiedOn.check(); err != nil {
+		return err
 	}
 	seenClass := map[string]bool{}
 	for i, cl := range m.Class {

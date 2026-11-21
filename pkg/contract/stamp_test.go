@@ -1,6 +1,7 @@
 package contract
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -52,8 +53,7 @@ func TestStampReplacesExistingEvidence(t *testing.T) {
 	doc := strings.Replace(stampDoc, "  tags: [java, \"quoted\"]\n", "  verified_on:\n    date: \"2025-01-01\"\n"+
 		"    vulnsuite: v0.1.0\n    # old run\n    host: linux/arm64\n    states: [vulnerable]\n\n  tags: [java]\n", 1)
 	vo := stampVO
-	vo.Platform = "linux/amd64"
-	vo.Host = "linux/arm64"
+	vo.Host = "linux/arm64" // the host of the old run, so it is replaced
 	vo.Vulnsuite = "0.5.0-dev+dirty"
 	out, err := Stamp([]byte(doc), vo)
 	if err != nil {
@@ -61,7 +61,7 @@ func TestStampReplacesExistingEvidence(t *testing.T) {
 	}
 	s := string(out)
 	for _, want := range []string{"  verified_on:\n    date: \"2026-11-21\"\n    vulnsuite: \"0.5.0-dev+dirty\"\n" +
-		"    host: linux/arm64\n    platform: linux/amd64\n    cpu_flags: [avx512vbmi]\n    states: [vulnerable]\n\n  tags: [java]\n"} {
+		"    host: linux/arm64\n    cpu_flags: [avx512vbmi]\n    states: [vulnerable]\n\n  tags: [java]\n"} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("missing %q in:\n%s", want, s)
 		}
@@ -73,7 +73,7 @@ func TestStampReplacesExistingEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Metadata.VerifiedOn.Vulnsuite != vo.Vulnsuite || c.IsUnverified() {
+	if c.Metadata.VerifiedOn[0].Vulnsuite != vo.Vulnsuite || c.IsUnverified() {
 		t.Fatalf("parsed back %+v", c.Metadata)
 	}
 }
@@ -108,5 +108,94 @@ func TestStampRejectsBadEvidence(t *testing.T) {
 	vo.States = nil
 	if _, err := Stamp([]byte(stampDoc), vo); err == nil {
 		t.Fatal("want an error for empty states")
+	}
+}
+
+// A run on another host is added next to the recorded one, as a list; a later
+// run on either host replaces only that host's entry.
+func TestStampKeepsRunsOnOtherHosts(t *testing.T) {
+	arm := stampVO
+	arm.Host, arm.Date, arm.CPUFlags = "linux/arm64", "2026-10-02", nil
+	once, err := Stamp([]byte(stampDoc), arm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(once), "  verified_on:\n    date: \"2026-10-02\"\n") {
+		t.Fatalf("a single run must stay a mapping (the form v0.5.0 reads):\n%s", once)
+	}
+	twice, err := Stamp(once, stampVO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "  verified_on:\n" +
+		"    - date: \"2026-10-02\"\n      vulnsuite: v0.4.0\n      host: linux/arm64\n      states: [vulnerable]\n" +
+		"    - date: \"2026-11-21\"\n      vulnsuite: v0.4.0\n      host: linux/amd64\n      cpu_flags: [avx512vbmi]\n      states: [vulnerable]\n"
+	if !strings.Contains(string(twice), want) {
+		t.Fatalf("want both runs:\n%s", twice)
+	}
+	// Emulated amd64 on an arm64 host is a different run from native arm64.
+	emu := arm
+	emu.Platform, emu.Date = "linux/amd64", "2026-11-22"
+	thrice, err := Stamp(twice, emu)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A fresh arm64 run replaces the old one in place and keeps the others.
+	arm.Date, arm.Vulnsuite = "2026-12-01", "v0.6.0"
+	out, err := Stamp(thrice, arm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := Parse(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, r := range c.Metadata.VerifiedOn {
+		got = append(got, r.Date+" "+r.RanOn())
+	}
+	if strings.Join(got, ", ") != "2026-12-01 linux/arm64, 2026-11-21 linux/amd64, 2026-11-22 linux/arm64 running linux/amd64" {
+		t.Fatalf("runs: %v\n%s", got, out)
+	}
+	if l := c.Metadata.VerifiedOn.Latest(); l == nil || l.Date != "2026-12-01" {
+		t.Fatalf("Latest = %+v", l)
+	}
+	if strings.Contains(string(out), "2026-10-02") {
+		t.Fatalf("the replaced run is still there:\n%s", out)
+	}
+}
+
+// A list written at the key's own indentation (also valid YAML) is replaced
+// whole, not left dangling after the new block.
+func TestStampReplacesListAtKeyIndent(t *testing.T) {
+	doc := strings.Replace(stampDoc, "  tags: [java, \"quoted\"]\n", "  verified_on:\n"+
+		"  - date: \"2025-01-01\"\n    vulnsuite: v0.1.0\n    host: linux/arm64\n    states: [vulnerable]\n"+
+		"  - date: \"2025-02-01\"\n    vulnsuite: v0.1.0\n    host: linux/amd64\n    states: [vulnerable]\n"+
+		"  tags: [java]\n", 1)
+	if _, err := Parse([]byte(doc)); err != nil {
+		t.Fatal(err)
+	}
+	out, err := Stamp([]byte(doc), stampVO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := Parse(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := c.Metadata.VerifiedOn; len(r) != 2 || r[0].Date != "2025-01-01" || r[1].Date != "2026-11-21" ||
+		!strings.Contains(string(out), "  tags: [java]\n") {
+		t.Fatalf("runs %+v:\n%s", r, out)
+	}
+}
+
+func TestVerifiedRunsJSONMirrorsContract(t *testing.T) {
+	one, _ := json.Marshal(VerifiedRuns{stampVO})
+	if !strings.HasPrefix(string(one), `{"date":`) {
+		t.Fatalf("one run must be an object: %s", one)
+	}
+	two, _ := json.Marshal(VerifiedRuns{stampVO, stampVO})
+	if !strings.HasPrefix(string(two), `[{"date":`) {
+		t.Fatalf("several runs must be an array: %s", two)
 	}
 }

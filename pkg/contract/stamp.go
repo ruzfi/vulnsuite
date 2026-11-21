@@ -16,19 +16,23 @@ var (
 	plainScalarRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/+-]*$`)
 )
 
-// Stamp records vo as the contract's metadata.verified_on and marks it
-// verification: verified. It edits only those lines of data, so the rest of
-// a hand-written contract (comments, quoting, key order) is left as it was,
-// and it re-parses the result to prove that nothing else changed. It needs
-// metadata to be a block mapping (not a {flow} one).
+// Stamp records vo in the contract's metadata.verified_on and marks it
+// verification: verified. vo replaces the run recorded for the same host and
+// platform and keeps the runs on others: one run is written as a mapping
+// (the form vulnsuite v0.5.0 reads), several as a list. It edits only those
+// lines of data, so the rest of a hand-written contract (comments, quoting,
+// key order) is left as it was, and it re-parses the result to prove that
+// nothing else changed. It needs metadata to be a block mapping (not a
+// {flow} one).
 func Stamp(data []byte, vo VerifiedOn) ([]byte, error) {
 	before, err := Parse(data)
 	if err != nil {
 		return nil, err
 	}
-	if err := vo.check(); err != nil {
+	if err := vo.check("verified_on"); err != nil {
 		return nil, err
 	}
+	want := before.Metadata.VerifiedOn.With(vo)
 	nl := "\n"
 	if strings.Contains(string(data), "\r\n") {
 		nl = "\r\n"
@@ -76,7 +80,7 @@ func Stamp(data []byte, vo VerifiedOn) ([]byte, error) {
 		return strings.TrimSpace(k)
 	}
 
-	block := renderVerifiedOn(vo, pad, strings.Repeat(" ", 2*child))
+	block := renderVerifiedRuns(want, pad, strings.Repeat(" ", child))
 	var out []string
 	replaced := false
 	for i := start + 1; i < end; i++ {
@@ -85,13 +89,14 @@ func Stamp(data []byte, vo VerifiedOn) ([]byte, error) {
 			lines[i] = pad + "verification: " + VerificationVerified
 		case "verified_on":
 			// Its value runs until the next line that is content at the
-			// key's own indentation or less; trailing blank and shallower
-			// comment lines stay where they are.
+			// key's own indentation or less, except the items of a list
+			// written at the key's indentation; trailing blank and
+			// shallower comment lines stay where they are.
 			j := i + 1
-			for j < end && !(isContent(lines[j]) && indentOf(lines[j]) <= child) {
+			for j < end && !(isContent(lines[j]) && indentOf(lines[j]) <= child && !isItemAt(lines[j], child)) {
 				j++
 			}
-			for j > i+1 && !isDeeper(lines[j-1], child) {
+			for j > i+1 && !isDeeper(lines[j-1], child) && !isItemAt(lines[j-1], child) {
 				j--
 			}
 			out = append(append(append(out, lines[:i]...), block...), lines[j:]...)
@@ -118,7 +123,7 @@ func Stamp(data []byte, vo VerifiedOn) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("the stamped contract does not parse (%v); add verified_on by hand", err)
 	}
-	if after.Metadata.VerifiedOn == nil || !reflect.DeepEqual(*after.Metadata.VerifiedOn, vo) {
+	if !reflect.DeepEqual(after.Metadata.VerifiedOn, want) {
 		return nil, errors.New("could not place verified_on in metadata; add it by hand")
 	}
 	if after.IsUnverified() {
@@ -165,20 +170,35 @@ func StampFile(path string, vo VerifiedOn) error {
 	return os.Rename(tmp.Name(), path)
 }
 
-func renderVerifiedOn(vo VerifiedOn, pad, pad2 string) []string {
+// renderVerifiedRuns writes the verified_on key at pad, its content one step
+// deeper: a mapping for one run, a list of mappings for several.
+func renderVerifiedRuns(runs VerifiedRuns, pad, step string) []string {
+	out := []string{pad + "verified_on:"}
+	inner := pad + step
+	if len(runs) == 1 {
+		return append(out, renderRun(runs[0], inner, inner)...)
+	}
+	for _, vo := range runs {
+		out = append(out, renderRun(vo, inner+"- ", inner+"  ")...)
+	}
+	return out
+}
+
+// renderRun writes one run's fields, the first prefixed with first and the
+// rest with rest.
+func renderRun(vo VerifiedOn, first, rest string) []string {
 	out := []string{
-		pad + "verified_on:",
-		pad2 + "date: " + strconv.Quote(vo.Date),
-		pad2 + "vulnsuite: " + yamlScalar(vo.Vulnsuite),
-		pad2 + "host: " + yamlScalar(vo.Host),
+		first + "date: " + strconv.Quote(vo.Date),
+		rest + "vulnsuite: " + yamlScalar(vo.Vulnsuite),
+		rest + "host: " + yamlScalar(vo.Host),
 	}
 	if vo.Platform != "" {
-		out = append(out, pad2+"platform: "+yamlScalar(vo.Platform))
+		out = append(out, rest+"platform: "+yamlScalar(vo.Platform))
 	}
 	if len(vo.CPUFlags) > 0 {
-		out = append(out, pad2+"cpu_flags: "+flowList(vo.CPUFlags))
+		out = append(out, rest+"cpu_flags: "+flowList(vo.CPUFlags))
 	}
-	return append(out, pad2+"states: "+flowList(vo.States))
+	return append(out, rest+"states: "+flowList(vo.States))
 }
 
 // yamlScalar writes s plain when that cannot be misread, else double-quoted
@@ -205,6 +225,11 @@ func indentOf(l string) int { return len(l) - len(strings.TrimLeft(l, " ")) }
 func isContent(l string) bool {
 	t := strings.TrimSpace(l)
 	return t != "" && !strings.HasPrefix(t, "#")
+}
+
+// isItemAt reports whether l is a list item ("- ...") indented exactly col.
+func isItemAt(l string, col int) bool {
+	return indentOf(l) == col && (strings.HasPrefix(l[col:], "- ") || strings.TrimSpace(l[col:]) == "-")
 }
 
 // isDeeper reports whether l is a content or comment line indented past col.
