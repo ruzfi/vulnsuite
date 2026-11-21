@@ -167,6 +167,7 @@ func (f *Fake) ImagePlatform(ctx context.Context, ref string) (string, error) {
 	defer f.mu.Unlock()
 	key, ok := f.image(ref)
 	if !ok {
+		//lint:ignore ST1005 dockerd's message, verbatim
 		return "", fmt.Errorf("No such image: %s", ref)
 	}
 	if p := f.ImagePlatforms[key]; p != "" {
