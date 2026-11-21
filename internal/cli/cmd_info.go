@@ -20,8 +20,11 @@ import (
 type infoOut struct {
 	*contract.Contract
 	// Verification is metadata.verification with its default applied.
-	Verification string          `json:"verification"`
-	Scanners     scanners.Report `json:"scanners"`
+	Verification string `json:"verification"`
+	// VerifiedRuns is metadata.verified_on always as an array (empty when
+	// none): the contract writes one run as an object.
+	VerifiedRuns []contract.VerifiedOn `json:"verified_runs"`
+	Scanners     scanners.Report       `json:"scanners"`
 }
 
 func cmdInfo() *Command {
@@ -67,7 +70,7 @@ writing a template and contributing it upstream.`,
 			}
 			rep := scanners.Match(c, idx)
 			if g.JSON {
-				return g.emitJSON(infoOut{c, c.Verification(), rep})
+				return g.emitJSON(infoOut{c, c.Verification(), c.Metadata.VerifiedOn.List(), rep})
 			}
 			m := c.Metadata
 			fmt.Fprintf(g.Stdout, "%s\n  %s\n\n", c.ID(), m.Summary)

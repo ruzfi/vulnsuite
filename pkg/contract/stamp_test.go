@@ -2,8 +2,11 @@ package contract
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const stampDoc = `# a hand-written contract: comments and quoting must survive
@@ -197,5 +200,106 @@ func TestVerifiedRunsJSONMirrorsContract(t *testing.T) {
 	two, _ := json.Marshal(VerifiedRuns{stampVO, stampVO})
 	if !strings.HasPrefix(string(two), `[{"date":`) {
 		t.Fatalf("several runs must be an array: %s", two)
+	}
+}
+
+// #137: verification written after verified_on is rewritten too.
+func TestStampVerificationAfterVerifiedOn(t *testing.T) {
+	doc := strings.Replace(stampDoc, "  verification: unverified  # needs AVX-512 VBMI\n  tags: [java, \"quoted\"]\n",
+		"  tags: [java, \"quoted\"]\n  verified_on:\n    date: \"2025-01-01\"\n    vulnsuite: v0.1.0\n    host: linux/arm64\n"+
+			"    states: [vulnerable]\n  verification: unverified\n", 1)
+	out, err := Stamp([]byte(doc), stampVO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := Parse(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.IsUnverified() || len(c.Metadata.VerifiedOn) != 2 {
+		t.Fatalf("got:\n%s", out)
+	}
+}
+
+func writeContract(t *testing.T, dir, doc string) string {
+	t.Helper()
+	p := filepath.Join(dir, "contract.yaml")
+	if err := os.WriteFile(p, []byte(doc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// #137: StampSource refuses a file whose contract changed since it was
+// loaded, but not one where only the evidence changed (another stamp).
+func TestStampSourceChecksTheFile(t *testing.T) {
+	dir := t.TempDir()
+	p := writeContract(t, dir, stampDoc)
+	loaded := &Contract{SourcePath: p, SourceData: []byte(stampDoc)}
+
+	other := stampVO
+	other.Host = "linux/arm64"
+	if err := StampFile(p, other); err != nil { // a concurrent stamp on another host
+		t.Fatal(err)
+	}
+	if err := StampSource(loaded, stampVO); err != nil {
+		t.Fatalf("evidence-only change refused: %v", err)
+	}
+	data, _ := os.ReadFile(p)
+	c, err := Parse(data)
+	if err != nil || len(c.Metadata.VerifiedOn) != 2 {
+		t.Fatalf("lost a run: %v\n%s", err, data)
+	}
+
+	writeContract(t, dir, strings.Replace(stampDoc, "status: 200", "status: 302", 1))
+	err = StampSource(loaded, stampVO)
+	if err == nil || !strings.Contains(err.Error(), "the contract changed since it was loaded") {
+		t.Fatalf("changed probe: %v", err)
+	}
+}
+
+// #137: a symlinked contract is stamped through the link, which stays a link.
+func TestStampFileThroughSymlink(t *testing.T) {
+	dir := t.TempDir()
+	real := writeContract(t, dir, stampDoc)
+	link := filepath.Join(t.TempDir(), "contract.yaml")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skip("symlinks unavailable:", err)
+	}
+	if err := StampFile(link, stampVO); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("the link was replaced: %v %v", fi, err)
+	}
+	if data, _ := os.ReadFile(real); !strings.Contains(string(data), "verified_on:") {
+		t.Fatalf("the target was not stamped:\n%s", data)
+	}
+}
+
+// #137: a stamp waits for another one writing the same file, and takes over
+// a lock left by one that died.
+func TestStampLock(t *testing.T) {
+	w, s := stampLockWait, stampLockStale
+	t.Cleanup(func() { stampLockWait, stampLockStale = w, s })
+	stampLockWait = 200 * time.Millisecond
+	dir := t.TempDir()
+	p := writeContract(t, dir, stampDoc)
+	lock := filepath.Join(dir, ".contract.yaml.stamp-lock")
+	if err := os.WriteFile(lock, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := StampFile(p, stampVO); err == nil || !strings.Contains(err.Error(), "another stamp is writing this file") {
+		t.Fatalf("held lock: %v", err)
+	}
+	old := time.Now().Add(-2 * time.Minute)
+	if err := os.Chtimes(lock, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := StampFile(p, stampVO); err != nil {
+		t.Fatalf("stale lock: %v", err)
+	}
+	if _, err := os.Stat(lock); !os.IsNotExist(err) {
+		t.Errorf("lock left behind: %v", err)
 	}
 }

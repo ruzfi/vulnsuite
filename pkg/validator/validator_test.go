@@ -535,6 +535,16 @@ func TestVerificationRules(t *testing.T) {
 	if rules(v.Check(c))["verified-on-stale"] != Warning {
 		t.Error("verified-on-stale expected for an undeclared state")
 	}
+	// A state declared after the stamp (#137): the run never covered it.
+	var uncovered []string
+	for _, f := range v.Check(withMeta(stamp("avx512vbmi", "vulnerable"), cpu)) {
+		if f.Rule == "verified-on-stale" {
+			uncovered = append(uncovered, f.Message)
+		}
+	}
+	if len(uncovered) != 1 || !strings.Contains(uncovered[0], `does not cover state "patched"`) {
+		t.Errorf("want one stale finding for the uncovered patched state, got %q", uncovered)
+	}
 	// Runs on several hosts are checked one by one, and the finding names
 	// the host whose run is stale.
 	two := `verification: verified, verified_on: [` +

@@ -109,6 +109,14 @@ func (v *Validator) verification(c *contract.Contract) []Finding {
 					fmt.Sprintf("%s lists state %q, which the template no longer declares; re-run `vulnsuite stamp`", run, st)})
 			}
 		}
+		// stamp runs every declared state, so a state the run did not
+		// cover was added after it and has never been run.
+		for _, st := range c.DeclaredStates() {
+			if !slices.Contains(vo.States, st) {
+				out = append(out, Finding{Warning, c.ID(), "verified-on-stale",
+					fmt.Sprintf("%s does not cover state %q, declared since; re-run `vulnsuite stamp`", run, st)})
+			}
+		}
 		var unchecked []string
 		for _, f := range c.Requires.CPUFlags {
 			if !slices.Contains(vo.CPUFlags, f) {

@@ -153,6 +153,17 @@ func (e *Engine) ImageExists(ctx context.Context, ref, platform string) (bool, e
 	return engine.PlatformMatches(platform, img.Os, img.Architecture, img.Variant), nil
 }
 
+// ImagePlatform implements engine.ImagePlatformer.
+func (e *Engine) ImagePlatform(ctx context.Context, ref string) (string, error) {
+	img, err := e.cli.ImageInspect(ctx, ref)
+	if err != nil {
+		return "", err
+	}
+	return engine.JoinPlatform(img.Os, img.Architecture, img.Variant), nil
+}
+
+var _ engine.ImagePlatformer = (*Engine)(nil)
+
 func (e *Engine) ImagePull(ctx context.Context, ref, platform string, out io.Writer) error {
 	po := client.ImagePullOptions{RegistryAuth: registryauth.ForContext(ctx, ref)}
 	if platform != "" {

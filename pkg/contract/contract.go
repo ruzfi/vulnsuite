@@ -796,6 +796,15 @@ func (r VerifiedRuns) MarshalJSON() ([]byte, error) {
 	return json.Marshal([]VerifiedOn(r))
 }
 
+// List returns the runs as a plain slice, never nil: an empty one when none
+// is recorded.
+func (r VerifiedRuns) List() []VerifiedOn {
+	if r == nil {
+		return []VerifiedOn{}
+	}
+	return []VerifiedOn(r)
+}
+
 // Latest returns the most recent run (the later entry on the same day), or
 // nil when none is recorded.
 func (r VerifiedRuns) Latest() *VerifiedOn {
@@ -926,6 +935,9 @@ type Contract struct {
 	// absolute, both set by the loader.
 	Folder     string `yaml:"-" json:"folder"`
 	SourcePath string `yaml:"-" json:"source_path"`
+	// SourceData is the contract file as the loader read it, so that
+	// StampSource can tell whether the file changed since.
+	SourceData []byte `yaml:"-" json:"-"`
 }
 
 // ID is a shortcut for Metadata.ID.

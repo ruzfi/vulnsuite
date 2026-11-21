@@ -76,6 +76,9 @@ type listRow struct {
 	// for several.
 	Verification string                `json:"verification"`
 	VerifiedOn   contract.VerifiedRuns `json:"verified_on,omitempty"`
+	// VerifiedRuns is the same runs, always as an array (empty when none),
+	// for a consumer that does not want to handle both shapes.
+	VerifiedRuns []contract.VerifiedOn `json:"verified_runs"`
 	VulnRefs     []string              `json:"vuln_refs"`
 	Detection    string                `json:"detection,omitempty"`
 	DetectedBy   []string              `json:"detected_by,omitempty"`
@@ -288,7 +291,7 @@ gets a warning. Offline with neither present, KEV is shown as "?" and
 					Category:  store.Category(p), Severity: c.Metadata.Severity,
 					Class: c.Classes(), CVE: c.IsCVETracked(), Year: c.Year(), Disclosed: c.Metadata.Disclosed,
 					States: c.DeclaredStates(), BuildKind: c.BuildKind(contract.StateVulnerable),
-					Fidelity: c.Fidelity(), Verification: c.Verification(), VerifiedOn: c.Metadata.VerifiedOn,
+					Fidelity: c.Fidelity(), Verification: c.Verification(), VerifiedOn: c.Metadata.VerifiedOn, VerifiedRuns: c.Metadata.VerifiedOn.List(),
 					VulnRefs:  c.Metadata.VulnRefs,
 					Detection: c.Metadata.Detection, DetectedBy: c.Metadata.DetectedBy, Tags: c.Metadata.Tags,
 					HostAccess: runner.HostAccessReason(c) != "",

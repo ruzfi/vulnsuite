@@ -512,7 +512,7 @@ rather than failed; use `-expose host` or scan from a container.
 | `fidelity-unset` | warning | metadata.fidelity is not set (real or simulated) |
 | `unverified-target` | warning | `verification: unverified`: nobody has run the target's states yet (`vulnsuite stamp` records a run) |
 | `verified-no-evidence` | warning | `verification: verified` is set, `requires` needs specific hardware (`cpu_flags` or `probe`), and `verified_on` records no run |
-| `verified-on-stale` | warning | a `verified_on` run names a state the template no longer declares, or misses a `requires.cpu_flags` entry added since the run (checked per run; the finding names the host when there are several) |
+| `verified-on-stale` | warning | a `verified_on` run names a state the template no longer declares, does not cover a state declared since, or misses a `requires.cpu_flags` entry added since the run (checked per run; the finding names the host when there are several) |
 | `simulated-on-image-base` | warning | fidelity: simulated but the base is a prebuilt image |
 | `kvm-without-requires` | warning | service.devices has /dev/kvm but requires.kvm is not set |
 | `cpu-flags-with-emulation` | warning | requires.emulation is true but requires.cpu_flags is set, which rules emulation out |

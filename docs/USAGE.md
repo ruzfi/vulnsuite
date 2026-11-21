@@ -562,7 +562,22 @@ For each target, `stamp` runs every declared state in turn (build, start,
 verify, tear down). Only when every state ends in `verify: ok` does it write
 `metadata.verified_on` (date, vulnsuite version, the daemon's `os/arch`, the
 emulated `platform` if any, the `requires.cpu_flags` it checked, the states)
-and set `verification: verified`. Only those lines of the contract change.
+and set `verification: verified`. Only those lines of the contract change (a
+comment on the `verification:` line goes with it: it said why the target was
+unverified).
+
+The run proves the contract as it was loaded, so `stamp` checks the file again
+before writing: if anything but `verification` and `verified_on` changed
+during the run (an edited probe, a branch switch), it refuses with `the
+contract changed since it was loaded`; run it again. Evidence written meanwhile
+by another stamp (say, on a second host sharing the checkout) is kept and
+merged, and a lock file next to the contract
+(`.contract.yaml.stamp-lock`, removed afterwards) keeps two stamps from
+writing at once. A symlinked contract is written through the link.
+
+The image's platform is checked too: an image for another platform than the
+daemon's, run under emulation even though no `requires` asked for it, is
+recorded with its `platform`, not as a native run.
 
 `verified_on` keeps one run per host and image platform. Stamping on another
 host adds its run next to the ones already recorded, and stamping again on
@@ -586,7 +601,10 @@ verified_on:
 
 `list` shows the date of the latest run; `info` lists every run, and
 `list -json` gives `verified_on` the same shape as the contract (an object for
-one run, an array for several). A
+one run, an array for several). `list -json` and `info -json` also carry
+`verified_runs`: the same runs, always an array (empty when none). When a stamp
+turns a single run into a list it prints a note, since vulnsuite v0.5.0 and
+older cannot read the list form. A
 failing state leaves the file untouched and fails the command. A host that does
 not meet `requires` skips the target. There is no `-ignore-requires`: the point
 is evidence from a host that qualifies. Commit the stamped contract with the
