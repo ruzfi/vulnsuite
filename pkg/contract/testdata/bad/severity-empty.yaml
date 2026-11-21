@@ -1,0 +1,28 @@
+# want: metadata/severity: must not be empty
+apiVersion: vulnsuite/v1
+kind: Target
+metadata:
+  id: demo-verification
+  summary: demo
+  verification: unverified
+  severity: ""
+  verified_on:
+    date: "2026-11-21"
+    vulnsuite: v0.4.0
+    host: linux/amd64
+    platform: linux/arm64/v8
+    cpu_flags: [avx512vbmi, bmi2]
+    states: [vulnerable, patched]
+base:
+  kind: image
+  image: eclipse-temurin:21-jre
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+service:
+  ports: [ { container: 8080, protocol: http } ]
+states:
+  vulnerable:
+    verify:
+      - http: { path: /, status: 200 }
+  patched:
+    verify:
+      - http: { path: /, status: 404 }

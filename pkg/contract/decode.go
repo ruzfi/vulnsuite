@@ -188,8 +188,9 @@ func Parse(data []byte) (*Contract, error) {
 	// Likewise which keys each sidecar writes: `image: ""` or `digest: ""`
 	// next to a build is a key the schema rejects there.
 	var keys struct {
-		Base    map[string]any `yaml:"base"`
-		Service struct {
+		Base     map[string]any `yaml:"base"`
+		Metadata map[string]any `yaml:"metadata"`
+		Service  struct {
 			Sidecars []map[string]any `yaml:"sidecars"`
 		} `yaml:"service"`
 	}
@@ -199,7 +200,43 @@ func Parse(data []byte) (*Contract, error) {
 	if err := c.checkStructure(keys.Base, keys.Service.Sidecars); err != nil {
 		return nil, err
 	}
+	if err := c.Metadata.checkWrittenEmpty(keys.Metadata); err != nil {
+		return nil, err
+	}
 	return c, nil
+}
+
+// checkWrittenEmpty rejects an enum key written with an empty or null value
+// (`severity: ""`), which decodes like a key left out but which the schema
+// rejects: only leaving the key out gives the default. present holds the
+// metadata keys as written.
+func (m Metadata) checkWrittenEmpty(present map[string]any) error {
+	for _, f := range []struct {
+		key, val string
+	}{{"severity", m.Severity}, {"detection", m.Detection}, {"fidelity", m.Fidelity}, {"verification", m.Verification}} {
+		if _, ok := present[f.key]; ok && f.val == "" {
+			return se("metadata/"+f.key, "must not be empty; leave the key out for the default")
+		}
+	}
+	var runs []any
+	switch v := present["verified_on"].(type) {
+	case map[string]any:
+		runs = []any{v}
+	case []any:
+		runs = v
+	}
+	for i, r := range runs {
+		run, ok := r.(map[string]any)
+		if _, has := run["platform"]; !ok || !has || i >= len(m.VerifiedOn) || m.VerifiedOn[i].Platform != "" {
+			continue
+		}
+		loc := "metadata/verified_on"
+		if len(runs) > 1 {
+			loc = fmt.Sprintf("%s/%d", loc, i)
+		}
+		return se(loc+"/platform", "must not be empty; leave it out for a native run")
+	}
+	return nil
 }
 
 // check enforces metadata.verified_on's schema rules: every run is well

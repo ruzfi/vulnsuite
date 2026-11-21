@@ -326,6 +326,7 @@ func (s *Store) Load(path string) (*contract.Contract, error) {
 	}
 	c.SourcePath = abs
 	c.Folder = filepath.Dir(abs)
+	c.SourceData = data
 	return c, nil
 }
 

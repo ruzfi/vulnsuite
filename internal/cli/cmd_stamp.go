@@ -10,6 +10,7 @@ import (
 
 	"github.com/ruzfi/vulnsuite/pkg/builder"
 	"github.com/ruzfi/vulnsuite/pkg/contract"
+	"github.com/ruzfi/vulnsuite/pkg/engine"
 	"github.com/ruzfi/vulnsuite/pkg/runner"
 )
 
@@ -21,6 +22,9 @@ type stampStateResult struct {
 	// skip is set when requires.probe found the host lacking: the target is
 	// skipped, not failed.
 	skip string
+	// platform is the image's os/arch when it is not the daemon's (it ran
+	// under emulation), else "".
+	platform string
 }
 
 // stampResult is one target's outcome in `stamp -json`. Outcome is stamped
@@ -69,8 +73,10 @@ and sets verification: verified. verified_on keeps one run per host and
 image platform: a stamp replaces the run recorded on the same host and keeps
 the others, so a target run on linux/arm64 and then on linux/amd64 records
 both (as a list; a single run stays a mapping). Only those lines change;
-comments and the rest of the file are kept. When any state fails, or the host does not meet
-the template's requires, the file is left untouched.
+comments and the rest of the file are kept (except a comment on the
+verification line). When any state fails, the host does not meet the
+template's requires, or the contract file changed during the run, the file
+is left untouched.
 
 A stamp is evidence that a host meeting the requires ran the target, so there
 is no -ignore-requires here. -dry-run runs and verifies without writing.
@@ -145,7 +151,7 @@ Targets run one at a time, and each state is torn down before the next.`,
 				}
 				res := stampOne(ctx, g, r, pf, c, exp, opts)
 				if res.Outcome == stampVerified && !dryRun {
-					if werr := contract.StampFile(c.SourcePath, *res.VerifiedOn); werr != nil {
+					if werr := contract.StampSource(c, *res.VerifiedOn); werr != nil {
 						res.Outcome, res.Detail = stampFailed, "verified, but could not write verified_on: "+werr.Error()
 					} else {
 						res.Outcome = stampStamped
@@ -155,6 +161,10 @@ Targets run one at a time, and each state is torn down before the next.`,
 				switch res.Outcome {
 				case stampStamped:
 					g.printf("stamped %s on %s: %s\n", c.ID(), res.VerifiedOn.RanOn(), c.SourcePath)
+					if had := c.Metadata.VerifiedOn; len(had) <= 1 && len(had.With(*res.VerifiedOn)) > 1 {
+						g.printf("  note: verified_on now records runs on %d hosts, written as a list; vulnsuite v0.5.0 and older cannot read that form\n",
+							len(had.With(*res.VerifiedOn)))
+					}
 				case stampVerified:
 					g.printf("verified %s (-dry-run: %s not written)\n", c.ID(), c.SourcePath)
 				case stampSkipped:
@@ -212,9 +222,10 @@ func stampOne(ctx context.Context, g *Global, r *runner.Runner, pf *preflighter,
 		}
 	}
 	states := c.DeclaredStates()
+	hostPlatform := pf.host.OS + "/" + pf.host.Arch
 	for _, state := range states {
 		g.printf("\n=== [%s] %s ===\n", c.ID(), state)
-		sr := stampState(ctx, g, r, c, state, exp, opts)
+		sr := stampState(ctx, g, r, c, state, exp, opts, hostPlatform)
 		res.States = append(res.States, sr)
 		if sr.skip != "" {
 			res.Outcome, res.Detail = stampSkipped, sr.skip
@@ -223,6 +234,12 @@ func stampOne(ctx context.Context, g *Global, r *runner.Runner, pf *preflighter,
 		if !sr.OK {
 			res.Outcome, res.Detail = stampFailed, fmt.Sprintf("%s: %s", state, sr.Detail)
 			return res
+		}
+		if platform == "" && sr.platform != "" {
+			// No requires asked for emulation, but the image is for
+			// another platform: the daemon emulated it, and the run is
+			// not a native one on this host.
+			platform = sr.platform
 		}
 	}
 	res.Outcome = stampVerified
@@ -239,7 +256,7 @@ func stampOne(ctx context.Context, g *Global, r *runner.Runner, pf *preflighter,
 
 // stampState runs one state, reports its verify, and tears it down.
 func stampState(ctx context.Context, g *Global, r *runner.Runner, c *contract.Contract, state string,
-	exp runner.Exposure, opts runner.Options) stampStateResult {
+	exp runner.Exposure, opts runner.Options, hostPlatform string) stampStateResult {
 	sr := stampStateResult{State: state}
 	h, err := r.Run(ctx, c, state, exp, opts)
 	if err != nil {
@@ -258,6 +275,7 @@ func stampState(ctx context.Context, g *Global, r *runner.Runner, c *contract.Co
 		}
 	}()
 	reportVerify(g, h, "  ")
+	sr.platform = emulatedPlatform(ctx, r.Engine, h, hostPlatform)
 	switch {
 	case h.Problem() != "":
 		sr.Detail = h.Problem()
@@ -270,4 +288,22 @@ func stampState(ctx context.Context, g *Global, r *runner.Runner, c *contract.Co
 		sr.OK = true
 	}
 	return sr
+}
+
+// emulatedPlatform returns the os/arch of the image h ran when it is not
+// hostPlatform, else "" (also when the engine cannot tell).
+func emulatedPlatform(ctx context.Context, eng engine.Engine, h *runner.Handle, hostPlatform string) string {
+	ip, ok := eng.(engine.ImagePlatformer)
+	if !ok || h.Image == nil || h.Image.Ref == "" {
+		return ""
+	}
+	p, err := ip.ImagePlatform(ctx, h.Image.Ref)
+	if err != nil || p == "" {
+		return ""
+	}
+	os, arch, variant := engine.SplitPlatform(p)
+	if engine.PlatformMatches(hostPlatform, os, arch, variant) {
+		return ""
+	}
+	return os + "/" + arch
 }

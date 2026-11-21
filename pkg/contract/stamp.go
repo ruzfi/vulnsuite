@@ -1,14 +1,17 @@
 package contract
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var (
@@ -80,13 +83,19 @@ func Stamp(data []byte, vo VerifiedOn) ([]byte, error) {
 		return strings.TrimSpace(k)
 	}
 
+	// verification may come before or after verified_on: rewrite it first,
+	// in place. A comment on its line goes with it: it says why the target
+	// was unverified, which the stamp makes stale.
+	for i := start + 1; i < end; i++ {
+		if keyAt(i) == "verification" {
+			lines[i] = pad + "verification: " + VerificationVerified
+		}
+	}
 	block := renderVerifiedRuns(want, pad, strings.Repeat(" ", child))
 	var out []string
 	replaced := false
 	for i := start + 1; i < end; i++ {
 		switch keyAt(i) {
-		case "verification":
-			lines[i] = pad + "verification: " + VerificationVerified
 		case "verified_on":
 			// Its value runs until the next line that is content at the
 			// key's own indentation or less, except the items of a list
@@ -138,26 +147,59 @@ func Stamp(data []byte, vo VerifiedOn) ([]byte, error) {
 }
 
 // StampFile applies Stamp to the contract at path, replacing the file
-// atomically and keeping its mode.
+// atomically and keeping its mode. A symlinked contract is written through
+// the link.
 func StampFile(path string, vo VerifiedOn) error {
-	data, err := os.ReadFile(path)
+	return stampFile(path, vo, nil)
+}
+
+// StampSource stamps the file c was loaded from (c.SourcePath), after
+// checking that it still holds the contract that ran: apart from
+// metadata.verification and verified_on, which another stamp may have
+// written meanwhile, it must parse to the same contract as c.SourceData,
+// the bytes the loader read. A contract with no SourceData is stamped
+// unchecked, as StampFile does.
+func StampSource(c *Contract, vo VerifiedOn) error {
+	return stampFile(c.SourcePath, vo, c.SourceData)
+}
+
+func stampFile(path string, vo VerifiedOn, loaded []byte) error {
+	real, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return err
+	}
+	unlock, err := lockStamp(real)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	defer unlock()
+	data, err := os.ReadFile(real)
+	if err != nil {
+		return err
+	}
+	if loaded != nil && !bytes.Equal(data, loaded) {
+		if err := sameButEvidence(loaded, data); err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
 	}
 	out, err := Stamp(data, vo)
 	if err != nil {
 		return fmt.Errorf("%s: %w", path, err)
 	}
-	st, err := os.Stat(path)
+	st, err := os.Stat(real)
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".stamp-*")
+	tmp, err := os.CreateTemp(filepath.Dir(real), ".stamp-*")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(tmp.Name())
 	if _, err := tmp.Write(out); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -167,7 +209,60 @@ func StampFile(path string, vo VerifiedOn) error {
 	if err := os.Chmod(tmp.Name(), st.Mode().Perm()); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), path)
+	return os.Rename(tmp.Name(), real)
+}
+
+// sameButEvidence reports, as an error, that now is not the contract loaded
+// was, comparing everything but metadata.verification and verified_on.
+func sameButEvidence(loaded, now []byte) error {
+	const changed = "the contract changed since it was loaded, so the run does not prove it; run stamp again"
+	a, err := Parse(loaded)
+	if err != nil {
+		return errors.New(changed)
+	}
+	b, err := Parse(now)
+	if err != nil {
+		return fmt.Errorf("%s (it no longer parses: %v)", changed, err)
+	}
+	a.Metadata.Verification, b.Metadata.Verification = "", ""
+	a.Metadata.VerifiedOn, b.Metadata.VerifiedOn = nil, nil
+	if !reflect.DeepEqual(a, b) {
+		return errors.New(changed)
+	}
+	return nil
+}
+
+// stampLockWait is how long a stamp waits for another one writing the same
+// file; a lock older than stampLockStale was left by a stamp that died.
+var (
+	stampLockWait  = 10 * time.Second
+	stampLockStale = time.Minute
+)
+
+// lockStamp takes the lock file next to path, so that two stamps of one
+// file (say, on two hosts sharing a checkout) cannot both read it and the
+// later write lose the earlier's run.
+func lockStamp(path string) (func(), error) {
+	lock := filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".stamp-lock")
+	deadline := time.Now().Add(stampLockWait)
+	for {
+		f, err := os.OpenFile(lock, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err == nil {
+			f.Close()
+			return func() { os.Remove(lock) }, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return nil, err
+		}
+		if st, serr := os.Stat(lock); serr == nil && time.Since(st.ModTime()) > stampLockStale {
+			os.Remove(lock)
+			continue
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("another stamp is writing this file (remove %s if none is)", lock)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // renderVerifiedRuns writes the verified_on key at pad, its content one step

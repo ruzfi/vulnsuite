@@ -157,6 +157,26 @@ func (f *Fake) ImageExists(ctx context.Context, ref, platform string) (bool, err
 	return ok && f.platformOK(key, platform), nil
 }
 
+// ImagePlatform implements engine.ImagePlatformer: the platform recorded for
+// the image in ImagePlatforms, else the host's (HostInfo).
+func (f *Fake) ImagePlatform(ctx context.Context, ref string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key, ok := f.image(ref)
+	if !ok {
+		return "", fmt.Errorf("No such image: %s", ref)
+	}
+	if p := f.ImagePlatforms[key]; p != "" {
+		return p, nil
+	}
+	return engine.JoinPlatform(f.HostInfo.OS, f.HostInfo.Arch, ""), nil
+}
+
+var _ engine.ImagePlatformer = (*Fake)(nil)
+
 // normalizeRef is the name a daemon resolves an image reference to, so that
 // "busybox", "busybox:latest" and "docker.io/library/busybox:latest" are one
 // image. A reference that does not parse is returned unchanged.
