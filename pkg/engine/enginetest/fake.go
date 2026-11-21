@@ -303,6 +303,7 @@ func (f *Fake) ImageBuild(ctx context.Context, opts engine.BuildOptions, out io.
 		if name == "" {
 			name = "Dockerfile"
 		}
+		//lint:ignore ST1005 dockerd's message, verbatim
 		return fmt.Errorf("Cannot locate specified Dockerfile: %s", name)
 	}
 	if f.FailBuild != "" {
@@ -792,6 +793,7 @@ func (f *Fake) ContainerPause(ctx context.Context, id string) error {
 	c := f.byIDOrName(id)
 	switch {
 	case c == nil:
+		//lint:ignore ST1005 dockerd's message, verbatim
 		return fmt.Errorf("No such container: %s", id)
 	case !c.Running:
 		return fmt.Errorf("container %s is not running", c.ID)
@@ -814,6 +816,7 @@ func (f *Fake) ContainerUnpause(ctx context.Context, id string) error {
 	c := f.byIDOrName(id)
 	switch {
 	case c == nil:
+		//lint:ignore ST1005 dockerd's message, verbatim
 		return fmt.Errorf("No such container: %s", id)
 	case !c.Paused:
 		return fmt.Errorf("Container %s is not paused", c.ID)
@@ -871,6 +874,7 @@ func (f *Fake) archivePath(id, p string) (*Container, string, File, error) {
 	}
 	c := f.byIDOrName(id)
 	if c == nil {
+		//lint:ignore ST1005 dockerd's message, verbatim
 		return nil, "", File{}, fmt.Errorf("No such container: %s", id)
 	}
 	p = path.Clean(p)

@@ -327,7 +327,7 @@ func DirFilesFromTar(r io.Reader, root string, maxBytes int64) (map[string]FileC
 		}
 		var fc FileContent
 		switch h.Typeflag {
-		case tar.TypeReg, tar.TypeRegA:
+		case tar.TypeReg: // the reader turns the legacy TypeRegA into TypeReg
 			if h.Size < 0 {
 				continue
 			}

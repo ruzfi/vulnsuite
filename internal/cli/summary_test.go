@@ -173,7 +173,7 @@ func TestRunJSONSummaryInterrupted(t *testing.T) {
 	code := mainWithEngine(ctx, fe, []string{"-json", "-T", root, "run", "-t", "misc", "-summary",
 		"-expose", "host", "-no-verify", "-ready-timeout", "1s", "-nuclei-templates", t.TempDir()}, &out, &errOut)
 	var sum runSummary
-	if code == ExitOK || json.Unmarshal([]byte(out.String()), &sum) != nil {
+	if code == ExitOK || json.Unmarshal(out.Bytes(), &sum) != nil {
 		t.Fatalf("interrupted: %d\n%s\n%s", code, out.String(), errOut.String())
 	}
 	if len(sum.Targets) != 0 || len(sum.Failed) != 0 || len(sum.Skipped) != 3 {
@@ -245,7 +245,7 @@ func TestBuildCountsJobsCancelledBeforeStart(t *testing.T) {
 	errOut.Reset()
 	code = mainWithEngine(ctx, fe, append([]string{"-json"}, args...), &out, &errOut)
 	var res []buildResult
-	if code == ExitOK || json.Unmarshal([]byte(out.String()), &res) != nil || len(res) != 3 {
+	if code == ExitOK || json.Unmarshal(out.Bytes(), &res) != nil || len(res) != 3 {
 		t.Fatalf("bare -json must list all 3 jobs: %d\n%s\n%s", code, out.String(), errOut.String())
 	}
 	cancelled := 0
@@ -266,7 +266,7 @@ func TestBuildCountsJobsCancelledBeforeStart(t *testing.T) {
 	errOut.Reset()
 	code = mainWithEngine(ctx, fe, append([]string{"-json"}, append(args, "-summary")...), &out, &errOut)
 	var sum buildSummary
-	if code == ExitOK || json.Unmarshal([]byte(out.String()), &sum) != nil {
+	if code == ExitOK || json.Unmarshal(out.Bytes(), &sum) != nil {
 		t.Fatalf("-summary: %d\n%s\n%s", code, out.String(), errOut.String())
 	}
 	if len(sum.Built) != 0 || len(sum.Failed)+len(sum.Skipped) != 3 || len(sum.Skipped) != cancelledCount(sum.Skipped) || len(sum.Skipped) == 0 {

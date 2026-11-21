@@ -47,7 +47,7 @@ type Engine struct {
 // named by DOCKER_CONTEXT or currentContext, then the local socket defaults
 // (including the Docker Desktop, OrbStack and Colima per-user sockets).
 func New(host string) (*Engine, error) {
-	opts := []client.Opt{client.FromEnv, client.WithAPIVersionNegotiation()}
+	opts := []client.Opt{client.FromEnv} // the client negotiates the API version by default
 	switch {
 	case host != "":
 		opts = append(opts, client.WithHost(host))
