@@ -2,6 +2,8 @@ module github.com/ruzfi/vulnsuite
 
 go 1.26.0
 
+toolchain go1.26.11
+
 require (
 	github.com/containerd/errdefs v1.0.0
 	github.com/distribution/reference v0.6.0

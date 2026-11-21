@@ -15,7 +15,7 @@ make e2e            # end-to-end against your local Docker daemon
 make lint           # gofmt + go vet
 ```
 
-Go 1.24 or newer. The only runtime dependency is a Docker-compatible daemon.
+Go 1.26 or newer. The only runtime dependency is a Docker-compatible daemon.
 The module depends on `github.com/goccy/go-yaml` and the official Moby SDK
 (`github.com/moby/moby/client` + `api`); please don't add more without a
 discussion. Anything that needs a different backend implements
