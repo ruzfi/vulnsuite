@@ -1,0 +1,17 @@
+# want: states/vulnerable/image: a per-state image applies only to kind: image
+apiVersion: vulnsuite/v1
+kind: Target
+metadata:
+  id: demo-bad
+  summary: a contract with one invalid value
+base:
+  kind: source
+  repo: https://github.com/example/app
+  commit: 0123456789abcdef0123456789abcdef01234567
+service:
+  ports: [ { container: 80, protocol: http } ]
+states:
+  vulnerable:
+    verify:
+      - http: { path: /, status: 200 }
+    image: ""

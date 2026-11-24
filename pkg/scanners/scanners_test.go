@@ -127,6 +127,8 @@ func TestParseRefScannersAndKnown(t *testing.T) {
 		{"laravel-env", "nuclei", "laravel-env", true}, // bare id defaults to nuclei
 		{"NMAP:Foo", "nmap", "Foo", true},              // scanner lowercased
 		{"bogus:x", "bogus", "x", false},
+		{"nuclei: CVE-2021-41773", "nuclei", "CVE-2021-41773", true}, // space after the colon (#145)
+		{" nuclei :CVE-2021-41773 ", "nuclei", "CVE-2021-41773", true},
 	}
 	for _, c := range cases {
 		r := ParseRef(c.in)
@@ -136,6 +138,16 @@ func TestParseRefScannersAndKnown(t *testing.T) {
 		if r.Known() != c.known {
 			t.Errorf("ParseRef(%q).Known() = %v, want %v", c.in, r.Known(), c.known)
 		}
+	}
+}
+
+// A ref written with space around the colon matches its template and is not
+// suggested again as undeclared (#145).
+func TestSpacedRefMatches(t *testing.T) {
+	idx := fakeCheckout(t)
+	r := Match(contractWith("", []string{"nuclei: apache-combo"}, []string{"CVE-2021-42013"}), idx)
+	if len(r.Suggested) != 0 {
+		t.Errorf("spaced ref still suggested: %+v", r.Suggested)
 	}
 }
 

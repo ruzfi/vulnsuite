@@ -88,6 +88,19 @@ vulnsuite stands up **knowingly vulnerable** targets. Two trust boundaries matte
   capability set. vulnsuite does **not** expose `privileged`, `--network host`,
   arbitrary `security_opt`, or host volume binds to templates.
 
+### Reading the templates tree
+
+- **A malformed contract cannot crash or hang the CLI.** Every command that
+  reads contracts (`list`, `info`, `validate`, `run <id>`) checks a document's
+  aliases, merge keys and tags before decoding it: a document that expands to
+  more than 100,000 nodes through aliases or merge keys, or that carries a
+  non-core tag or a tag with no value, is rejected, and a panic in the YAML
+  decoder is reported as a parse error. A `net` probe step reads at most
+  65536 bytes.
+- **Discovery stays inside the tree.** A symlinked directory is followed only
+  when it resolves inside the folder being walked, so a link such as `x -> /`
+  in a checkout cannot make `list` walk the host's file system.
+
 ### Author/review aid
 
 - `vulnsuite validate` warns (`host-device-access`, `elevated-capability`) when

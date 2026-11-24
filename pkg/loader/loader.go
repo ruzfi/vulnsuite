@@ -11,8 +11,6 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/goccy/go-yaml"
-
 	"github.com/ruzfi/vulnsuite/pkg/contract"
 )
 
@@ -379,11 +377,17 @@ func (s *Store) ByID() (map[string]*contract.Contract, error) {
 // at most one contract (the first of ContractNames present); dot-directories
 // and skipDirs are never entered, contentDirs are skipped inside a contract
 // folder, and symlinked directories are followed once (a directory reached
-// again through a link loop is not re-entered).
+// again through a link loop is not re-entered) and only when they resolve
+// inside folder: a link such as `x -> /` in a checkout must not make discovery
+// walk the host's file system.
 func contractsIn(folder string) ([]string, error) {
 	root, err := filepath.Abs(folder)
 	if err != nil {
 		root = folder
+	}
+	realRoot := root
+	if r, err := filepath.EvalSymlinks(root); err == nil {
+		realRoot = r
 	}
 	var out []string
 	visited := map[string]bool{}
@@ -421,7 +425,7 @@ func contractsIn(folder string) ([]string, error) {
 			isDir := e.IsDir()
 			if e.Type()&fs.ModeSymlink != 0 {
 				info, err := os.Stat(filepath.Join(dir, name))
-				isDir = err == nil && info.IsDir()
+				isDir = err == nil && info.IsDir() && resolvesInside(realRoot, filepath.Join(dir, name))
 			}
 			if !isDir || strings.HasPrefix(name, ".") || skipDirs[name] || (inContract && contentDirs[name]) {
 				continue
@@ -437,6 +441,17 @@ func contractsIn(folder string) ([]string, error) {
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// resolvesInside reports whether path, with every symlink resolved, is root
+// (itself resolved) or lies under it.
+func resolvesInside(root, path string) bool {
+	real, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(root, real)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
 }
 
 // peeked is the subset of metadata read for cheap resolution over a whole tree,
@@ -472,8 +487,10 @@ func peek(path string) (peeked, error) {
 			Primary  bool     `yaml:"primary"`
 		} `yaml:"metadata"`
 	}
-	if err := yaml.Unmarshal(data, &doc); err != nil {
-		return peeked{}, fmt.Errorf("invalid YAML: %s", strings.TrimSpace(yaml.FormatError(err, false, false)))
+	// DecodeYAML applies Parse's alias, merge-key and tag guards, so a bad
+	// contract anywhere in the tree cannot hang or crash list, info or run.
+	if err := contract.DecodeYAML(data, &doc); err != nil {
+		return peeked{}, err
 	}
 	m := doc.Metadata
 	return peeked{ID: m.ID, Refs: m.VulnRefs, Group: m.Group, Variant: m.Variant, Primary: m.Primary}, nil

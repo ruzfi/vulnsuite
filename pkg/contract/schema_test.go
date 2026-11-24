@@ -53,6 +53,10 @@ var decoderOnly = map[string]string{
 		"of their fields, which JSON Schema has no keyword for",
 	"sequence-min-hits-over-attempts.yaml": "min_hits must not exceed attempts, a comparison of two sibling values " +
 		"that JSON Schema has no keyword for",
+	"healthcheck-timeout-too-long.yaml": "the schema's pattern requires a positive duration; bounding it at 24h " +
+		"across s, m and h units is a numeric comparison a pattern cannot express readably",
+	"healthcheck-timeout-overflow.yaml": "as for healthcheck-timeout-too-long.yaml: the value overflows a duration, " +
+		"which the decoder reports as out of range",
 }
 
 func loadSchema(t *testing.T) map[string]any {

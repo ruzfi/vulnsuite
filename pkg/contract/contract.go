@@ -30,6 +30,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -92,7 +93,8 @@ const ImageRepoPrefix = "vulnsuite"
 var durationRe = regexp.MustCompile(`^(\d+)([smh])$`)
 
 // ParseDuration parses the contract's short duration form ("60s", "5m", "1h").
-// An empty string returns def.
+// An empty string returns def. A value too large for a time.Duration (about
+// 290 years) is an error, not a silently wrapped or truncated duration.
 func ParseDuration(text string, def time.Duration) (time.Duration, error) {
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -102,16 +104,22 @@ func ParseDuration(text string, def time.Duration) (time.Duration, error) {
 	if m == nil {
 		return 0, fmt.Errorf("bad duration %q (want e.g. 60s, 5m)", text)
 	}
-	var n int
-	fmt.Sscanf(m[1], "%d", &n)
+	unit := time.Second
 	switch m[2] {
 	case "m":
-		return time.Duration(n) * time.Minute, nil
+		unit = time.Minute
 	case "h":
-		return time.Duration(n) * time.Hour, nil
+		unit = time.Hour
 	}
-	return time.Duration(n) * time.Second, nil
+	n, err := strconv.ParseInt(m[1], 10, 64)
+	if err != nil || n > int64(math.MaxInt64/unit) {
+		return 0, fmt.Errorf("duration %q is out of range", text)
+	}
+	return time.Duration(n) * unit, nil
 }
+
+// MaxHealthcheckTimeout bounds service.healthcheck.timeout.
+const MaxHealthcheckTimeout = 24 * time.Hour
 
 // Port is a port the target listens on inside the container.
 type Port struct {
@@ -186,7 +194,7 @@ type NetStep struct {
 	Send         string `yaml:"send,omitempty" json:"send,omitempty"`
 	Expect       string `yaml:"expect,omitempty" json:"expect,omitempty"`               // regex the response must match
 	ExpectAbsent string `yaml:"expect_absent,omitempty" json:"expect_absent,omitempty"` // regex the response must NOT match
-	Read         int    `yaml:"read,omitempty" json:"read,omitempty"`                   // bytes to read after this step (default 4096; 0 = skip read)
+	Read         int    `yaml:"read,omitempty" json:"read,omitempty"`                   // bytes to read after this step, 1..MaxNetRead (default 4096; unset = the default)
 	NoRead       bool   `yaml:"no_read,omitempty" json:"no_read,omitempty"`             // send without reading a response
 }
 

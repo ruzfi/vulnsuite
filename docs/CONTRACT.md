@@ -20,11 +20,23 @@ document. YAML anchors, aliases and merge keys (`<<: *base`) may be used; a
 value reached through one must have the type required where it is used, and a
 merged key must be a field of the mapping it is merged into. Each anchor name
 may be defined once, before any alias to it, and the document with every alias
-expanded may hold at most 100,000 nodes. A required string may not be empty
+expanded may hold at most 100,000 nodes. These rules are checked before the
+document is decoded, by `validate` and by every command that reads the
+templates tree (`list`, `info`, `run <id>`), so a malformed contract is an error
+there rather than a hang. Tags may be only the core ones that restate a value's
+type (`!!str`, `!!int`, `!!float`, `!!bool`, `!!null`, `!!seq`, `!!map`), on a
+value of that type; a local tag (`!x`), any other tag, and a tag with no value
+after it (`ports: !!seq` and nothing more) are rejected. A required string may not be empty
 (`summary` may not be blank either): `base.image`, `base.repo`, `base.commit`,
 a sidecar's `name` and `image` (or its `build.context`), a per-state sidecar `image`, and the `run` of a
-`seed` step or an `exec` probe. A base key the base kind does not allow is
-rejected even with an empty value (`context: ""` on an image base). The machine-readable form of this document is
+`seed` step or an `exec` probe. An optional string whose value has a format may
+not be written empty either -- leave the key out instead: `base.digest`,
+`base.dockerfile`, `service.user`, `service.healthcheck.timeout`, a sidecar's
+or a per-state sidecar's `digest`, a state's `digest` and `patch`, an overlay
+`mode`, `metadata.disclosed`, `group` and `variant`, and
+`requires.probe.timeout`. A base key the base kind does not allow is
+rejected even with an empty value (`context: ""` on an image base), and so is a
+state `image` on a source or build base. The machine-readable form of this document is
 [`schemas/contract.schema.json`](../schemas/contract.schema.json); the loader
 enforces the same rules.
 
@@ -33,7 +45,9 @@ Discovery walks the templates tree and takes at most one contract per folder
 enters dot-directories (`.git`, `.github`, ...) or `node_modules`, skips a
 template's own `files/`, `patches/` and `src/` (only inside a folder that holds
 a contract, so a category may be called `files`), and follows symlinked
-directories once.
+directories once, and only when the link resolves inside the folder being
+walked (the templates root, or the folder named on the command line): a link
+out of the tree, such as `x -> /`, is skipped.
 
 ## Top level
 
@@ -102,8 +116,8 @@ base: { kind: build, context: src, dockerfile: Dockerfile, build_args: {} }
 | `ports` | required; `{ container: 80, protocol: http }`. Protocols: `http`, `https`, `tcp`, `ssh`, `ftp`, `smtp`, `redis`, `mysql`, `postgres`. The first HTTP port (else the first port) is the **primary** port a scanner is pointed at, always published. Add `publish: true` to a secondary port to publish it too (host mode) and include it in scanner target lists; unmarked secondary ports stay internal. Container ports must be unique. |
 | `command` | string or list; overrides the image command |
 | `environment` | map; merged with the state's environment (state wins) |
-| `healthcheck` | `{ http: { path, status }, timeout: 60s }` or `{ tcp: { port }, timeout }`; `timeout` is `<n>s|m|h`. When the target cannot be reached from the machine running vulnsuite, it is checked from inside the target: the port must be listening, and an `http` check uses `curl` if the image has it |
-| `sidecars` | helper containers `{ name, image, digest, command, environment }` (names unique) started with each target state on a private network shared only with that state's target, reachable there by `name` in every exposure mode; each state gets its own sidecars (`command` sets the container command, e.g. a `server ...` arg list for a clustered node). Instead of `image`/`digest` a sidecar may have a `build: { context, dockerfile, build_args }` to run an image built from the template, e.g. a driver or fake-DNS sidecar that runs the template's own scripts: exactly one of `image` and `build` is set, and a `build` takes no `digest`. See **Built sidecars** below |
+| `healthcheck` | `{ http: { path, status }, timeout: 60s }` or `{ tcp: { port }, timeout }`; `timeout` is `<n>s|m|h`, greater than 0 and at most `24h` (default 60s). When the target cannot be reached from the machine running vulnsuite, it is checked from inside the target: the port must be listening, and an `http` check uses `curl` if the image has it |
+| `sidecars` | helper containers `{ name, image, digest, command, environment }` (names unique, matching `^[A-Za-z0-9][A-Za-z0-9_.-]*$`: a name is part of the sidecar's container name and its network alias) started with each target state on a private network shared only with that state's target, reachable there by `name` in every exposure mode; each state gets its own sidecars (`command` sets the container command, e.g. a `server ...` arg list for a clustered node). Instead of `image`/`digest` a sidecar may have a `build: { context, dockerfile, build_args }` to run an image built from the template, e.g. a driver or fake-DNS sidecar that runs the template's own scripts: exactly one of `image` and `build` is set, and a `build` takes no `digest`. See **Built sidecars** below |
 | `user` | run-as `uid` or `uid:gid` |
 | `cap_add` / `cap_drop` | Linux capabilities, e.g. `cap_drop: [ALL]` then `cap_add: [CAP_NET_BIND_SERVICE]` |
 | `sanitizer` | `{ log_dir: /var/log/asan }`: the directory a sanitizer-instrumented target writes its reports to, read by a `sequence`'s `expect_sanitizer` steps. An absolute, canonical plain path (the characters of `overlay[].dest`, no `..`, `.`, `//` or trailing `/`, not `/`). Point the runtime at it yourself (`ASAN_OPTIONS=...:log_path=/var/log/asan/asan`) and create it writable by every user in the image. Not part of the image hash |
@@ -184,7 +198,7 @@ scanner's discrimination cannot be checked). Each state:
 
 | Field | Notes |
 | --- | --- |
-| `image` / `digest` | per-state image override — the cheapest "patched": a newer tag. `image` bases only: a `source` or `build` base builds every state from its own checkout or context, so a state `image` (or `digest`) there is a schema error; make the states differ with a `patch` or `overlay` |
+| `image` / `digest` | per-state image override — the cheapest "patched": a newer tag. `digest` pins that `image` and needs it: a state `digest` without `image` is rejected (it would be ignored, and the state would run the base image). `image` bases only: a `source` or `build` base builds every state from its own checkout or context, so a state `image` (or `digest`) there is a schema error; make the states differ with a `patch` or `overlay` |
 | `patch` | a git patch applied to a `source` or `build` base |
 | `overlay` | `[{ src, dest, mode }]` files from the template baked into the image (`image` base) or written into the build context (`source`/`build` base). `src` is relative to the template folder; `dest` is an absolute path in the image for an `image` base, or a path in the build context for a `source`/`build` base. `mode` (e.g. `"0755"`) is set on the file in the build context and kept by `COPY`, so it also works on a non-root or shell-less base. See **Paths** below. |
 | `environment` | baked into built images and passed at run time. Names must match `^[A-Za-z_][A-Za-z0-9_.-]*$`; values may not contain newlines or other control characters (they become Dockerfile `ENV` lines; `$` is kept literally). |
@@ -295,7 +309,7 @@ mode the published port is held by Docker's port proxy, which accepts before the
 service listens in the container. A server that greets the client, or one that
 waits for the client to speak first, counts as open.
 
-The `net` probe runs an ordered send/expect dialogue over a single TCP connection (optionally TLS), for multi-step protocols -- FTP SITE commands, SMTP, line protocols -- that a one-shot `tcp` probe cannot express. Each step optionally sends bytes, then reads the response and asserts `expect` (regex must match) and/or `expect_absent`. A response is read across TCP segments: reading stops once `expect` matches, after `read` bytes (default 4096), when the server closes, after 500ms without more data, or at the probe timeout. So a multi-line reply (`220-Welcome` then `220 ready`) is judged whole and none of it leaks into the next step. A `tcp` probe reads its banner the same way, up to `banner_matches`. The connection is TLS when `tls: true` is set or when the probed port is declared `protocol: https` (the primary port when `port` is left out); a dialogue with any other port, e.g. SMTP on 25 of an https target, stays plain.
+The `net` probe runs an ordered send/expect dialogue over a single TCP connection (optionally TLS), for multi-step protocols -- FTP SITE commands, SMTP, line protocols -- that a one-shot `tcp` probe cannot express. Each step optionally sends bytes, then reads the response and asserts `expect` (regex must match) and/or `expect_absent`. A response is read across TCP segments: reading stops once `expect` matches, after `read` bytes (1-65536, default 4096), when the server closes, after 500ms without more data, or at the probe timeout. So a multi-line reply (`220-Welcome` then `220 ready`) is judged whole and none of it leaks into the next step. A `tcp` probe reads its banner the same way, up to `banner_matches`. The connection is TLS when `tls: true` is set or when the probed port is declared `protocol: https` (the primary port when `port` is left out); a dialogue with any other port, e.g. SMTP on 25 of an https target, stays plain.
 
 HTTP probes are sent over a raw socket so the request line is exactly what the
 template says. Chunked responses are decoded. A probe speaks the scheme of the
