@@ -274,22 +274,81 @@ func TestDiscoveryWalkRules(t *testing.T) {
 	}
 }
 
-func TestDiscoveryFollowsSymlinkedDirsWithoutLooping(t *testing.T) {
+// Symlinked directories are followed when they resolve inside the root, once
+// (a loop back to the root does not recurse), and never when they resolve
+// outside it: `x -> /` must not make discovery walk the host (#145).
+func TestDiscoveryFollowsSymlinksOnlyInsideRoot(t *testing.T) {
 	outside, root := t.TempDir(), t.TempDir()
-	writeContract(t, filepath.Join(outside, "t1", "contract.yaml"), "linked-one")
+	writeContract(t, filepath.Join(outside, "t1", "contract.yaml"), "outside-one")
+	writeContract(t, filepath.Join(root, "real", "t2", "contract.yaml"), "inside-two")
 	if err := os.Symlink(outside, filepath.Join(root, "linked")); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
-	// A loop back to the root must not recurse forever.
-	if err := os.Symlink(root, filepath.Join(outside, "loop")); err != nil {
-		t.Fatal(err)
+	for link, target := range map[string]string{
+		"alias": filepath.Join(root, "real"), // inside: followed
+		"loop":  root,                        // inside, a loop: not re-entered
+		"host":  string(filepath.Separator),  // outside: never walked
+		"up":    "..",                        // relative, outside
+	} {
+		if err := os.Symlink(target, filepath.Join(root, "real", link)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	got, err := New(root).All()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"linked/t1/contract.yaml"}; fmt.Sprint(relPaths(t, root, got)) != fmt.Sprint(want) {
+	if want := []string{"real/t2/contract.yaml"}; fmt.Sprint(relPaths(t, root, got)) != fmt.Sprint(want) {
 		t.Fatalf("All = %v, want %v", relPaths(t, root, got), want)
+	}
+}
+
+// A root that is itself a symlink (a checkout reached through a link) still
+// follows links inside it.
+func TestDiscoveryThroughSymlinkedRoot(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "store")
+	writeContract(t, filepath.Join(real, "a", "t1", "contract.yaml"), "rooted-one")
+	if err := os.Symlink(filepath.Join(real, "a"), filepath.Join(real, "b")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	got, err := New(link).All()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("All = %v, want one contract", got)
+	}
+}
+
+// peek, which list/info/run resolve every contract with, applies Parse's
+// guards: an empty tag or a merge-key bomb is an error, not a crash or a hang
+// (#145).
+func TestPeekGuards(t *testing.T) {
+	bomb := "a0: &m0 {k: v}\n"
+	for i := 1; i <= 30; i++ {
+		bomb += fmt.Sprintf("a%d: &m%d {<<: [*m%d, *m%d, *m%d, *m%d]}\n", i, i, i-1, i-1, i-1, i-1)
+	}
+	for name, doc := range map[string]string{
+		"empty-tag":  "metadata:\n  id: x-one\n  vuln_refs: !x\n  summary: y\n",
+		"flow-tag":   "metadata: {vuln_refs: !x}\n",
+		"seq-tag":    "service: {ports: !!seq}\n",
+		"null-tag":   "metadata: {class: !!null}\n",
+		"merge-bomb": bomb + "metadata: {id: x-one}\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "contract.yaml")
+			if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := peek(path); err == nil {
+				t.Fatal("want an error")
+			}
+		})
 	}
 }
 

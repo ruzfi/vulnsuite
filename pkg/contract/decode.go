@@ -125,8 +125,9 @@ var (
 // Parse decodes and structurally validates a contract document. Semantic lint
 // (is the template *wrong* rather than malformed?) lives in package validator.
 func Parse(data []byte) (*Contract, error) {
-	// Aliases are checked before decoding: goccy expands them (and merge
-	// keys) without a limit, so an alias bomb must be stopped first.
+	// Aliases and tags are checked before decoding: goccy expands aliases
+	// (and merge keys) without a limit, so an alias bomb must be stopped
+	// first, and it has crashed on tags with no value.
 	file, perr := parser.ParseBytes(data, 0)
 	var anchors map[string]ast.Node
 	if perr == nil {
@@ -136,8 +137,8 @@ func Parse(data []byte) (*Contract, error) {
 		}
 	}
 	var raw rawContract
-	if err := yaml.UnmarshalWithOptions(data, &raw, yaml.Strict()); err != nil {
-		return nil, fmt.Errorf("invalid YAML: %s", strings.TrimSpace(yaml.FormatError(err, false, false)))
+	if err := unmarshal(data, &raw, perr, yaml.Strict()); err != nil {
+		return nil, err
 	}
 	if perr != nil { // the decoder reports syntax errors itself; a backstop
 		return nil, fmt.Errorf("invalid YAML: %w", perr)
@@ -187,23 +188,67 @@ func Parse(data []byte) (*Contract, error) {
 	// rejects `context: ""` on an image base like any other foreign key.
 	// Likewise which keys each sidecar writes: `image: ""` or `digest: ""`
 	// next to a build is a key the schema rejects there.
+	// Which keys each state writes: on a source or build base the schema
+	// rejects `image: ""` there like any other image.
 	var keys struct {
 		Base     map[string]any `yaml:"base"`
 		Metadata map[string]any `yaml:"metadata"`
 		Service  struct {
 			Sidecars []map[string]any `yaml:"sidecars"`
 		} `yaml:"service"`
+		States map[string]map[string]any `yaml:"states"`
 	}
-	if err := yaml.Unmarshal(data, &keys); err != nil {
-		return nil, fmt.Errorf("invalid YAML: %s", strings.TrimSpace(yaml.FormatError(err, false, false)))
+	if err := unmarshal(data, &keys, nil); err != nil {
+		return nil, err
 	}
-	if err := c.checkStructure(keys.Base, keys.Service.Sidecars); err != nil {
+	if err := c.checkStructure(keys.Base, keys.Service.Sidecars, keys.States); err != nil {
 		return nil, err
 	}
 	if err := c.Metadata.checkWrittenEmpty(keys.Metadata); err != nil {
 		return nil, err
 	}
 	return c, nil
+}
+
+// DecodeYAML decodes a contract document into v with the guards Parse applies
+// to its own decode, for callers that read only part of a contract (the
+// loader's peek): aliases, merge keys and tags are checked first, so an alias
+// bomb or a tag with no value is an error rather than a hang or a crash, and
+// a panic in the decoder is returned as an error. It does not validate the
+// document; use Parse for that.
+func DecodeYAML(data []byte, v any, opts ...yaml.DecodeOption) error {
+	file, perr := parser.ParseBytes(data, 0)
+	if perr == nil {
+		if _, err := checkAliases(file); err != nil {
+			return err
+		}
+	}
+	if err := unmarshal(data, v, perr, opts...); err != nil {
+		return err
+	}
+	if perr != nil {
+		return fmt.Errorf("invalid YAML: %w", perr)
+	}
+	return nil
+}
+
+// unmarshal runs goccy's decoder, returning its error formatted, and a panic
+// in it (a decoder bug on input the checks before it did not foresee) as an
+// error too: perr, the parser's error if any, or the panic value.
+func unmarshal(data []byte, v any, perr error, opts ...yaml.DecodeOption) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if perr != nil {
+				err = fmt.Errorf("invalid YAML: %w", perr)
+				return
+			}
+			err = fmt.Errorf("invalid YAML: the document could not be decoded (%v)", r)
+		}
+	}()
+	if err := yaml.UnmarshalWithOptions(data, v, opts...); err != nil {
+		return fmt.Errorf("invalid YAML: %s", strings.TrimSpace(yaml.FormatError(err, false, false)))
+	}
+	return nil
 }
 
 // checkWrittenEmpty rejects an enum key written with an empty or null value
@@ -316,9 +361,10 @@ var baseKeys = map[string]map[string]bool{
 }
 
 // checkStructure enforces the same rules as schemas/contract.schema.json.
-// present holds the keys written under base, empty values included, and
-// sidecarKeys those of each service sidecar, in order.
-func (c *Contract) checkStructure(present map[string]any, sidecarKeys []map[string]any) error {
+// present holds the keys written under base, empty values included,
+// sidecarKeys those of each service sidecar, in order, and stateKeys those of
+// each state.
+func (c *Contract) checkStructure(present map[string]any, sidecarKeys []map[string]any, stateKeys map[string]map[string]any) error {
 	if c.APIVersion != APIVersion {
 		return se("apiVersion", "must be %q (got %q)", APIVersion, c.APIVersion)
 	}
@@ -416,6 +462,11 @@ func (c *Contract) checkStructure(present map[string]any, sidecarKeys []map[stri
 	default:
 		return se("base/kind", "%q is not one of image, source, build", b.Kind)
 	}
+	for _, k := range []string{"digest", "dockerfile"} {
+		if v, ok := present[k]; ok && v == "" {
+			return se("base/"+k, "must not be empty; leave the key out instead")
+		}
+	}
 	if b.Digest != "" && !digestRe.MatchString(b.Digest) {
 		return se("base/digest", "must look like sha256:<64 hex>")
 	}
@@ -490,8 +541,13 @@ func (c *Contract) checkStructure(present map[string]any, sidecarKeys []map[stri
 			return se("service/devices", "%q is not an allowed device (allowed: /dev/kvm, /dev/net/tun, /dev/fuse, /dev/vhost-net, /dev/vhost-vsock, /dev/dri/cardN, /dev/dri/renderDN); raw disk/memory and other host devices are never needed for a target", d)
 		}
 	}
-	if s.Healthcheck.Timeout != "" && !timeoutRe.MatchString(s.Healthcheck.Timeout) {
-		return se("service/healthcheck/timeout", "must look like 60s or 5m")
+	if t := s.Healthcheck.Timeout; t != "" {
+		if !timeoutRe.MatchString(t) {
+			return se("service/healthcheck/timeout", "%q must look like 60s or 5m", t)
+		}
+		if d, err := ParseDuration(t, 0); err != nil || d <= 0 || d > MaxHealthcheckTimeout {
+			return se("service/healthcheck/timeout", "%q must be greater than 0 and at most %s", t, fmtDuration(MaxHealthcheckTimeout))
+		}
 	}
 	if san := s.Sanitizer; san != nil {
 		if san.LogDir == "" {
@@ -510,6 +566,8 @@ func (c *Contract) checkStructure(present map[string]any, sidecarKeys []map[stri
 			}
 		} else if sc.Name == "" || sc.Image == "" {
 			return se(loc, "name and image are required")
+		} else if !sidecarNameRe.MatchString(sc.Name) {
+			return se(loc+"/name", "%q must match %s: a sidecar's name is part of its container name and its network alias", sc.Name, sidecarNameRe)
 		}
 		if seenSidecar[sc.Name] {
 			return se(loc+"/name", "sidecar %q is declared more than once", sc.Name)
@@ -552,12 +610,16 @@ func (c *Contract) checkStructure(present map[string]any, sidecarKeys []map[stri
 		// context; nothing runs FROM a state image there, so one would be
 		// silently ignored and "patched" would still be the vulnerable build.
 		if b.Kind != BaseImage {
-			if st.Image != "" {
+			if _, written := stateKeys[name]["image"]; written || st.Image != "" {
 				return se(loc+"/image", "a per-state image applies only to kind: image; a %s base builds every state from its own source, so make the states differ with a patch or overlay", b.Kind)
 			}
 			if st.Digest != "" {
 				return se(loc+"/digest", "pins a per-state image, which applies only to kind: image")
 			}
+		} else if st.Digest != "" && st.Image == "" {
+			// EffectiveImage reads the digest only with the image it pins; on
+			// its own it would be ignored and the state would run the base.
+			return se(loc+"/digest", "pins a per-state image; set image too (the base is pinned by base.digest)")
 		}
 		if st.Patch != "" {
 			if err := checkLocalPath(st.Patch); err != nil {
@@ -645,6 +707,9 @@ func (c *Contract) checkStructure(present map[string]any, sidecarKeys []map[stri
 					return se(ploc+"/net/steps", "at least one step is required")
 				}
 				if err := checkProbeNums(ploc+"/net", p.Net.Port, p.Net.Timeout); err != nil {
+					return err
+				}
+				if err := checkNetReads(ploc+"/net", p.Net.Steps); err != nil {
 					return err
 				}
 			}
@@ -780,6 +845,9 @@ func checkSequence(loc string, s *SequenceProbe) error {
 			if err := checkProbeNums(sloc+"/net", st.Net.Port, st.Net.Timeout); err != nil {
 				return err
 			}
+			if err := checkNetReads(sloc+"/net", st.Net.Steps); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -818,6 +886,28 @@ func checkProbeNums(loc string, port int, timeout float64) error {
 		return se(loc+"/timeout", "must be greater than 0")
 	}
 	return nil
+}
+
+// checkNetReads bounds each net step's read: (0 = the default 4096; an
+// explicit 0 or negative value is rejected by checkNodeType).
+func checkNetReads(loc string, steps []NetStep) error {
+	for i, st := range steps {
+		if st.Read < 0 || st.Read > MaxNetRead {
+			return se(fmt.Sprintf("%s/steps/%d/read", loc, i), "must be 1..%d", MaxNetRead)
+		}
+	}
+	return nil
+}
+
+// fmtDuration prints d in the contract's short form (24h, 90m, 30s).
+func fmtDuration(d time.Duration) string {
+	switch {
+	case d%time.Hour == 0:
+		return fmt.Sprintf("%dh", d/time.Hour)
+	case d%time.Minute == 0:
+		return fmt.Sprintf("%dm", d/time.Minute)
+	}
+	return fmt.Sprintf("%ds", d/time.Second)
 }
 
 // allowedDevices are the host devices a template may pass through (still

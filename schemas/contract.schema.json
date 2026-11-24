@@ -377,7 +377,8 @@
             },
             "timeout": {
               "type": "string",
-              "pattern": "^\\d+[smh]$"
+              "pattern": "^0*[1-9]\\d*[smh]$",
+              "description": "how long to wait for the target to become ready (default 60s): greater than 0 and at most 24h (vulnsuite enforces the upper bound)"
             }
           }
         },
@@ -393,7 +394,9 @@
             "properties": {
               "name": {
                 "type": "string",
-                "minLength": 1
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+                "description": "Part of the sidecar's container name and its network alias (and of a built sidecar's image tag)."
               },
               "image": {
                 "type": "string",
@@ -470,7 +473,6 @@
               },
               "properties": {
                 "name": {
-                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
                   "maxLength": 100
                 }
               }
@@ -618,6 +620,22 @@
     "state": {
       "type": "object",
       "additionalProperties": false,
+      "if": {
+        "required": [
+          "digest"
+        ]
+      },
+      "then": {
+        "description": "A digest pins the state's image override; without image it would be ignored and the state would run the base image.",
+        "required": [
+          "image"
+        ],
+        "properties": {
+          "image": {
+            "minLength": 1
+          }
+        }
+      },
       "properties": {
         "image": {
           "type": "string",
@@ -906,7 +924,9 @@
               },
               "read": {
                 "type": "integer",
-                "description": "bytes to read after this step (default 4096)"
+                "minimum": 1,
+                "maximum": 65536,
+                "description": "bytes to read after this step, 1..65536 (default 4096)"
               },
               "no_read": {
                 "type": "boolean",

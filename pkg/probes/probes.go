@@ -665,9 +665,20 @@ func readUntil(conn net.Conn, max int, expect string, deadline time.Time) string
 	return readUntilFrom(conn, nil, max, expect, deadline)
 }
 
+// maxRead bounds one read, as the contract bounds a net step's read: (the
+// decoder rejects more; this keeps a contract that bypassed it from
+// allocating gigabytes or panicking in make).
+const maxRead = 65536
+
 // readUntilFrom is readUntil continuing from bytes already read (got), which
-// count toward max and toward matching expect.
+// count toward max and toward matching expect. max is clamped to 0..maxRead.
 func readUntilFrom(conn net.Conn, got []byte, max int, expect string, deadline time.Time) string {
+	if max > maxRead {
+		max = maxRead
+	}
+	if max < 0 {
+		max = 0
+	}
 	defer func() { _ = conn.SetReadDeadline(deadline) }()
 	_ = conn.SetReadDeadline(deadline)
 	got = append([]byte(nil), got...)

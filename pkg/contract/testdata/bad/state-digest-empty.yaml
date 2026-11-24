@@ -1,0 +1,21 @@
+# want: states/patched/digest: must not be empty
+apiVersion: vulnsuite/v1
+kind: Target
+metadata:
+  id: demo-bad
+  summary: a contract with one invalid value
+base:
+  kind: image
+  image: nginx:1.27
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+service:
+  ports: [ { container: 80, protocol: http } ]
+states:
+  vulnerable:
+    verify:
+      - http: { path: /, status: 200 }
+  patched:
+    image: nginx:1.28
+    digest: ""
+    verify:
+      - http: { path: /, status: 404 }

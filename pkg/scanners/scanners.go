@@ -50,13 +50,14 @@ func (r Ref) String() string { return r.Scanner + ":" + r.ID }
 // Known reports whether the ref names a recognized scanner.
 func (r Ref) Known() bool { return Known[r.Scanner] }
 
-// ParseRef splits "scanner:id". A bare id is assumed to be nuclei's.
+// ParseRef splits "scanner:id". A bare id is assumed to be nuclei's. Space
+// around the scanner and around the id is ignored ("nuclei: CVE-2021-41773").
 func ParseRef(s string) Ref {
 	scanner, id, ok := strings.Cut(strings.TrimSpace(s), ":")
 	if !ok {
 		return Ref{Scanner: Nuclei, ID: scanner}
 	}
-	return Ref{Scanner: strings.ToLower(scanner), ID: id}
+	return Ref{Scanner: strings.ToLower(strings.TrimSpace(scanner)), ID: strings.TrimSpace(id)}
 }
 
 // Refs parses a contract's detected_by list.

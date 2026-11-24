@@ -1,0 +1,23 @@
+# want: states/patched/sidecars/db/digest: must not be empty
+apiVersion: vulnsuite/v1
+kind: Target
+metadata:
+  id: demo-bad
+  summary: a contract with one invalid value
+base:
+  kind: image
+  image: nginx:1.27
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+service:
+  ports: [ { container: 80, protocol: http } ]
+  sidecars:
+    - { name: db, image: "postgres:16" }
+states:
+  vulnerable:
+    verify:
+      - http: { path: /, status: 200 }
+  patched:
+    sidecars:
+      db: { image: "postgres:17", digest: "" }
+    verify:
+      - http: { path: /, status: 404 }

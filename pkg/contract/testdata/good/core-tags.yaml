@@ -1,0 +1,20 @@
+# Core YAML tags only restate a node's type; they stay accepted (#145).
+apiVersion: !!str vulnsuite/v1
+kind: Target
+metadata:
+  id: demo-core-tags
+  summary: !!str a contract that spells out core YAML tags
+  vuln_refs: !!seq [VS-DEMO-1]
+  primary: !!bool false
+base:
+  kind: image
+  image: nginx:1.27
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+service:
+  ports: !!seq
+  - { container: 80, protocol: http }
+  environment: { MODE: !!str "1" }
+states:
+  vulnerable:
+    verify:
+      - http: { path: /, status: 200, timeout: !!float 2.5 }

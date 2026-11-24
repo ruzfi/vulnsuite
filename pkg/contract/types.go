@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/goccy/go-yaml/ast"
+	"github.com/goccy/go-yaml/token"
 )
 
 // checkDocument enforces what goccy's Strict mode does not: that the input is a
@@ -127,6 +128,9 @@ func (x *expander) walk(n ast.Node) (int, error) {
 		}
 		return count(k)
 	case *ast.TagNode:
+		if err := checkTag(v); err != nil {
+			return 0, err
+		}
 		k, err := x.walk(v.Value)
 		if err != nil {
 			return 0, err
@@ -160,6 +164,99 @@ func (x *expander) walk(n ast.Node) (int, error) {
 	return sum, nil
 }
 
+// coreTags are the YAML tags a contract may carry: the core schema's, which
+// only restate a node's type. Any other tag (a local !x, !!binary,
+// !!timestamp, !!set, ...) has no JSON equivalent for the schema to check.
+var coreTags = map[string]bool{"!!str": true, "!!int": true, "!!float": true, "!!bool": true,
+	"!!null": true, "!!seq": true, "!!map": true}
+
+// checkTag rejects a tag the decoder cannot be trusted with: a tag outside
+// coreTags, and a core tag whose node is missing or of another kind
+// (`ports: !!seq` with nothing after it). goccy parses a tag that ends its
+// line by attaching it to whatever comes next, even a sibling key at the same
+// indentation, and its decoder has crashed on such nodes (#145), so a tagged
+// collection that starts on a later line must be indented under the tag's
+// line, as YAML requires.
+func checkTag(v *ast.TagNode) error {
+	name := v.Start.Value
+	if inner, ok := strings.CutPrefix(name, "!<tag:yaml.org,2002:"); ok {
+		name = "!!" + strings.TrimSuffix(inner, ">")
+	}
+	if !coreTags[name] {
+		return se(lineOf(v), "tag %s is not supported; a contract may use only the core tags !!str, !!int, !!float, !!bool, !!null, !!seq and !!map", v.Start.Value)
+	}
+	val := ast.Node(v.Value)
+	for {
+		a, ok := val.(*ast.AnchorNode)
+		if !ok {
+			break
+		}
+		val = a.Value
+	}
+	if val == nil {
+		return se(lineOf(v), "tag %s has no value", v.Start.Value)
+	}
+	ok := false
+	switch name {
+	case "!!null":
+		_, ok = val.(*ast.NullNode)
+	case "!!bool":
+		_, ok = val.(*ast.BoolNode)
+	case "!!int":
+		_, ok = val.(*ast.IntegerNode)
+	case "!!float":
+		switch val.(type) {
+		case *ast.FloatNode, *ast.IntegerNode, *ast.InfinityNode, *ast.NanNode:
+			ok = true
+		}
+	case "!!str":
+		switch val.(type) {
+		case *ast.StringNode, *ast.LiteralNode, *ast.IntegerNode, *ast.FloatNode, *ast.BoolNode,
+			*ast.InfinityNode, *ast.NanNode:
+			ok = true
+		}
+	case "!!seq":
+		if seq, isSeq := val.(*ast.SequenceNode); isSeq {
+			ok = seq.IsFlowStyle || (len(seq.Values) > 0 && indentedUnder(v, seq.Start, true))
+		}
+	case "!!map":
+		switch m := val.(type) {
+		case *ast.MappingNode:
+			ok = m.IsFlowStyle || (len(m.Values) > 0 && indentedUnder(v, m.Values[0].Key.GetToken(), false))
+		case *ast.MappingValueNode:
+			ok = indentedUnder(v, m.Key.GetToken(), false)
+		}
+	}
+	if !ok {
+		return se(lineOf(v), "tag %s does not match its value (%s)", v.Start.Value, describe(val))
+	}
+	return nil
+}
+
+// indentedUnder reports whether first, the first token of a block collection
+// tagged by tag, sits on the tag's line or is indented under that line (the
+// column of the line's first token). A block sequence that is a mapping's
+// value (seq, on a line that does not start with "-") may also start at that
+// column, as YAML allows `key:\n- a`.
+func indentedUnder(tag *ast.TagNode, first *token.Token, seq bool) bool {
+	if first == nil || first.Position == nil || tag.Start.Position == nil {
+		return false
+	}
+	line := tag.Start.Position.Line
+	if first.Position.Line == line {
+		return true
+	}
+	lead := tag.Start
+	for lead.Prev != nil && lead.Prev.Position != nil && lead.Prev.Position.Line == line {
+		lead = lead.Prev
+	}
+	col := first.Position.Column
+	if seq && lead.Type != token.SequenceEntryType {
+		return col >= lead.Position.Column
+	}
+	return col > lead.Position.Column
+}
+
 // checker type-checks a document; anchors resolves aliases.
 type checker struct {
 	anchors map[string]ast.Node
@@ -172,7 +269,8 @@ var (
 )
 
 // probeTypes are the verify-probe structs whose port, timeout and counts the
-// schema bounds (port 1..65535, timeout > 0, attempts/min_hits/ms >= 1).
+// schema bounds (port 1..65535, timeout > 0, attempts/min_hits/ms >= 1, a net
+// step's read 1..MaxNetRead).
 // Their Go fields are plain numbers where 0 means "the default", so an
 // explicit `port: 0` or `timeout: 0` cannot be told apart from an absent key
 // after decoding; checkNodeType rejects it here, where the key's presence is
@@ -185,10 +283,30 @@ var probeTypes = map[reflect.Type]bool{
 	reflect.TypeOf(SequenceProbe{}): true,
 	reflect.TypeOf(SequenceExec{}):  true,
 	reflect.TypeOf(SleepStep{}):     true,
+	reflect.TypeOf(NetStep{}):       true,
 }
 
 // positiveKeys are the probe keys checkPositive bounds.
-var positiveKeys = map[string]bool{"port": true, "timeout": true, "attempts": true, "min_hits": true, "ms": true}
+var positiveKeys = map[string]bool{"port": true, "timeout": true, "attempts": true, "min_hits": true, "ms": true, "read": true}
+
+// MaxNetRead bounds a net step's read: (bytes).
+const MaxNetRead = 65536
+
+// nonEmptyKeys are the string keys, by the struct they decode into, whose
+// schema pattern rejects an empty string. An empty value decodes like a key
+// left out, so only here, where the key is still visible, can `user: ""` be
+// told apart from no user. (base.digest and base.dockerfile are checked in
+// checkStructure, after the base's foreign keys.)
+var nonEmptyKeys = map[reflect.Type]map[string]bool{
+	reflect.TypeOf(Metadata{}):        {"disclosed": true, "group": true, "variant": true},
+	reflect.TypeOf(RequiresProbe{}):   {"timeout": true},
+	reflect.TypeOf(rawService{}):      {"user": true},
+	reflect.TypeOf(Healthcheck{}):     {"timeout": true},
+	reflect.TypeOf(Sidecar{}):         {"digest": true},
+	reflect.TypeOf(rawState{}):        {"digest": true, "patch": true},
+	reflect.TypeOf(OverlayFile{}):     {"mode": true},
+	reflect.TypeOf(SidecarOverride{}): {"digest": true},
+}
 
 // checkPositive rejects an explicit non-positive probe port or timeout.
 func (c checker) checkPositive(n ast.Node, key, loc string) error {
@@ -213,6 +331,8 @@ func (c checker) checkPositive(n ast.Node, key, loc string) error {
 		return se(loc, "must be greater than 0")
 	case (key == "attempts" || key == "min_hits" || key == "ms") && v < 1:
 		return se(loc, "must be at least 1")
+	case key == "read" && (v < 1 || v > MaxNetRead):
+		return se(loc, "must be 1..%d", MaxNetRead)
 	}
 	return nil
 }
@@ -422,6 +542,11 @@ func (c checker) checkNodeType(n ast.Node, t reflect.Type, loc string) error {
 			}
 			if err := c.checkNodeType(e.Value, f.Type, join(loc, key)); err != nil {
 				return err
+			}
+			if nonEmptyKeys[t][key] {
+				if sn, ok := c.unwrap(e.Value).(ast.ScalarNode); ok && isString(sn) && fmt.Sprint(sn.GetValue()) == "" {
+					return se(join(loc, key), "must not be empty; leave the key out instead")
+				}
 			}
 			if probeTypes[t] && positiveKeys[key] {
 				if err := c.checkPositive(e.Value, key, join(loc, key)); err != nil {
