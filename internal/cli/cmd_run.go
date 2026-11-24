@@ -102,6 +102,11 @@ func checkExposureFlags(fs *flag.FlagSet, exp runner.Exposure) (pinned bool, err
 	if exp.Mode != runner.ModeHost && flagSet(fs, "bind") {
 		return false, usageError{fmt.Sprintf("-bind is used only by -expose host (the mode is %s)", exp.Mode)}
 	}
+	// #146: host and macvlan never create the internal network, so
+	// -no-egress there would leave the target with a route off the host.
+	if exp.Internal && exp.Mode != runner.ModeInternal {
+		return false, usageError{fmt.Sprintf("-no-egress is used only by -expose internal (the mode is %s)", exp.Mode)}
+	}
 	if exp.Mode != runner.ModeMacvlan {
 		for _, name := range []string{"parent", "ip", "subnet", "gateway"} {
 			if flagSet(fs, name) {

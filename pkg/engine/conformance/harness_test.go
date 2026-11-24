@@ -244,6 +244,36 @@ func (h *harness) created(t *testing.T, name string) (entrypoint, cmd []string) 
 	return c.entrypoint, c.cmd
 }
 
+// hardening returns the security options and capability changes a container
+// was created with, as the daemon (or the fake) recorded them. Capabilities
+// lose a "CAP_" prefix: the SDK adds it, and the daemon reads both spellings
+// the same.
+func (h *harness) hardening(t *testing.T, name string) (securityOpt, capAdd, capDrop []string) {
+	t.Helper()
+	if h.f != nil {
+		c, ok := h.f.Containers[name]
+		if !ok {
+			t.Fatalf("no container %s", name)
+		}
+		return c.Spec.SecurityOpt, capNames(c.Spec.CapAdd), capNames(c.Spec.CapDrop)
+	}
+	h.d.mu.Lock()
+	defer h.d.mu.Unlock()
+	c := h.d.container(name)
+	if c == nil {
+		t.Fatalf("no container %s", name)
+	}
+	return c.securityOpt, capNames(c.capAdd), capNames(c.capDrop)
+}
+
+func capNames(caps []string) []string {
+	var out []string
+	for _, c := range caps {
+		out = append(out, strings.TrimPrefix(strings.ToUpper(c), "CAP_"))
+	}
+	return out
+}
+
 // failRemove makes removing container name fail with msg.
 func (h *harness) failContainerRemove(t *testing.T, name, msg string) {
 	if h.f != nil {

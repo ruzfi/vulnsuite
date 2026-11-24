@@ -1,8 +1,11 @@
 package runner
 
 import (
+	"context"
 	"strings"
 	"testing"
+
+	"github.com/ruzfi/vulnsuite/pkg/contract"
 )
 
 // Hand-written fixtures in the formats ASan (gcc's libasan and clang's
@@ -247,5 +250,86 @@ func TestLinesAfter(t *testing.T) {
 				t.Errorf("linesAfter = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// #146: UndefinedBehaviorSanitizer reports ("file:line: runtime error: ...",
+// with or without a stack, and a SUMMARY alone) are parsed, so
+// expect_sanitizer: none fails over them under -fsanitize=address,undefined.
+func TestParseUBSanReports(t *testing.T) {
+	const withStack = "/src/calc.c:12:9: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'\n" +
+		"    #0 0x55d1 in add /src/calc.c:12:9\n    #1 0x55d2 in main /src/calc.c:30:3\n\n" +
+		"SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior /src/calc.c:12:9 in \n"
+	const bare = "/src/shift.c:4:14: runtime error: shift exponent 40 is too large for 32-bit type 'int'\n"
+	const summaryOnly = "SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior /src/idx.c:7:3 in \n"
+	const goPanic = "panic: runtime error: index out of range [5] with length 3\n"
+
+	rs := ParseSanitizerReports(asanResolverUAF + withStack + bare + summaryOnly + goPanic)
+	if len(rs) != 4 {
+		t.Fatalf("%d reports: %+v", len(rs), rs)
+	}
+	if rs[0].Sanitizer != "AddressSanitizer" || rs[0].Kind != "heap-use-after-free" {
+		t.Fatalf("the ASan report before the UBSan ones changed: %+v", rs[0])
+	}
+	ub := rs[1]
+	if ub.Sanitizer != "UndefinedBehaviorSanitizer" || ub.Kind != "undefined-behavior" || !strings.HasPrefix(ub.Description, "signed integer overflow: 2147483647") {
+		t.Fatalf("with stack: %+v", ub)
+	}
+	for _, k := range []string{"undefined-behavior", "signed-integer-overflow", "overflow"} {
+		if !ub.MatchesKind(k) {
+			t.Errorf("MatchesKind(%q) = false", k)
+		}
+	}
+	if ub.MatchesKind("heap-use-after-free") {
+		t.Error("a UBSan report matched an ASan kind")
+	}
+	if len(ub.Frames) != 2 || ub.Frames[0].String() != "add calc.c:12:9" {
+		t.Fatalf("with stack frames: %+v", ub.Frames)
+	}
+	if f, ok := ub.MatchFrame("^add "); !ok || f.Func != "add" {
+		t.Fatalf("MatchFrame: %+v %v", f, ok)
+	}
+	// Without print_stacktrace the header's location is the only frame.
+	b := rs[2]
+	if b.Kind != "undefined-behavior" || !b.MatchesKind("shift-exponent") || len(b.Frames) != 1 || b.Frames[0].String() != "shift.c:4:14" {
+		t.Fatalf("bare: %+v", b)
+	}
+	if _, ok := b.MatchFrame(`shift\.c:4`); !ok {
+		t.Fatal("bare report's location does not match a frame regexp")
+	}
+	if s := b.Summary(); s != "undefined-behavior at shift.c:4:14" {
+		t.Fatalf("summary %q", s)
+	}
+	// A SUMMARY alone (report_error_type, or the header cut off).
+	so := rs[3]
+	if so.Sanitizer != "UndefinedBehaviorSanitizer" || so.Kind != "undefined-behavior" || len(so.Frames) != 1 || so.Frames[0].Location != "/src/idx.c:7:3" {
+		t.Fatalf("summary only: %+v", so)
+	}
+	if rs := ParseSanitizerReports(goPanic); len(rs) != 0 {
+		t.Fatalf("a Go panic parsed as a UBSan report: %+v", rs)
+	}
+}
+
+// #146: under -fsanitize=address,undefined, a UBSan report written during
+// the attempt fails expect_sanitizer: none, and a positive step can expect it.
+func TestSequenceUBSanReport(t *testing.T) {
+	const report = "/src/calc.c:12:9: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'\n" +
+		"SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior /src/calc.c:12:9 in \n"
+	f := newSeqFix(t)
+	pid := 40
+	f.setExec(func(_, cmd string) (int, string, error) {
+		if cmd == "/trigger fire" {
+			pid++
+			f.report(pid, report)
+		}
+		return 0, "", nil
+	})
+	r := f.run(context.Background(), &contract.SequenceProbe{Steps: raceSteps(expectNone())})
+	if r.OK || outcomes(r) != "fail" || !strings.Contains(r.Detail, "sanitizer report: undefined-behavior at calc.c:12:9") {
+		t.Fatalf("none passed over a UBSan report: %+v", r)
+	}
+	r = f.run(context.Background(), &contract.SequenceProbe{Steps: raceSteps(expectHit("signed-integer-overflow", `calc\.c:12`))})
+	if !r.OK || outcomes(r) != "hit" {
+		t.Fatalf("positive UBSan step: %+v", r)
 	}
 }

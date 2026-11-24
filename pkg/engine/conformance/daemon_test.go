@@ -67,13 +67,16 @@ type stubContainer struct {
 	id, name, image string
 	labels          map[string]string
 	entrypoint, cmd []string
-	ports           []stubPort
-	networks        map[string]*stubEndpoint // network name -> endpoint
-	started         bool
-	running         bool
-	paused          bool
-	exitCode        int
-	files           map[string]stubFile // absolute clean path -> file
+	// securityOpt, capAdd and capDrop are the HostConfig fields of the same
+	// names, as the client sent them.
+	securityOpt, capAdd, capDrop []string
+	ports                        []stubPort
+	networks                     map[string]*stubEndpoint // network name -> endpoint
+	started                      bool
+	running                      bool
+	paused                       bool
+	exitCode                     int
+	files                        map[string]stubFile // absolute clean path -> file
 }
 
 // stubFile is a file in a stub container's filesystem: a regular file, a
@@ -592,6 +595,9 @@ func (d *daemon) containerCreate(w http.ResponseWriter, r *http.Request) {
 		HostConfig struct {
 			NetworkMode  string
 			PortBindings map[string][]struct{ HostIp, HostPort string }
+			SecurityOpt  []string
+			CapAdd       []string
+			CapDrop      []string
 		}
 		NetworkingConfig struct {
 			EndpointsConfig map[string]struct {
@@ -624,7 +630,8 @@ func (d *daemon) containerCreate(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusNotFound, "network %s not found", mode)
 		return
 	}
-	c := &stubContainer{id: d.newID(), name: name, image: body.Image, labels: body.Labels, entrypoint: body.Entrypoint, cmd: body.Cmd, networks: map[string]*stubEndpoint{}}
+	c := &stubContainer{id: d.newID(), name: name, image: body.Image, labels: body.Labels, entrypoint: body.Entrypoint, cmd: body.Cmd, networks: map[string]*stubEndpoint{},
+		securityOpt: body.HostConfig.SecurityOpt, capAdd: body.HostConfig.CapAdd, capDrop: body.HostConfig.CapDrop}
 	if c.name == "" {
 		c.name = "auto_" + c.id[:6]
 	}

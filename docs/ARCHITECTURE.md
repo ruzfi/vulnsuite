@@ -66,8 +66,8 @@ probes are skipped with an explanation.
 complete vulnerable (or patched) target on its own; the runner also passes
 the environment at run time for `image` kinds, which are never rebuilt.
 
-**Hardening baseline, not paranoia.** `no-new-privileges` plus Docker's
-default capability set. `cap-drop ALL` breaks stock server images on boot;
+**Hardening baseline, not paranoia.** `no-new-privileges` (for targets and
+sidecars alike) plus Docker's default capability set. `cap-drop ALL` breaks stock server images on boot;
 the isolation that matters for a knowingly-vulnerable target is the network
 (`-no-egress`) and the host it runs on. Templates can tighten per target.
 

@@ -696,19 +696,42 @@ func stepPIDFile() string {
 // trackStepPID wraps an exec step's command so that its PID is in pidFile
 // while it runs (and the file is gone once it ended), for killStep. The
 // command still runs under sh -c with the same output and exit code.
+//
+// #146: when the image has setsid, the command runs in a session (and so a
+// process group) of its own, and the file marks it with "g" so killStep can
+// kill the whole group. A background job of a non-interactive sh is never a
+// group leader, so setsid execs in place and $! is the group's ID.
 func trackStepPID(command, pidFile string) string {
-	f := shellQuote(pidFile)
-	return fmt.Sprintf(`sh -c %s & p=$!; echo "$p" > %s; wait "$p"; rc=$?; rm -f %s; exit "$rc"`, shellQuote(command), f, f)
+	f, c := shellQuote(pidFile), shellQuote(command)
+	return fmt.Sprintf(`if command -v setsid >/dev/null 2>&1; then setsid sh -c %s & p=$!; g=g; else sh -c %s & p=$!; g=; fi; `+
+		`echo "$p $g" > %s; wait "$p"; rc=$?; rm -f %s; exit "$rc"`, c, c, f, f)
 }
 
-// killStep kills an exec step that may still be running, by its PID file,
-// on a context of its own (the attempt's may be over).
+// killStepScript kills the process tree of the step whose PID file is
+// pidFile. POSIX sh builtins plus /proc only (busybox works): it stops the
+// step and every descendant found by walking /proc/<pid>/status PPid lines,
+// so nothing forks or reparents while it looks, then kills the step's process
+// group (when setsid made one) and every process it found.
+func killStepScript(pidFile string) string {
+	f := shellQuote(pidFile)
+	return fmt.Sprintf(`[ -r %s ] || exit 0; read -r p g < %s; rm -f %s; [ -n "$p" ] || exit 0; `+
+		`kill -s STOP "$p" 2>/dev/null; t=" $p "; n=1; `+
+		`while [ "$n" = 1 ]; do n=0; for s in /proc/[0-9]*/status; do `+
+		`c=${s#/proc/}; c=${c%%/status}; case "$t" in *" $c "*) continue;; esac; `+
+		`pp=; while read -r k v; do [ "$k" = PPid: ] && { pp=$v; break; }; done 2>/dev/null < "$s"; `+
+		`case "$t" in *" $pp "*) t="$t$c "; kill -s STOP "$c" 2>/dev/null; n=1;; esac; `+
+		`done; done; `+
+		`[ "$g" = g ] && kill -s KILL -- "-$p" 2>/dev/null; `+
+		`for c in $t; do kill -s KILL "$c" 2>/dev/null; done; exit 0`, f, f, f)
+}
+
+// killStep kills an exec step that may still be running, with its whole
+// process tree, by its PID file, on a context of its own (the attempt's may
+// be over).
 func (x *sequenceExec) killStep(parent context.Context, container, pidFile string) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), killStepTimeout)
 	defer cancel()
-	f := shellQuote(pidFile)
-	_, _, _ = x.r.Engine.ContainerExec(ctx, container,
-		fmt.Sprintf(`p=$(cat %s 2>/dev/null) && kill -9 "$p" 2>/dev/null; rm -f %s`, f, f), killStepTimeout)
+	_, _, _ = x.r.Engine.ContainerExec(ctx, container, killStepScript(pidFile), killStepTimeout)
 }
 
 // sidecarDetail names the sidecar an exec step ran in.

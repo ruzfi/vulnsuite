@@ -12,17 +12,19 @@ import (
 // `ERROR: <Name>Sanitizer: <description>` header (AddressSanitizer,
 // LeakSanitizer, and others in the same format), or the
 // `WARNING: ThreadSanitizer: ...` / `WARNING: MemorySanitizer: ...` header
-// those two print.
+// those two print, or an UndefinedBehaviorSanitizer
+// `file:line:col: runtime error: <description>` line (or its SUMMARY alone).
 type SanitizerReport struct {
 	// Sanitizer is the runtime's name, e.g. "AddressSanitizer".
 	Sanitizer string
 	// Kind is the bug class: the SUMMARY line's (e.g. "heap-use-after-free",
 	// "double-free", "data-race") when the report has one, else taken from
 	// the header's description: its first word, its leading words joined by
-	// "-" for ThreadSanitizer ("data race" is "data-race"), and "leak" for
-	// LeakSanitizer.
+	// "-" for ThreadSanitizer ("data race" is "data-race"), "leak" for
+	// LeakSanitizer, and "undefined-behavior" for UndefinedBehaviorSanitizer.
 	Kind string
-	// Description is the ERROR line after "<Sanitizer>: ".
+	// Description is the ERROR line after "<Sanitizer>: " (for UBSan, the
+	// text after "runtime error: ").
 	Description string
 	// Frames is the report's first stack (the faulting access), in order.
 	Frames []StackFrame
@@ -53,12 +55,20 @@ var (
 	sanFrameRe   = regexp.MustCompile(`^\s*#\d+\s+(?:0x[0-9a-fA-F]+(?:\s+|$))?(.*)$`)
 	sanModuleRe  = regexp.MustCompile(`\s+\([^()\s]+\+0x[0-9a-fA-F]+\)$`)
 	sanBuildIDRe = regexp.MustCompile(`\s+\(BuildId: [0-9a-fA-F]+\)\s*$`)
+	// UndefinedBehaviorSanitizer heads a report with the source location:
+	// "/src/x.c:12:5: runtime error: signed integer overflow: ...". The
+	// location must look like one, so a Go "panic: runtime error:" is not it.
+	ubsanErrorRe = regexp.MustCompile(`^\s*(?:==\d+==\s*)?(\S+:\d+(?::\d+)?|<unknown>): runtime error: (.*)$`)
 )
+
+// ubsan is UndefinedBehaviorSanitizer's name in its SUMMARY line.
+const ubsan = "UndefinedBehaviorSanitizer"
 
 // ParseSanitizerReports reads every report in a sanitizer log: each starts at
 // an `ERROR: <Sanitizer>: <description>` line, or a ThreadSanitizer or
 // MemorySanitizer `WARNING: <Sanitizer>: <description>` line (the `==pid==`
-// prefix is optional), and its first stack is the first run of `#N 0x...` frame lines
+// prefix is optional), or an UndefinedBehaviorSanitizer
+// `<file:line[:col]>: runtime error: <description>` line, and its first stack is the first run of `#N 0x...` frame lines
 // after it, up to the first line that is not a frame (the blank line before
 // the next section). A report cut short (still being written, or capped)
 // yields what is there.
@@ -66,14 +76,20 @@ func ParseSanitizerReports(text string) []SanitizerReport {
 	var out []SanitizerReport
 	var cur *SanitizerReport
 	inStack, stackDone := false, false
+	// UBSan prints a stack only with print_stacktrace=1; without one, its
+	// header's source location is the report's only frame.
+	var ubsanLoc string
 	flush := func() {
 		if cur != nil {
 			if cur.summaryKind != "" {
 				cur.Kind = cur.summaryKind
 			}
+			if cur.Sanitizer == ubsan && len(cur.Frames) == 0 && ubsanLoc != "" && ubsanLoc != "<unknown>" {
+				cur.Frames = []StackFrame{{Location: ubsanLoc, Text: ubsanLoc}}
+			}
 			out = append(out, *cur)
 		}
-		cur = nil
+		cur, ubsanLoc = nil, ""
 	}
 	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimRight(line, "\r")
@@ -85,10 +101,34 @@ func ParseSanitizerReports(text string) []SanitizerReport {
 			inStack, stackDone = false, false
 			continue
 		}
+		if m := ubsanErrorRe.FindStringSubmatch(line); m != nil {
+			flush()
+			desc := strings.TrimSpace(m[2])
+			cur = &SanitizerReport{Sanitizer: ubsan, Kind: headerKind(ubsan, desc), Description: desc}
+			ubsanLoc = m[1]
+			inStack, stackDone = false, false
+			continue
+		}
+		summary := sanSummaryRe.FindStringSubmatch(strings.TrimSpace(line))
+		if summary != nil && summary[1] == ubsan {
+			loc := "" // "undefined-behavior /src/x.c:12:5 in"
+			if f := strings.Fields(summary[2]); len(f) > 1 {
+				loc = f[1]
+			}
+			if cur == nil || cur.Sanitizer != ubsan || cur.summaryKind != "" || (loc != "" && loc != ubsanLoc) {
+				// A UBSan SUMMARY without its own header (the header cut
+				// off) is a report of its own, never a second summary of
+				// the report before it or one about another location.
+				flush()
+				cur = &SanitizerReport{Sanitizer: ubsan, Kind: headerKind(ubsan, "")}
+				ubsanLoc = loc
+				inStack, stackDone = false, true
+			}
+		}
 		if cur == nil {
 			continue
 		}
-		if m := sanSummaryRe.FindStringSubmatch(strings.TrimSpace(line)); m != nil {
+		if m := summary; m != nil {
 			// "heap-use-after-free /src/x.c:12 in f", "data race ...";
 			// LeakSanitizer's "64 byte(s) leaked ..." names no class.
 			words := 1
@@ -122,6 +162,8 @@ func headerKind(sanitizer, desc string) string {
 		return "leak" // "detected memory leaks"
 	case "ThreadSanitizer":
 		return phraseKind(desc, -1) // "data race (pid=7)"
+	case ubsan:
+		return "undefined-behavior" // as its SUMMARY says
 	}
 	return phraseKind(desc, 1)
 }
@@ -179,16 +221,25 @@ func (f StackFrame) String() string {
 
 // MatchesKind reports whether the report is of bug class kind: its SUMMARY
 // class, or a word of its ERROR description before the address ("attempting
-// double-free on 0x..." is a double-free). Case does not matter.
+// double-free on 0x..." is a double-free). For UndefinedBehaviorSanitizer
+// the description's leading phrase joined by "-" matches too ("signed
+// integer overflow: ..." is a signed-integer-overflow, "shift exponent 40 is
+// too large" a shift-exponent). Case does not matter.
 func (r SanitizerReport) MatchesKind(kind string) bool {
 	if strings.EqualFold(r.Kind, kind) || strings.EqualFold(r.summaryKind, kind) {
 		return true
+	}
+	if r.Sanitizer == ubsan {
+		phrase, _, _ := strings.Cut(r.Description, ":")
+		if p := phraseKind(phrase, -1); p != "" && strings.EqualFold(p, kind) {
+			return true
+		}
 	}
 	for _, w := range strings.Fields(r.Description) {
 		if w == "on" || w == "at" || strings.HasPrefix(w, "0x") || strings.HasPrefix(w, "(") {
 			break
 		}
-		if strings.EqualFold(w, kind) {
+		if strings.EqualFold(strings.TrimSuffix(w, ":"), kind) {
 			return true
 		}
 	}

@@ -82,6 +82,8 @@ type Fake struct {
 	Containers     map[string]*Container
 	Networks       map[string]engine.NetworkSpec
 	Execs          []string
+	// ExecTimeouts holds the timeout of each recorded exec, parallel to Execs.
+	ExecTimeouts []time.Duration
 	// Calls logs, in order, every successful ContainerPause ("pause <c>"),
 	// ContainerExec ("exec <c>: <command>") and ContainerUnpause
 	// ("unpause <c>"), with <c> the container as the caller named it, so a
@@ -567,7 +569,7 @@ func (f *Fake) ContainerInspect(ctx context.Context, id string) (*engine.Contain
 	return d, nil
 }
 
-func (f *Fake) ContainerExec(ctx context.Context, id, command string, _ time.Duration) (int, string, error) {
+func (f *Fake) ContainerExec(ctx context.Context, id, command string, timeout time.Duration) (int, string, error) {
 	if err := ctx.Err(); err != nil {
 		return -1, "", err
 	}
@@ -584,6 +586,7 @@ func (f *Fake) ContainerExec(ctx context.Context, id, command string, _ time.Dur
 		return -1, "", fmt.Errorf("Container %s is paused, unpause the container before exec", id)
 	}
 	f.Execs = append(f.Execs, id+": "+command)
+	f.ExecTimeouts = append(f.ExecTimeouts, timeout)
 	f.Calls = append(f.Calls, "exec "+id+": "+command)
 	fn := f.ExecFn
 	f.mu.Unlock()

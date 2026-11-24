@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -256,5 +257,56 @@ func TestUnreachableTargetShortTimeoutStillChecksInside(t *testing.T) {
 	}
 	if len(fe.Execs) == 0 || !isHealthcheck(fe.Execs[0]) {
 		t.Fatalf("the in-container healthcheck did not run: %v", fe.Execs)
+	}
+}
+
+// #146: an inside healthcheck whose exec times out (a hung service) is not
+// ready; only a missing shell falls back to "ready once it runs".
+func TestInsideHealthcheckTimeoutIsNotReady(t *testing.T) {
+	for name, tc := range map[string]struct {
+		code  int
+		err   error
+		ready bool
+	}{
+		"exec timed out":     {-1, fmt.Errorf("exec timed out: %w", context.DeadlineExceeded), false},
+		"exec cancelled":     {-1, fmt.Errorf("exec timed out: %w", context.Canceled), false},
+		"other daemon error": {-1, errors.New("Error response from daemon: connection reset"), false},
+		"killed check":       {137, nil, false},
+		"exit 126":           {126, nil, true},
+		"exit 127":           {127, nil, true},
+		"no sh on PATH":      {-1, errors.New(`OCI runtime exec failed: exec failed: unable to start container process: exec: "sh": executable file not found in $PATH`), true},
+		"no /proc/net/tcp":   {insideCannot, nil, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fe := enginetest.New()
+			fe.ExecFn = func(string, string) (int, string, error) { return tc.code, "", tc.err }
+			r := unreachableRunner(fe)
+			c := load(t, "redis-unauthenticated-access")
+			h, err := r.Run(context.Background(), c, "vulnerable", DefaultExposure(), Options{ReadyTimeout: 1500 * time.Millisecond, Build: builder.Options{Pull: true}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if h.Ready != tc.ready {
+				t.Fatalf("ready = %v, want %v (%s)", h.Ready, tc.ready, h.ReadyDetail)
+			}
+		})
+	}
+}
+
+// #146: the exec around the inside http check outlives curl's --max-time, so
+// a slow service ends in curl's 000 (not ready) rather than an exec timeout.
+func TestInsideHealthcheckExecTimeoutExceedsCurl(t *testing.T) {
+	fe := enginetest.New()
+	r := unreachableRunner(fe)
+	c := load(t, "redis-unauthenticated-access")
+	h, err := r.Run(context.Background(), c, "vulnerable", DefaultExposure(), Options{ReadyTimeout: 100 * time.Millisecond, Build: builder.Options{Pull: true}})
+	if err != nil || !h.Ready {
+		t.Fatalf("run: %v, ready %v", err, h != nil && h.Ready)
+	}
+	if len(fe.ExecTimeouts) == 0 || fe.ExecTimeouts[0] <= insideCurlMaxTime {
+		t.Fatalf("exec timeouts %v must exceed curl's %s", fe.ExecTimeouts, insideCurlMaxTime)
+	}
+	if s := httpScript("http", 80, "/", 200); !strings.Contains(s, fmt.Sprintf("--max-time %d ", int(insideCurlMaxTime/time.Second))) {
+		t.Fatalf("curl max time not from insideCurlMaxTime: %s", s)
 	}
 }
