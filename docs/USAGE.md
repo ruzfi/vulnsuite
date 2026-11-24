@@ -22,7 +22,8 @@ packages behind the CLI see [ARCHITECTURE.md](ARCHITECTURE.md).
 ## Commands
 
 ```text
-vulnsuite list [selector...] [filters] [-group H] [-variants] [-runnable]  list and filter templates (aliases: ls, search)
+vulnsuite list [selector...] [filters] [-variants] [-runnable]   list and filter templates (aliases: ls, search)
+vulnsuite list -group H [filters] [-runnable]                    one variant group (no selectors alongside)
 vulnsuite info <selector>                                        states, build kinds, probes, scanner templates (alias: show)
 vulnsuite validate [-t SEL]... [-strict] [-allow-unpinned]       structure + semantic lint
 vulnsuite build [vulnerable|patched] -t SEL... | -f FILE | <filters> | -all [-variants] [-j N] [-push -registry REG]
@@ -78,7 +79,15 @@ any subfolder: the git root, or the directory holding the
   (`origin/HEAD`, else `main`), fast-forwarding it; it refuses instead while
   tracked files have uncommitted changes or the detached HEAD has commits no
   branch or tag keeps. A checkout is never replaced, so the update fails if
-  `git` is not on `PATH`;
+  `git` is not on `PATH`. A checkout found from the working directory (not
+  named with `-templates` or `$VULNSUITE_TEMPLATES`) is updated only when its
+  `origin` is `ruzfi/vulnsuite-templates` or the `-repo` you pass (any URL
+  form: https, ssh, `git@host:owner/name.git`); otherwise update-templates
+  refuses and touches nothing, so running it inside an application
+  repository that happens to hold a vulnsuite contract never pulls or checks
+  out that repository. Name the checkout with `-templates DIR` to update it
+  regardless. `-repo` on a checkout must name its `origin` (change the
+  remote with `git remote set-url origin` instead);
 - anything else is replaced by the GitHub archive of `-ref` (default `main`),
   but only when the directory is missing, empty, or was installed by
   `update-templates` (it has a `.vulnsuite-templates-version` marker). Any other
@@ -156,7 +165,7 @@ every member:
 vulnsuite run -t php2shell                 # just the primary
 vulnsuite run -t php2shell -variants       # every member of the family
 vulnsuite run -t php2shell-waf-evasion     # one exact variant (an id; -variants is a no-op)
-vulnsuite list -group php2shell            # the whole family, one row per member
+vulnsuite list -group php2shell            # the whole family, one row per member (no selectors alongside: a usage error)
 vulnsuite info php2shell                   # the family: primary + each variant
 ```
 
@@ -219,6 +228,10 @@ suite:web-basics     # pull in a named suite
 A **suite** is a named selectors file (`<templates>/suites/<name>.txt`, same
 format) reached explicitly with `-t suite:<name>` or a `suite:` line in a file —
 never by a bare handle, so standing up a whole curated set is always deliberate.
+Every command that takes selectors resolves `suite:<name>` the same way:
+`run`, `build`, `stamp`, `stop -t suite:<name>`, `validate -t suite:<name>`,
+`list suite:<name>` and `info suite:<name>` (which lists the suite's targets,
+or shows the one target a single-target suite selects).
 A mistake in a `-f` or suite file — a selector that matches nothing, a bad
 filter line — is reported as `file:line: ...`.
 A group handle inside a suite resolves to its primary, or to all members when you
@@ -565,6 +578,10 @@ emulated `platform` if any, the `requires.cpu_flags` it checked, the states)
 and set `verification: verified`. Only those lines of the contract change (a
 comment on the `verification:` line goes with it: it said why the target was
 unverified).
+
+As with `build` ("nothing to build"), a selection that matches no template
+fails with `nothing to stamp` (exit 1) instead of succeeding having stamped
+nothing.
 
 The run proves the contract as it was loaded, so `stamp` checks the file again
 before writing: if anything but `verification` and `verified_on` changed

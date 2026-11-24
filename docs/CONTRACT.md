@@ -86,7 +86,15 @@ base: { kind: build, context: src, dockerfile: Dockerfile, build_args: {} }
   `docker manifest inspect <image> -v | grep -m1 digest` or `docker buildx imagetools inspect <image>`.
 - `source` pins `commit` to a full 40-character (or 64-character SHA-256)
   commit id; a branch or tag is unpinned, an abbreviated id a `short-commit`
-  warning. The state's `patch` is applied on top.
+  warning. The state's `patch` is applied on top. The repository is cloned
+  and checked out with LF line endings on every host (`core.autocrlf=false`,
+  `core.eol=lf`), so a Windows git configured for CRLF does not rewrite its
+  scripts. A patch is applied with `git apply`, which allows no fuzz; when
+  that fails and GNU patch is on `PATH`, it is retried with GNU patch, which
+  applies with fuzz and refuses absolute paths, `..` and writes through a
+  symbolic link (patch files with absolute or `..` targets are rejected
+  before either runs). Without GNU patch (BSD patch on macOS) the build fails
+  with `git apply`'s error.
 - Per-state `image` overrides and every sidecar image (`service.sidecars`
   and per-state `sidecars` overrides) must pin `digest` too
   (`unpinned-state-image`, `unpinned-sidecar`; `-allow-unpinned` downgrades
@@ -464,6 +472,9 @@ own:
   (nested ones too, like the content hash) is left out, and a
   `.dockerignore` at the context root is honoured with Docker's pattern rules.
   The Dockerfile and `.dockerignore` are always sent, as with `docker build`.
+  File modes travel as they are on disk, except from Windows, which has no
+  exec bit: there every entry is sent as `(mode & 0755) | 0111`, as the
+  Docker CLI does, so an `entrypoint.sh` stays executable.
 - `overlay[].dest` is a plain path: letters, digits and `. _ @ % + = : , / -`,
   no whitespace, quotes, `$` or control characters, no `..` segments, and not
   `/` itself. It names the file, so it may not end in `/` or `/.` (an `image`

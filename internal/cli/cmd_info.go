@@ -38,7 +38,10 @@ scanner templates (nuclei:<id>) should fire on it. With a nuclei-templates
 checkout available ($NUCLEI_TEMPLATES, ~/nuclei-templates or -nuclei-templates)
 the ids are resolved to files and templates matching the target's CVEs are
 suggested. When nothing is linked, that is a detection gap worth closing by
-writing a template and contributing it upstream.`,
+writing a template and contributing it upstream.
+
+A group handle prints the family; suite:<name> lists the suite's targets (or,
+when it selects one, shows that target).`,
 		Flags: func(fs *flag.FlagSet) {
 			fs.StringVar(&nucleiDir, "nuclei-templates", "", "nuclei-templates checkout")
 		},
@@ -53,14 +56,33 @@ writing a template and contributing it upstream.`,
 			if err != nil {
 				return err
 			}
-			// A selector that names a multi-member group prints the family
-			// (primary + variants) rather than a single target's detail.
-			if members, ok, gerr := store.GroupMembers(args[0]); gerr == nil && ok && len(members) > 1 {
-				return printFamily(g, store, args[0], members)
-			}
-			c, err := store.LoadSelector(args[0])
-			if err != nil {
-				return err
+			// A suite resolves as run/build/stamp resolve it: one target
+			// prints its detail, several print the suite's members.
+			var c *contract.Contract
+			if name, ok := suiteHandle(args[0]); ok {
+				paths, err := resolveTargets(ctx, store, args[:1], nil, false, false, filters{})
+				if err != nil {
+					return err
+				}
+				switch len(paths) {
+				case 0:
+					return fmt.Errorf("suite %q selects no templates", name)
+				case 1:
+					if c, err = store.Load(paths[0]); err != nil {
+						return err
+					}
+				default:
+					return printSuite(g, store, name, paths)
+				}
+			} else {
+				// A selector that names a multi-member group prints the family
+				// (primary + variants) rather than a single target's detail.
+				if members, ok, gerr := store.GroupMembers(args[0]); gerr == nil && ok && len(members) > 1 {
+					return printFamily(g, store, args[0], members)
+				}
+				if c, err = store.LoadSelector(args[0]); err != nil {
+					return err
+				}
 			}
 			var idx *scanners.Index
 			if dir := scanners.ResolveDir(nucleiDir); dir != "" {
@@ -191,6 +213,40 @@ func printFamily(g *Global, store *loader.Store, handle string, members []loader
 			}
 		}
 		fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\t%s\n", dash(label), m.ID, dash(m.Severity), dash(strings.Join(m.VulnRefs, ",")), m.Summary)
+	}
+	tw.Flush()
+	fmt.Fprintf(g.Stdout, "\nInspect one with:  vulnsuite info <id>\n")
+	return nil
+}
+
+// printSuite renders a suite that selects several targets: one row each.
+func printSuite(g *Global, store *loader.Store, name string, paths []string) error {
+	type suiteOut struct {
+		Suite   string         `json:"suite"`
+		Members []familyMember `json:"members"`
+	}
+	out := suiteOut{Suite: name, Members: []familyMember{}}
+	for _, p := range paths {
+		c, err := store.Load(p)
+		if err != nil {
+			out.Members = append(out.Members, familyMember{ID: fallbackID(p), Summary: "(unloadable: " + err.Error() + ")"})
+			continue
+		}
+		out.Members = append(out.Members, familyMember{
+			ID: c.ID(), Variant: c.Variant(),
+			Severity: c.Metadata.Severity, Class: c.Classes(),
+			VulnRefs: c.Metadata.VulnRefs, Summary: c.Metadata.Summary,
+		})
+	}
+	if g.JSON {
+		return g.emitJSON(out)
+	}
+	fmt.Fprintf(g.Stdout, "%s%s  (suite, %d targets)\n", suitePrefix, name, len(out.Members))
+	fmt.Fprintf(g.Stdout, "  `-t %s%s` runs every one of them.\n\n", suitePrefix, name)
+	tw := tabwriter.NewWriter(g.Stdout, 2, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "  ID\tSEV\tREFS\tSUMMARY")
+	for _, m := range out.Members {
+		fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\n", m.ID, dash(m.Severity), dash(strings.Join(m.VulnRefs, ",")), m.Summary)
 	}
 	tw.Flush()
 	fmt.Fprintf(g.Stdout, "\nInspect one with:  vulnsuite info <id>\n")

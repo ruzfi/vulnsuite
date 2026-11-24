@@ -130,6 +130,11 @@ Targets run one at a time, and each state is torn down before the next.`,
 				}
 				return fmt.Errorf("%d template(s) failed to load", len(loadErrs))
 			}
+			if len(cs) == 0 {
+				// As build: a selection that matches nothing is a failure,
+				// not a silent success that stamped nothing.
+				return fmt.Errorf("nothing to stamp")
+			}
 			eng, err := g.Engine(ctx)
 			if err != nil {
 				return err

@@ -10,6 +10,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -71,7 +72,7 @@ func (m *buildContext) readFile(name string) (memFile, bool, error) {
 	if err != nil {
 		return memFile{}, false, err
 	}
-	return memFile{data: data, mode: int64(info.Mode().Perm())}, true, nil
+	return memFile{data: data, mode: int64(contextPerm(info.Mode().Perm(), runtime.GOOS))}, true, nil
 }
 
 // stream writes the context as a tar through a pipe. dockerfile is the
@@ -182,7 +183,7 @@ func (m *buildContext) walkTree(tw *tar.Writer, ign *dockerignore, keep map[stri
 			return err
 		}
 		// No ModTime: the context (and so the build cache) depends on content only.
-		hdr := &tar.Header{Name: name, Mode: int64(info.Mode().Perm())}
+		hdr := &tar.Header{Name: name, Mode: int64(contextPerm(info.Mode().Perm(), runtime.GOOS))}
 		switch {
 		case info.IsDir():
 			hdr.Typeflag, hdr.Name = tar.TypeDir, name+"/"
@@ -294,4 +295,16 @@ func escapeToken(dockerfile []byte) rune {
 		}
 	}
 	return '\\'
+}
+
+// contextPerm is the permission a build-context entry carries. Windows has
+// no exec bit (Go reports 0666 for a file, 0777 for a directory), so, as the
+// Docker CLI does (chmodTarEntry in its archive package), every
+// entry is made executable there and loses its group and other write bits:
+// otherwise an entrypoint.sh sent from Windows arrives non-executable.
+func contextPerm(perm fs.FileMode, goos string) fs.FileMode {
+	if goos == "windows" {
+		return (perm & 0o755) | 0o111
+	}
+	return perm
 }

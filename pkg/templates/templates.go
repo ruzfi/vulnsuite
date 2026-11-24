@@ -36,14 +36,33 @@ func DefaultDir() string {
 	return filepath.Join(home, DefaultDirName)
 }
 
+// Source says how Resolve found the templates directory.
+type Source int
+
+// Sources, in the order Resolve tries them.
+const (
+	SourceFlag       Source = iota // -templates
+	SourceEnv                      // $VULNSUITE_TEMPLATES
+	SourceWorkingDir               // the working directory or a parent of it
+	SourceDefault                  // ~/vulnsuite-templates
+)
+
 // Resolve picks the templates directory: an explicit flag, then $VULNSUITE_TEMPLATES,
 // then the working directory when it holds templates, then ~/vulnsuite-templates.
 func Resolve(flag string) (string, error) {
+	dir, _, err := ResolveSource(flag)
+	return dir, err
+}
+
+// ResolveSource is Resolve, also reporting where the directory came from.
+func ResolveSource(flag string) (string, Source, error) {
 	if flag != "" {
-		return filepath.Abs(flag)
+		dir, err := filepath.Abs(flag)
+		return dir, SourceFlag, err
 	}
 	if env := os.Getenv(EnvDir); env != "" {
-		return filepath.Abs(env)
+		dir, err := filepath.Abs(env)
+		return dir, SourceEnv, err
 	}
 	if cwd, err := os.Getwd(); err == nil {
 		// The working directory itself, or any parent up to the enclosing git
@@ -52,11 +71,11 @@ func Resolve(flag string) (string, error) {
 		// parents).
 		for _, dir := range candidateDirs(cwd) {
 			if HasTemplates(dir) {
-				return dir, nil
+				return dir, SourceWorkingDir, nil
 			}
 		}
 	}
-	return DefaultDir(), nil
+	return DefaultDir(), SourceDefault, nil
 }
 
 func candidateDirs(cwd string) []string {
@@ -208,6 +227,13 @@ type UpdateOptions struct {
 	HTTPClient *http.Client
 	// GitTimeout overrides DefaultGitTimeout.
 	GitTimeout time.Duration
+
+	// CheckOrigin is set when Dir was found from the working directory
+	// rather than named (-templates, $VULNSUITE_TEMPLATES): a git checkout
+	// there is then updated only when its origin is Repo or DefaultRepo, so
+	// update-templates run inside some other repository that happens to hold
+	// a vulnsuite contract never pulls or checks out in it.
+	CheckOrigin bool
 }
 
 // Update fetches the templates repository into Dir. A git checkout is pulled
@@ -307,8 +333,24 @@ func updateGit(ctx context.Context, o UpdateOptions) (string, string, error) {
 		}
 		return string(out), nil
 	}
-	if o.Repo != "" && o.Repo != DefaultRepo {
-		return o.Dir, "", fmt.Errorf("%s is a git checkout: -repo is not used for checkouts; change its remote with `git remote set-url origin`", o.Dir)
+	foreignRepo := o.Repo != "" && !sameRepo(o.Repo, DefaultRepo)
+	if o.CheckOrigin || foreignRepo {
+		// The raw URL (not `git remote get-url`, which applies insteadOf).
+		out, _ := git(o.GitTimeout, "config", "--get", "remote.origin.url")
+		origin := strings.TrimSpace(out)
+		if o.CheckOrigin && !sameRepo(origin, DefaultRepo) && (o.Repo == "" || !sameRepo(origin, o.Repo)) {
+			want := DefaultRepo
+			if foreignRepo {
+				want = o.Repo + " or " + DefaultRepo
+			}
+			if origin == "" {
+				origin = "(no origin remote)"
+			}
+			return o.Dir, "", fmt.Errorf("%s was found from the working directory, but it is a git checkout of %s, not of %s; refusing to update it. Run update-templates outside it, or name it with -templates %s to update it anyway", o.Dir, origin, want, o.Dir)
+		}
+		if foreignRepo && !sameRepo(origin, o.Repo) {
+			return o.Dir, "", fmt.Errorf("%s is a git checkout of %s: -repo %s is not used for checkouts; change its remote with `git remote set-url origin`", o.Dir, origin, o.Repo)
+		}
 	}
 	if o.Ref == "" {
 		if _, err := git(o.GitTimeout, "symbolic-ref", "-q", "HEAD"); err == nil {
@@ -343,6 +385,32 @@ func updateGit(ctx context.Context, o UpdateOptions) (string, string, error) {
 		return o.Dir, "", err
 	}
 	return o.Dir, strings.TrimSpace(rev), nil
+}
+
+// sameRepo reports whether the git remote URL (or owner/name) a names the
+// GitHub repository owner/name b. Only the last two path segments count, so
+// https://, ssh:// and scp-like (git@host-alias:owner/name.git) forms all
+// match; case is ignored, as GitHub does.
+func sameRepo(a, b string) bool {
+	ra, rb := repoPath(a), repoPath(b)
+	return ra != "" && strings.EqualFold(ra, rb)
+}
+
+// repoPath returns the owner/name a remote URL ends in, or "".
+func repoPath(url string) string {
+	url = strings.TrimSpace(strings.ReplaceAll(url, "\\", "/"))
+	url = strings.TrimSuffix(strings.TrimRight(url, "/"), ".git")
+	url = strings.ReplaceAll(url, ":", "/")
+	var parts []string
+	for _, p := range strings.Split(url, "/") {
+		if p != "" {
+			parts = append(parts, p)
+		}
+	}
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[len(parts)-2] + "/" + parts[len(parts)-1]
 }
 
 // returnToDefaultBranch handles a plain update of a checkout whose HEAD is

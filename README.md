@@ -140,7 +140,7 @@ schema for editors and CI is [schemas/contract.schema.json](schemas/contract.sch
 | `stop` (`down`) | tear down targets, their sidecars and sidecar networks |
 | `images` | list or remove locally built images |
 | `host` (`doctor`) | what the daemon's machine offers targets: arch, CPU flags, `/dev/kvm`, kernel, amd64 emulation |
-| `update-templates` (`ut`) | fetch or update the community templates |
+| `update-templates` (`ut`) | fetch or update the community templates (a checkout you are standing in only when its origin is the templates repo) |
 
 `vulnsuite help <command>` prints every flag. The full reference is
 [docs/USAGE.md](docs/USAGE.md):
@@ -148,7 +148,7 @@ schema for editors and CI is [schemas/contract.schema.json](schemas/contract.sch
 - [Selectors, states and global flags](docs/USAGE.md#commands)
 - [Templates directory and `update-templates`](docs/USAGE.md#templates-directory-and-update-templates)
 - [Finding the right target](docs/USAGE.md#finding-the-right-target): filters by ref, class, category, CVE, KEV, year
-- [Variant groups](docs/USAGE.md#variant-groups-and--variants), and [filters, `-f` files and suites as selectors](docs/USAGE.md#standing-up-a-set-filters-and-suites-as-selectors)
+- [Variant groups](docs/USAGE.md#variant-groups-and--variants), and [filters, `-f` files and suites as selectors](docs/USAGE.md#standing-up-a-set-filters-and-suites-as-selectors) (`suite:<name>` works wherever a selector does: `run`, `build`, `stamp`, `stop`, `list`, `validate`, `info`)
 - [Building images](docs/USAGE.md#building-images), pushing them and registry credentials
 - [Running and verifying](docs/USAGE.md#running-and-verifying), and [`-json -summary` results for pipelines](docs/USAGE.md#results-for-pipelines--json--summary)
 - [Exposure modes](docs/USAGE.md#exposure-modes--how-your-scanner-reaches-the-target): `internal`, `host`, `macvlan`, sidecars, remote daemons

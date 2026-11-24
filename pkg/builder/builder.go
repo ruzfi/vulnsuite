@@ -439,12 +439,8 @@ func (b *Builder) buildSource(ctx context.Context, c *contract.Contract, st *con
 		return err
 	}
 	repo := filepath.Join(tmp, "src")
-	// "--" stops the repo value being read as an option.
-	if out, err := b.git(ctx, "", 10*time.Minute, "clone", "--filter=blob:none", "--no-checkout", "--", c.Base.Repo, repo); err != nil {
-		return fmt.Errorf("clone %s: %s", c.Base.Repo, tail(out))
-	}
-	if out, err := b.git(ctx, repo, 2*time.Minute, "checkout", "--quiet", c.Base.Commit); err != nil {
-		return fmt.Errorf("checkout %s: %s", c.Base.Commit, tail(out))
+	if err := b.checkoutSource(ctx, c.Base.Repo, c.Base.Commit, repo); err != nil {
+		return err
 	}
 	if st.Patch != "" {
 		patch, err := c.TemplatePath(st.Patch)
@@ -533,6 +529,27 @@ func bakeEnv(mc *buildContext, dockerfile string, env map[string]string) error {
 	return nil
 }
 
+// lfOnly makes git write files with LF line endings whatever the host's
+// configuration: the tree is built into a Linux image, and a Windows git with
+// core.autocrlf=true would otherwise check scripts out with CRLF (and the LF
+// patch would then no longer match them).
+var lfOnly = []string{"-c", "core.autocrlf=false", "-c", "core.eol=lf"}
+
+// checkoutSource clones repo into dst and checks out commit, with LF line
+// endings on every host.
+func (b *Builder) checkoutSource(ctx context.Context, repo, commit, dst string) error {
+	// "--" stops the repo value being read as an option.
+	clone := append(append([]string{}, lfOnly...), "clone", "--filter=blob:none", "--no-checkout", "--", repo, dst)
+	if out, err := b.git(ctx, "", 10*time.Minute, clone...); err != nil {
+		return fmt.Errorf("clone %s: %s", repo, tail(out))
+	}
+	checkout := append(append([]string{}, lfOnly...), "checkout", "--quiet", commit)
+	if out, err := b.git(ctx, dst, 2*time.Minute, checkout...); err != nil {
+		return fmt.Errorf("checkout %s: %s", commit, tail(out))
+	}
+	return nil
+}
+
 func (b *Builder) applyPatch(ctx context.Context, dir, patch string) error {
 	// A patch is untrusted template content applied on the host. Refuse any
 	// hunk that targets an absolute path or escapes the source tree with "..".
@@ -545,26 +562,43 @@ func (b *Builder) applyPatch(ctx context.Context, dir, patch string) error {
 	// repository) from being read as part of an enclosing one, such as a
 	// TMPDIR inside a checkout. Without --unsafe-paths, git apply refuses
 	// absolute paths, ".." and writes beyond a symlink.
-	// core.autocrlf=false: the context is built into a Linux image, so a
-	// Windows host's git must not write the patched lines with CRLF.
+	// lfOnly: the context is built into a Linux image, so a Windows host's
+	// git must not write the patched lines with CRLF.
 	ceiling := "GIT_CEILING_DIRECTORIES=" + filepath.Dir(dir)
-	out, err := b.gitEnv(ctx, dir, 2*time.Minute, []string{ceiling}, "-c", "core.autocrlf=false", "apply", "--", patch)
+	out, err := b.gitEnv(ctx, dir, 2*time.Minute, []string{ceiling}, append(append([]string{}, lfOnly...), "apply", "--", patch)...)
 	if err == nil {
 		return nil
 	}
 	gitErr := fmt.Errorf("apply %s: %s", filepath.Base(patch), tail(out))
 	// Fallback for patches git apply will not take (it allows no fuzz): GNU
-	// patch only, because the safety flags below are GNU options. Any other
-	// patch (BSD patch on macOS) fails closed with git's error.
+	// patch only. GNU patch (2.7 and later) refuses on its own to write to an
+	// absolute path, through "..", or through a symbolic link, on top of the
+	// patchStaysInTree scan above. Any other patch (BSD patch on macOS) does
+	// not promise that, so it is not used: the build fails closed with git's
+	// error.
 	if !isGNUPatch(ctx) {
 		return gitErr
 	}
-	cmd := exec.CommandContext(ctx, "patch", "-p1", "--no-absolute-filenames", "--forward", "--batch", "-d", dir, "-i", patch)
+	cmd := exec.CommandContext(ctx, "patch", patchFallbackArgs(dir, patch)...)
 	pout, perr := cmd.CombinedOutput()
 	if perr != nil {
 		return fmt.Errorf("%w; patch fallback: %s", gitErr, tail(string(pout)))
 	}
 	return nil
+}
+
+// patchFallbackArgs is the GNU patch command line that applies patch inside
+// dir. The paths are passed as option values, made absolute so neither can
+// read as an option, and "--" ends the options so nothing after them is
+// parsed as one.
+func patchFallbackArgs(dir, patch string) []string {
+	if abs, err := filepath.Abs(dir); err == nil {
+		dir = abs
+	}
+	if abs, err := filepath.Abs(patch); err == nil {
+		patch = abs
+	}
+	return []string{"-p1", "--forward", "--batch", "--directory=" + dir, "--input=" + patch, "--"}
 }
 
 // isGNUPatch reports whether the patch on PATH is GNU patch.
