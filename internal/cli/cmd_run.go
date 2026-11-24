@@ -688,7 +688,7 @@ func cmdStop() *Command {
 		Short: "tear down running targets (all, or selected templates)",
 		Usage: "[-t SELECTOR]... [-variants] [-prune-net]",
 		Flags: func(fs *flag.FlagSet) {
-			fs.Var(&sel, "t", "only this template/selector (repeatable; default: everything vulnsuite started)")
+			fs.Var(&sel, "t", "only this template/selector or suite:<name> (repeatable; default: everything vulnsuite started)")
 			fs.StringVar(&network, "network", runner.DefaultNetwork, "internal network name")
 			fs.BoolVar(&variantsStop, "variants", false, "when a selector names a group, stop every member (default: just its primary)")
 			fs.BoolVar(&pruneNet, "prune-net", false, "also remove the internal network when stopping everything")
@@ -710,10 +710,12 @@ func cmdStop() *Command {
 				if err != nil {
 					return err
 				}
-				cs, loadErrs, err := gather(store, sel, false, variantsStop)
+				// resolveTargets, as run/build/stamp, so suite:<name> works.
+				paths, err := resolveTargets(ctx, store, sel, nil, false, variantsStop, filters{})
 				if err != nil {
 					return err
 				}
+				cs, loadErrs := store.LoadMany(paths)
 				for _, c := range cs {
 					ids = append(ids, c.ID())
 				}

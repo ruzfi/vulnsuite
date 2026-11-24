@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -328,5 +329,28 @@ func TestNestedGitNeitherSentNorHashed(t *testing.T) {
 	write(t, dir, "src/vendor/lib/a.go", "package lib // edited\n")
 	if h3, _ := snapshot(); h3 == h2 {
 		t.Error("a source edit must change the hash")
+	}
+}
+
+// #147: Windows reports 0666 for every file, so the exec bit is added (and
+// group/other write dropped) exactly as the Docker CLI does; elsewhere the
+// host permission is kept.
+func TestContextPerm(t *testing.T) {
+	for _, tc := range []struct {
+		perm fs.FileMode
+		goos string
+		want fs.FileMode
+	}{
+		{0o666, "windows", 0o755},
+		{0o777, "windows", 0o755},
+		{0o444, "windows", 0o555},
+		{0o600, "windows", 0o711},
+		{0o644, "linux", 0o644},
+		{0o755, "linux", 0o755},
+		{0o666, "darwin", 0o666},
+	} {
+		if got := contextPerm(tc.perm, tc.goos); got != tc.want {
+			t.Errorf("contextPerm(%o, %s) = %o, want %o", tc.perm, tc.goos, got, tc.want)
+		}
 	}
 }

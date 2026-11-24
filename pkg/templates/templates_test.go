@@ -783,3 +783,89 @@ func TestUpdateThroughSymlink(t *testing.T) {
 		t.Fatal("the dangling link must be left alone")
 	}
 }
+
+func TestRepoPath(t *testing.T) {
+	for url, want := range map[string]string{
+		"ruzfi/vulnsuite-templates":                          "ruzfi/vulnsuite-templates",
+		"https://github.com/ruzfi/vulnsuite-templates":       "ruzfi/vulnsuite-templates",
+		"https://github.com/ruzfi/vulnsuite-templates.git/":  "ruzfi/vulnsuite-templates",
+		"git@github.com:ruzfi/vulnsuite-templates.git":       "ruzfi/vulnsuite-templates",
+		"git@github.com-alias:Ruzfi/Vulnsuite-Templates.git": "Ruzfi/Vulnsuite-Templates",
+		"ssh://git@github.com:22/ruzfi/vulnsuite-templates":  "ruzfi/vulnsuite-templates",
+		`C:\src\mirror\vulnsuite-templates`:                  "mirror/vulnsuite-templates",
+		"":                                                   "",
+		"origin":                                             "",
+	} {
+		if got := repoPath(url); got != want {
+			t.Errorf("repoPath(%q) = %q, want %q", url, got, want)
+		}
+	}
+	if !sameRepo("git@github.com:RUZFI/vulnsuite-templates.git", DefaultRepo) || sameRepo("", "") || sameRepo("https://github.com/acme/app", DefaultRepo) {
+		t.Error("sameRepo")
+	}
+}
+
+// #147 item 2: a checkout found from the working directory is updated only
+// when its origin is the templates repository (or -repo); an app repository
+// that merely holds a vulnsuite contract is never pulled or checked out.
+func TestUpdateCheckOriginRefusesForeignCheckout(t *testing.T) {
+	origin, clone, git := gitRepo(t)
+	head := git(clone, "rev-parse", "HEAD")
+	_ = os.WriteFile(filepath.Join(origin, "a.yaml"), []byte("v2"), 0o644)
+	git(origin, "commit", "-q", "-am", "two")
+	ctx := context.Background()
+	for _, o := range []UpdateOptions{
+		{Dir: clone, CheckOrigin: true},
+		{Dir: clone, CheckOrigin: true, Ref: "v1"},
+		{Dir: clone, CheckOrigin: true, Repo: "acme/app"},
+	} {
+		_, _, err := Update(ctx, o)
+		if err == nil || !strings.Contains(err.Error(), "refusing to update") || !strings.Contains(err.Error(), "-templates "+clone) {
+			t.Fatalf("%+v: err = %v", o, err)
+		}
+		if got := git(clone, "rev-parse", "HEAD"); got != head {
+			t.Fatalf("%+v: HEAD moved to %s", o, got)
+		}
+	}
+	// No origin remote at all: refused too.
+	git(clone, "remote", "rename", "origin", "upstream")
+	if _, _, err := Update(ctx, UpdateOptions{Dir: clone, CheckOrigin: true}); err == nil || !strings.Contains(err.Error(), "no origin remote") {
+		t.Fatalf("no origin: err = %v", err)
+	}
+	git(clone, "remote", "rename", "upstream", "origin")
+	// Named explicitly (CheckOrigin unset): updated as before.
+	if _, rev, err := Update(ctx, UpdateOptions{Dir: clone}); err != nil || rev == "" {
+		t.Fatalf("explicit: rev=%s err=%v", rev, err)
+	}
+}
+
+// An origin that is the default repository, or the one -repo names, is
+// updated even when found from the working directory.
+func TestUpdateCheckOriginAcceptsTemplatesRepo(t *testing.T) {
+	origin, clone, git := gitRepo(t)
+	// Point origin at the GitHub URL, rewritten to the local origin by
+	// insteadOf, so no network is used but the configured URL is GitHub's.
+	gh := "https://github.com/" + DefaultRepo + ".git"
+	git(clone, "config", "--global", "url."+origin+".insteadOf", gh)
+	git(clone, "remote", "set-url", "origin", gh)
+	_ = os.WriteFile(filepath.Join(origin, "a.yaml"), []byte("v2"), 0o644)
+	git(origin, "commit", "-q", "-am", "two")
+	v2 := git(origin, "rev-parse", "--short", "HEAD")
+	ctx := context.Background()
+	if _, rev, err := Update(ctx, UpdateOptions{Dir: clone, CheckOrigin: true}); err != nil || rev != v2 {
+		t.Fatalf("default repo: rev=%s err=%v (want %s)", rev, err, v2)
+	}
+	// A fork named by -repo is accepted for its own checkout, with or
+	// without CheckOrigin; a different -repo is still refused.
+	fork := "https://github.com/acme/vulnsuite-templates-fork.git"
+	git(clone, "config", "--global", "url."+origin+".insteadOf", fork)
+	git(clone, "remote", "set-url", "origin", fork)
+	for _, check := range []bool{true, false} {
+		if _, _, err := Update(ctx, UpdateOptions{Dir: clone, CheckOrigin: check, Repo: "acme/vulnsuite-templates-fork", Ref: "v1"}); err != nil {
+			t.Fatalf("-repo matching origin (check=%v): %v", check, err)
+		}
+	}
+	if _, _, err := Update(ctx, UpdateOptions{Dir: clone, Repo: "acme/other"}); err == nil || !strings.Contains(err.Error(), "-repo acme/other is not used") {
+		t.Fatalf("-repo not matching origin: err = %v", err)
+	}
+}

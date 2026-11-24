@@ -19,22 +19,6 @@ import (
 	"github.com/ruzfi/vulnsuite/pkg/validator"
 )
 
-// gather resolves -t selectors / -all into loaded contracts (plus load errors).
-// With variants set, a selector that names a group expands to all its members,
-// and -all returns the full matrix; otherwise a group resolves to its primary
-// and -all returns one target per family (primaries) plus all ungrouped targets.
-func gather(store *loader.Store, selectors []string, all, variants bool) ([]*contract.Contract, []error, error) {
-	if !all && len(selectors) == 0 {
-		return nil, nil, usageError{"pass -t <template> (repeatable) or -all"}
-	}
-	paths, err := store.FindMany(selectors, all, variants)
-	if err != nil {
-		return nil, nil, err
-	}
-	cs, errs := store.LoadMany(paths)
-	return cs, errs, nil
-}
-
 // fallbackID names a template that failed to load: its metadata.id when
 // that much can be read, else its folder (or file) name.
 func fallbackID(path string) string {
@@ -137,8 +121,8 @@ func cmdList() *Command {
 		Name: "list", Aliases: []string{"ls", "search"},
 		Short: "list and filter templates by class, KEV, product surface, CVE and year",
 		Usage: "[selector...] [-group H] [-variants] [-ref ID]... [-class C]... [-kev] [-category P] [-cve] [-unverified] [-year YYYY]",
-		Long: `A selector is a folder, a contract file, or a template id (substring match
-when unique). A ref-shaped selector (CVE-..., GHSA-..., GO-..., VS-...) that
+		Long: `A selector is a folder, a contract file, a template id (substring match
+when unique), or suite:<name> (the targets of templates/suites/<name>.txt). A ref-shaped selector (CVE-..., GHSA-..., GO-..., VS-...) that
 matches no id/file/folder resolves against vuln_refs instead, so
 ` + "`search CVE-2026-109619`" + ` just works. With no selector every template is listed.
 
@@ -176,13 +160,16 @@ gets a warning. Offline with neither present, KEV is shown as "?" and
 -kev/-no-kev cannot be used.`,
 		Flags: func(fs *flag.FlagSet) {
 			f.register(fs)
-			fs.StringVar(&groupFilter, "group", "", "only members of this variant group (shows the whole family)")
+			fs.StringVar(&groupFilter, "group", "", "only members of this variant group (shows the whole family; not with selectors)")
 			fs.BoolVar(&variants, "variants", false, "expand variant groups to all members (default: collapse each group to its primary)")
 			fs.BoolVar(&runnable, "runnable", false, "only templates whose requires the current daemon meets (asks the daemon; see `vulnsuite host`)")
 		},
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
 			if err := f.validate(); err != nil {
 				return err
+			}
+			if groupFilter != "" && len(args) > 0 {
+				return usageError{fmt.Sprintf("-group lists one variant group; drop the selector(s) %s, or drop -group", strings.Join(args, " "))}
 			}
 			store, err := g.Store()
 			if err != nil {
@@ -242,7 +229,8 @@ gets a warning. Offline with neither present, KEV is shown as "?" and
 			case len(args) == 0:
 				paths, err = store.FindMany(nil, true, variants || filterAll)
 			default:
-				paths, err = store.FindMany(args, false, variants)
+				// The same resolver as run/build/stamp, so suite:<name> works.
+				paths, err = resolveTargets(ctx, store, args, nil, false, variants, filters{})
 			}
 			if err != nil {
 				return err
@@ -496,7 +484,7 @@ func cmdValidate() *Command {
 		Short: "validate template contracts (structure + semantic lint)",
 		Usage: "[-t SELECTOR]... [-all] [-strict] [-allow-unpinned]",
 		Flags: func(fs *flag.FlagSet) {
-			fs.Var(&sel, "t", "template selector (repeatable); default: every template")
+			fs.Var(&sel, "t", "template selector or suite:<name> (repeatable); default: every template")
 			fs.BoolVar(&all, "all", false, "validate every template (the default when no -t is given)")
 			fs.BoolVar(&strict, "strict", false, "treat warnings as errors")
 			fs.BoolVar(&allowUnpinned, "allow-unpinned", false, "an unpinned base is a warning, not an error")
@@ -520,10 +508,12 @@ func cmdValidate() *Command {
 			}
 			// Always expand groups when validating: the per-group rules
 			// (one primary, unique variants) need every member in view.
-			cs, loadErrs, err := gather(store, sel, all, true)
+			// resolveTargets, as run/build/stamp, so suite:<name> works.
+			paths, err := resolveTargets(ctx, store, sel, nil, all, true, filters{})
 			if err != nil {
 				return err
 			}
+			cs, loadErrs := store.LoadMany(paths)
 			v := &validator.Validator{
 				AllowUnpinned: allowUnpinned,
 				CategoryOf:    func(c *contract.Contract) string { return store.Category(c.SourcePath) },
@@ -604,7 +594,11 @@ func cmdUpdateTemplates() *Command {
 A git checkout is pulled (fast-forward only); with -ref, the ref is fetched
 from origin and checked out detached (refused while tracked files have
 uncommitted changes). A checkout is never replaced: if git is not on PATH the
-update fails.
+update fails. A checkout found from the working directory (rather than named
+with -templates or $VULNSUITE_TEMPLATES) is only updated when its origin is
+` + templates.DefaultRepo + ` or -repo; any other repository that happens to
+hold a vulnsuite contract is left alone. -repo on a checkout must name its
+origin.
 
 Anything else is replaced by the GitHub archive of -ref (default ` + templates.DefaultBranch + `), but
 only when the directory is missing, empty, or was installed by
@@ -616,7 +610,7 @@ update-templates before; pass -force to replace any other directory.`,
 		},
 		NoArgs: true,
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
-			dir, err := templates.Resolve(g.TemplatesDir)
+			dir, src, err := templates.ResolveSource(g.TemplatesDir)
 			if err != nil {
 				return err
 			}
@@ -627,7 +621,8 @@ update-templates before; pass -force to replace any other directory.`,
 			if g.Quiet {
 				progress = io.Discard
 			}
-			dir, version, err := templates.Update(ctx, templates.UpdateOptions{Dir: dir, Repo: repo, Ref: ref, Force: force, Output: progress, Warn: g.Stderr})
+			dir, version, err := templates.Update(ctx, templates.UpdateOptions{Dir: dir, Repo: repo, Ref: ref, Force: force, Output: progress, Warn: g.Stderr,
+				CheckOrigin: src == templates.SourceWorkingDir})
 			if err != nil {
 				return err
 			}
