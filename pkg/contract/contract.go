@@ -162,7 +162,9 @@ func (h HTTPProbe) Strong() bool {
 	return h.BodyMatches != "" || h.BodyAbsent != "" || len(h.HeaderMatches) > 0 || len(h.HeaderAbsent) > 0
 }
 
-// ExecProbe runs a command inside the target container.
+// ExecProbe runs a command inside the target container. StdoutMatches is
+// matched against the command's stdout and stderr together: the engines
+// return the exec's two streams combined.
 type ExecProbe struct {
 	Run           string  `yaml:"run" json:"run"`
 	ExpectExit    *int    `yaml:"expect_exit,omitempty" json:"expect_exit,omitempty"`

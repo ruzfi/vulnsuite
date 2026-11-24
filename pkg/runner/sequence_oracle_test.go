@@ -184,16 +184,20 @@ func TestSequenceRestartUsesReadyTimeoutAndReseeds(t *testing.T) {
 
 // untrackStepPID returns the command trackStepPID wrapped, or ok false.
 func untrackStepPID(wrapped string) (command, pidFile string, ok bool) {
-	rest, found := strings.CutPrefix(wrapped, "sh -c '")
+	const pre, mid = "if command -v setsid >/dev/null 2>&1; then setsid sh -c '", "' & p=$!; g=g; else sh -c '"
+	rest, found := strings.CutPrefix(wrapped, pre)
 	if !found {
 		return "", "", false
 	}
-	end := strings.LastIndex(rest, `' & p=$!; echo "$p" > '`)
+	end := strings.Index(rest, mid)
 	if end < 0 {
 		return "", "", false
 	}
 	command = strings.ReplaceAll(rest[:end], `'\''`, "'")
-	tail := rest[end+len(`' & p=$!; echo "$p" > '`):]
+	_, tail, found := strings.Cut(rest, `echo "$p $g" > '`)
+	if !found {
+		return "", "", false
+	}
 	pidFile, _, _ = strings.Cut(tail, "'")
 	return command, pidFile, trackStepPID(command, pidFile) == wrapped
 }
@@ -299,9 +303,7 @@ func TestTrackStepPIDShell(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	f := shellQuote(pidFile)
-	kill := fmt.Sprintf(`p=$(cat %s 2>/dev/null) && kill -9 "$p" 2>/dev/null; rm -f %s`, f, f)
-	if out, err := exec.Command(sh, "-c", kill).CombinedOutput(); err != nil {
+	if out, err := exec.Command(sh, "-c", killStepScript(pidFile)).CombinedOutput(); err != nil {
 		t.Fatalf("kill: %v %s", err, out)
 	}
 	_ = run.Wait()
@@ -338,7 +340,7 @@ func TestSequenceKillsStepLeftRunning(t *testing.T) {
 			}
 		}
 	}
-	if pidFile == "" || !strings.Contains(kills[0], shellQuote(pidFile)) {
+	if pidFile == "" || kills[0] != f.driver+": "+killStepScript(pidFile) {
 		t.Errorf("kill %q does not use the step's PID file %q", kills[0], pidFile)
 	}
 }

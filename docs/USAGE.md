@@ -375,6 +375,10 @@ created with. A run whose flags don't match it fails instead of joining it: a
 again. The same goes for the macvlan network `vulnsuite-macvlan-<parent>`
 when `-subnet` or `-gateway` differs from the existing one.
 
+`-no-egress` applies only to `-expose internal`. `host` and `macvlan` give the
+target a route off the host by design, so combining either with `-no-egress`
+is a usage error (exit 2) instead of a run that silently keeps its egress.
+
 `vulnsuite ps`, `targets` and `stop` find containers by their
 `dev.vulnsuite.*` labels: `stop -t foo` stops exactly template `foo` (never
 `foo-bar`), and containers vulnsuite did not start are left alone.
@@ -425,7 +429,8 @@ yours) — there too, `-expose host -bind <daemon address>` gives you a scannabl
 URL. The healthcheck then runs inside the target (it checks that the port
 listens, or, for an `http` healthcheck, asks `curl` when the image has it), so
 seeds still wait for the service; an image without a shell is taken as ready
-once it runs. `exec` and `sequence` verify probes still run, since they need
+once it runs. A check that hangs (the exec times out) counts as not ready,
+never as "no shell". `exec` and `sequence` verify probes still run, since they need
 no network path: a failing one fails verify, and the network probes are
 reported as skipped. A `sequence` reports each attempt (`hit`, `pass`, `not
 reached` or `fail`) in its verify line and in `-json` under the probe's
@@ -618,7 +623,7 @@ run's output in the PR.
 
 The real isolation for a knowingly-vulnerable target is the no-egress internal
 network (`-no-egress`) and a dedicated host — not stripping Linux
-capabilities. Targets run with `no-new-privileges` and Docker's default
+capabilities. Targets and their sidecars run with `no-new-privileges` and Docker's default
 capability set (which already excludes `SYS_ADMIN`, `NET_ADMIN`,
 `SYS_PTRACE`, ...); stock images need caps from that set just to boot. A
 contract can tighten per target with `service.cap_drop: [ALL]`, `cap_add`,

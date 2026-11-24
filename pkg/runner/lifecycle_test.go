@@ -145,6 +145,10 @@ func TestSidecarsResolvableInEveryMode(t *testing.T) {
 			if got := fe.Resolve(want, "sc-demo"); len(got) != 1 || got[0] != h.Container {
 				t.Fatalf("sidecar resolves the target to %v", got)
 			}
+			// #146: the sidecar runs with the target's no-new-privileges.
+			if so := fe.Containers[want].Spec.SecurityOpt; len(so) != 1 || so[0] != "no-new-privileges:true" {
+				t.Fatalf("sidecar security_opt %q, want [no-new-privileges:true]", so)
+			}
 			scNet := fe.Networks[h.SidecarNetwork]
 			spec := fe.Containers[h.Container].Spec
 			// The fake's address on the target's first (exposure) network; the

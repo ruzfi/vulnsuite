@@ -30,6 +30,8 @@ func TestIgnoredFlagsAreUsageErrors(t *testing.T) {
 		{"ip outside macvlan", runArgs("-ip", "192.168.1.50"), "-ip is used only by -expose macvlan"},
 		{"subnet outside macvlan", runArgs("-subnet", "192.168.1.0/24"), "-subnet is used only by -expose macvlan"},
 		{"gateway outside macvlan", runArgs("-gateway", "192.168.1.1"), "-gateway is used only by -expose macvlan"},
+		{"no-egress with host", runArgs("-expose", "host", "-no-egress"), "-no-egress is used only by -expose internal (the mode is host)"},
+		{"no-egress with macvlan", runArgs("-expose", "macvlan", "-parent", "eth0", "-no-egress"), "-no-egress is used only by -expose internal (the mode is macvlan)"},
 		{"stop -t with -prune-net", []string{"-T", root, "stop", "-t", "foo", "-prune-net"}, "-prune-net removes the network only when stopping everything"},
 		{"stop selector arg with -prune-net", []string{"-T", root, "stop", "foo", "-prune-net"}, "-prune-net removes the network only when stopping everything"},
 		{"build -registry without -push", []string{"-T", root, "build", "-t", "foo", "-registry", "ghcr.io/x/y"}, "-registry is only used by -push"},

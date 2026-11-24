@@ -71,3 +71,22 @@ func TestAwaitReadyTimeoutDetail(t *testing.T) {
 		t.Fatalf("ready detail: %q", h.ReadyDetail)
 	}
 }
+
+// #146: waiting again on the same handle (a sequence restart after a crash on
+// boot) clears the previous wait's exit code and detail.
+func TestAwaitReadyResetsStaleFields(t *testing.T) {
+	fe := enginetest.New() // the in-container healthcheck passes
+	r := New(fe)
+	r.Reach = func(string, int, time.Duration) probes.Reach { return probes.Unreachable }
+	c := load(t, "redis-unauthenticated-access")
+	h, err := r.Run(context.Background(), c, "vulnerable", DefaultExposure(), Options{ReadyTimeout: time.Second, Build: builder.Options{Pull: true}})
+	if err != nil || !h.Ready {
+		t.Fatalf("run: %v ready=%v", err, h != nil && h.Ready)
+	}
+	code := 3
+	h.Ready, h.ExitCode, h.ReadyDetail = false, &code, "the container exited with code 3 before it was ready"
+	r.awaitReady(context.Background(), c, h, time.Second)
+	if !h.Ready || h.ExitCode != nil || h.ReadyDetail != "" {
+		t.Fatalf("stale fields after a ready wait: ready=%v exit=%v detail=%q", h.Ready, h.ExitCode, h.ReadyDetail)
+	}
+}

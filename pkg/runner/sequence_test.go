@@ -208,7 +208,9 @@ func (f *seqFix) assertThawed() {
 }
 
 // isStepKill reports whether cmd (or an exec call) is killStep's.
-func isStepKill(cmd string) bool { return strings.Contains(cmd, `p=$(cat '/tmp/.vulnsuite-step-`) }
+func isStepKill(cmd string) bool {
+	return strings.Contains(cmd, `read -r p g < '/tmp/.vulnsuite-step-`)
+}
 
 func execStep(container, run string) contract.SequenceStep {
 	return contract.SequenceStep{Exec: &contract.SequenceExec{ExecProbe: contract.ExecProbe{Run: run}, Container: container}}

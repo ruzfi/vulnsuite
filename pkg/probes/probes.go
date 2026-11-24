@@ -20,6 +20,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ruzfi/vulnsuite/pkg/contract"
 )
@@ -505,7 +506,7 @@ func runExec(ctx context.Context, s *contract.ExecProbe, t Target) (bool, string
 	}
 	code, out, err := t.Exec(ctx, t.Container, s.Run, secs(s.Timeout, 30*time.Second))
 	if err != nil {
-		return false, "", fmt.Errorf("exec %q -> %v", s.Run, err)
+		return false, "", fmt.Errorf("exec %q -> %v%s", s.Run, err, execOutput(out))
 	}
 	want := 0
 	if s.ExpectExit != nil {
@@ -519,9 +520,30 @@ func runExec(ctx context.Context, s *contract.ExecProbe, t Target) (bool, string
 		problems = append(problems, fmt.Sprintf("stdout !~ /%s/", s.StdoutMatches))
 	}
 	if len(problems) > 0 {
-		return false, fmt.Sprintf("exec %q -> %s", s.Run, strings.Join(problems, "; ")), nil
+		return false, fmt.Sprintf("exec %q -> %s%s", s.Run, strings.Join(problems, "; "), execOutput(out)), nil
 	}
 	return true, fmt.Sprintf("exec %q -> ok", s.Run), nil
+}
+
+// execOutputMax bounds how much of a failed exec's output its detail quotes.
+const execOutputMax = 512
+
+// execOutput is the "; output: ..." suffix of a failed exec's detail (#146):
+// the command's combined stdout and stderr, trimmed and truncated, or "" when
+// it printed nothing.
+func execOutput(out string) string {
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return ""
+	}
+	if len(out) > execOutputMax {
+		cut := execOutputMax
+		for cut > 0 && !utf8.RuneStart(out[cut]) {
+			cut--
+		}
+		return fmt.Sprintf("; output (first %d of %d bytes): %q", cut, len(out), out[:cut])
+	}
+	return fmt.Sprintf("; output: %q", out)
 }
 
 func runTCP(ctx context.Context, s *contract.TCPProbe, t Target) (bool, string, error) {
@@ -549,10 +571,15 @@ func runTCP(ctx context.Context, s *contract.TCPProbe, t Target) (bool, string, 
 		early, listening = checkListener(conn, min(ListenerGrace, timeout))
 	}
 	if s.Closed {
-		// Asserting the port is NOT open: a dial error (refused/unreachable) is
-		// the expected result; a successful connection is the failure.
+		// Asserting the port is NOT open: only a refused connection (or a
+		// proxy that accepts and closes) proves it. #146: a timeout or no
+		// route says nothing about the port, only that this machine cannot
+		// reach the target, so it is a transport failure, not a pass.
 		if err != nil {
-			return true, fmt.Sprintf("tcp %d closed as expected (%v)", port, err), nil
+			if ctx.Err() == nil && isConnRefused(err) {
+				return true, fmt.Sprintf("tcp %d closed as expected (%v)", port, err), nil
+			}
+			return false, "", &connError{fmt.Errorf("tcp %d -> %v (cannot tell whether it is closed)", port, err)}
 		}
 		if !listening {
 			return true, fmt.Sprintf("tcp %d closed as expected (%s)", port, errNotListening), nil

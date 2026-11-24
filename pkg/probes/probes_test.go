@@ -3,12 +3,14 @@ package probes
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ruzfi/vulnsuite/pkg/contract"
 )
@@ -440,5 +442,69 @@ func TestRunSequenceBadRegex(t *testing.T) {
 		if r.OK || !strings.Contains(r.Detail, "invalid regex in sequence probe steps[0]") {
 			t.Errorf("%s: %+v", st.Kind(), r)
 		}
+	}
+}
+
+// #146: closed: passes only on a refused connection; a dial that times out,
+// finds no route or cannot resolve the host cannot tell, so it is a transport
+// failure (verify then says "could not verify from here").
+func TestTCPClosedOnlyOnRefused(t *testing.T) {
+	ctx := context.Background()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	refused := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+	r := Run(ctx, contract.Probe{TCP: &contract.TCPProbe{Closed: true}}, Target{Host: "127.0.0.1", Port: refused})
+	if !r.OK || r.Transport {
+		t.Fatalf("refused port: ok=%v transport=%v %s", r.OK, r.Transport, r.Detail)
+	}
+	for name, host := range map[string]string{
+		"unresolvable": "no-such-host.invalid",
+		"blackholed":   "192.0.2.1", // TEST-NET-1: times out or has no route
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := Run(ctx, contract.Probe{TCP: &contract.TCPProbe{Closed: true, Timeout: 0.5}}, Target{Host: host, Port: 6379})
+			if r.OK || !r.Transport || !strings.Contains(r.Detail, "cannot tell whether it is closed") {
+				t.Fatalf("ok=%v transport=%v %s", r.OK, r.Transport, r.Detail)
+			}
+		})
+	}
+	// A cancelled probe is not a pass either.
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	if r := Run(cctx, contract.Probe{TCP: &contract.TCPProbe{Closed: true}}, Target{Host: "127.0.0.1", Port: refused}); r.OK {
+		t.Fatalf("cancelled closed: probe passed: %s", r.Detail)
+	}
+}
+
+// #146: a failed exec probe (or sequence exec step) quotes the command's
+// output, truncated; a passing one does not.
+func TestExecFailureDetailIncludesOutput(t *testing.T) {
+	ctx := context.Background()
+	execWith := func(code int, out string, err error) Target {
+		return Target{Container: "c", Exec: func(context.Context, string, string, time.Duration) (int, string, error) { return code, out, err }}
+	}
+	r := Run(ctx, contract.Probe{Exec: &contract.ExecProbe{Run: "cat /etc/shadow", StdoutMatches: "root:"}}, execWith(1, "cat: /etc/shadow: Permission denied\n", nil))
+	if r.OK || !strings.Contains(r.Detail, `output: "cat: /etc/shadow: Permission denied"`) {
+		t.Fatalf("ok=%v %s", r.OK, r.Detail)
+	}
+	r = Run(ctx, contract.Probe{Exec: &contract.ExecProbe{Run: "hang"}}, execWith(-1, "partial", errors.New("exec timed out: context deadline exceeded")))
+	if r.OK || !strings.Contains(r.Detail, "timed out") || !strings.Contains(r.Detail, `output: "partial"`) {
+		t.Fatalf("ok=%v %s", r.OK, r.Detail)
+	}
+	long := strings.Repeat("é", 600) // 1200 bytes, the cut must not split a rune
+	r = Run(ctx, contract.Probe{Exec: &contract.ExecProbe{Run: "x"}}, execWith(2, long, nil))
+	if r.OK || !strings.Contains(r.Detail, "output (first 512 of 1200 bytes)") || len(r.Detail) > 1500 || !utf8.ValidString(r.Detail) {
+		t.Fatalf("ok=%v len=%d %s", r.OK, len(r.Detail), r.Detail)
+	}
+	r = Run(ctx, contract.Probe{Exec: &contract.ExecProbe{Run: "x"}}, execWith(1, "  \n", nil))
+	if r.OK || strings.Contains(r.Detail, "output") {
+		t.Fatalf("empty output quoted: %s", r.Detail)
+	}
+	r = Run(ctx, contract.Probe{Exec: &contract.ExecProbe{Run: "x", StdoutMatches: "ok"}}, execWith(0, "ok", nil))
+	if !r.OK || strings.Contains(r.Detail, "output") {
+		t.Fatalf("pass: ok=%v %s", r.OK, r.Detail)
 	}
 }

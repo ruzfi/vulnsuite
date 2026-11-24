@@ -469,7 +469,7 @@ func (r *Runner) Run(ctx context.Context, c *contract.Contract, state string, ex
 		// server images need caps from the default set just to boot. The real
 		// isolation for a knowingly-vulnerable target is the no-egress internal
 		// network and a dedicated host. A contract can tighten per target.
-		SecurityOpt: []string{"no-new-privileges:true"},
+		SecurityOpt: []string{noNewPrivileges},
 		CapAdd:      c.Service.CapAdd,
 		CapDrop:     c.Service.CapDrop,
 		// Run the platform the image was resolved for (emulation), not the
@@ -850,6 +850,9 @@ func (r *Runner) clearSidecarNetwork(ctx context.Context, scNet string) error {
 	return nil
 }
 
+// noNewPrivileges is the security option every target and sidecar runs with.
+const noNewPrivileges = "no-new-privileges:true"
+
 // startSidecars starts the state's sidecars on the private network scNet,
 // each resolvable there under its template name. They run on the target's
 // platform: a stack that needs emulation is emulated as a whole. It returns
@@ -879,6 +882,9 @@ func (r *Runner) startSidecars(ctx context.Context, c *contract.Contract, st *co
 			},
 			Network:  &engine.NetworkAttachment{Name: scNet, Aliases: []string{sc.Name}},
 			Platform: platform,
+			// #146: the same baseline as the target. A sidecar can be built
+			// from the template's own context, so it is no more trusted.
+			SecurityOpt: []string{noNewPrivileges},
 		}
 		id, err := r.Engine.ContainerCreate(ctx, spec)
 		if err != nil {
@@ -997,6 +1003,9 @@ func (r *Runner) awaitReady(ctx context.Context, c *contract.Contract, h *Handle
 	if override > 0 {
 		timeout = override
 	}
+	// #146: a sequence restart waits again on the same handle; a previous
+	// wait's verdict (a crash on boot) must not outlive it.
+	h.Ready, h.ReadyDetail, h.ExitCode = false, "", nil
 	wctx, cancel := context.WithCancel(ctx)
 	exited := make(chan *engine.ContainerDetail, 1)
 	done := make(chan struct{})
@@ -1162,23 +1171,47 @@ func (r *Runner) waitReadyInside(ctx context.Context, c *contract.Contract, h *H
 		if (left <= 0 && !first) || ctx.Err() != nil {
 			return false
 		}
-		code, _, err := r.Engine.ContainerExec(ctx, h.Container, cmd, min(10*time.Second, max(left, 5*time.Second)))
+		code, _, err := r.Engine.ContainerExec(ctx, h.Container, cmd, insideExecTimeout)
 		switch {
 		case ctx.Err() != nil:
 			return false
 		case err == nil && code == insideReady:
 			return true
-		case err == nil && code == insideNotReady:
-			// not up yet
-		case err != nil && !running():
-			// Not started yet, or exited (the exit watcher then cancels ctx).
-		default:
-			// No shell (exec error, 126/127) or nothing to read: the check
-			// cannot run in this image.
+		case execMissingShell(code, err), err == nil && code == insideCannot:
+			// No shell, or nothing to read: the check cannot run in this
+			// image, so fall back to "ready once it runs".
 			return running()
+		case err == nil:
+			// insideNotReady, or the check was killed: not up yet.
+		case errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled):
+			// #146: the exec timed out (a hung service). That is not ready,
+			// never "the check cannot run here".
+		default:
+			// Not started yet, exited (the exit watcher then cancels ctx), or
+			// a transient daemon error: try again until the deadline.
 		}
 		sleepCtx(ctx, insidePoll)
 	}
+}
+
+// insideCurlMaxTime is curl's --max-time in httpScript, and insideExecTimeout
+// the exec's own timeout around it: always longer, so a slow service ends in
+// curl's "000" (not ready) instead of an exec timeout.
+const (
+	insideCurlMaxTime = 5 * time.Second
+	insideExecTimeout = insideCurlMaxTime + 5*time.Second
+)
+
+// execMissingShell reports whether an exec failed because the image has no
+// shell (or no sh on PATH): exit 126/127 from the runtime, or the runtime's
+// "executable file not found" error.
+func execMissingShell(code int, err error) bool {
+	if err == nil {
+		return code == 126 || code == 127
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "executable file not found") ||
+		(strings.Contains(msg, "exec") && strings.Contains(msg, "no such file or directory"))
 }
 
 // listenScript exits 0 when a TCP socket listens on port in the namespace it
@@ -1204,8 +1237,8 @@ func httpScript(scheme string, port int, path string, want int) string {
 	if want != 0 {
 		ok = fmt.Sprintf(`[ "$s" = %d ]`, want)
 	}
-	return fmt.Sprintf(`if command -v curl >/dev/null 2>&1; then s=$(curl -sk -o /dev/null -w '%%{http_code}' --max-time 5 %s); `+
-		`%s && exit 0; exit 1; fi; %s`, shellQuote(url), ok, listenScript(port))
+	return fmt.Sprintf(`if command -v curl >/dev/null 2>&1; then s=$(curl -sk -o /dev/null -w '%%{http_code}' --max-time %d %s); `+
+		`%s && exit 0; exit 1; fi; %s`, int(insideCurlMaxTime/time.Second), shellQuote(url), ok, listenScript(port))
 }
 
 // shellQuote quotes s as one sh word.

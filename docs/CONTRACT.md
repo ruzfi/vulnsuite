@@ -273,7 +273,7 @@ demonstrate the *impact* from the advisory, not a matcher.
     port: 6379
     send: "PING\r\n"
     banner_matches: "\\+PONG"
-    closed: true                  # instead: assert the port is NOT open (refused/unreachable is a pass)
+    closed: true                  # instead: assert the port is NOT open (only a refused connection is a pass)
 - net:                            # scripted multi-step dialogue over one connection
     port: 21
     steps:
@@ -287,6 +287,17 @@ demonstrate the *impact* from the advisory, not a matcher.
     expect_exit: 0
     stdout_matches: "root:"
 ```
+
+An `exec` probe's `stdout_matches` is matched against the command's stdout
+and stderr together: the engine returns the exec's two streams combined, so
+anchor the pattern on text only the success case prints. When an `exec` probe
+or sequence step fails, its detail quotes the command's output (the first
+512 bytes).
+
+A `closed: true` probe passes only when the connection is refused, or
+accepted and closed at once by a port proxy (below). A dial that times out,
+finds no route or cannot resolve the host proves nothing about the port, so
+it counts as "could not verify from here", not as a pass.
 
 A port counts as open, for a `tcp` probe and for a `tcp` (or default)
 healthcheck, only when something listens on it. A connection that is accepted
@@ -384,11 +395,11 @@ attempt `timeout`:
 
 | Step | At run time |
 | --- | --- |
-| `exec` | in the target, or in the sidecar `container` of the same state. Default `expect_exit` 0 and `timeout` 30 s, as for an `exec` probe |
+| `exec` | in the target, or in the sidecar `container` of the same state. Default `expect_exit` 0 and `timeout` 30 s, as for an `exec` probe. A step that fails while still running (its timeout, the attempt timeout, the freeze cap) is killed with its whole process tree, so a pipeline or background job cannot finish during the next attempt: in its own process group when the image has `setsid`, otherwise by walking `/proc` |
 | `freeze` / `resume` | `docker pause` / `unpause` of the target container, never a sidecar |
 | `sleep` | waits, cut short by the attempt timeout |
 | `http`, `tcp`, `net` | against the same address the other probes use. When this machine cannot reach the target (internal mode on Docker Desktop, macvlan, a remote daemon's loopback) the step cannot run and the attempt is not reached, with the same explanation as skipped network probes |
-| `expect_sanitizer` | reads the files in `log_dir` that are new or changed since the attempt started (only the appended part of a file that grew; at most 1 MiB per file, so a file that was already past 1 MiB yields nothing new; at most 4096 files and 64 MiB in all, past which the attempt is not reached) and parses every `ERROR: <Name>Sanitizer: <description>` report in them (AddressSanitizer, LeakSanitizer, and others in that format), and every `WARNING: ThreadSanitizer:` or `WARNING: MemorySanitizer:` report. `kind` matches the report's `SUMMARY` class or a word of its description (`attempting double-free` is a `double-free`). A ThreadSanitizer class is its words joined by `-` (`data race` is `data-race`, `lock-order-inversion`), and a LeakSanitizer report's class is `leak`; `frame` must match a frame of the report's first stack (the faulting access, up to the first blank line), written as `func file:line`. A report is written after resume, so the step waits up to 5 s for a matching one; `none` watches the whole 5 s and fails on the first report |
+| `expect_sanitizer` | reads the files in `log_dir` that are new or changed since the attempt started (only the appended part of a file that grew; at most 1 MiB per file, so a file that was already past 1 MiB yields nothing new; at most 4096 files and 64 MiB in all, past which the attempt is not reached) and parses every `ERROR: <Name>Sanitizer: <description>` report in them (AddressSanitizer, LeakSanitizer, and others in that format), every `WARNING: ThreadSanitizer:` or `WARNING: MemorySanitizer:` report, and every UndefinedBehaviorSanitizer `file:line:col: runtime error: <description>` report (or a lone `SUMMARY: UndefinedBehaviorSanitizer:` line). `kind` matches the report's `SUMMARY` class or a word of its description (`attempting double-free` is a `double-free`). A UBSan report's class is `undefined-behavior`, and its description's leading words joined by `-` match too (`signed integer overflow: ...` is a `signed-integer-overflow`, `shift exponent 40 is too large` a `shift-exponent`); its first stack is printed only with `UBSAN_OPTIONS=print_stacktrace=1`, and without one the report's source location is its only frame. Point UBSan's `log_path` at `log_dir` too (with `-fsanitize=address,undefined` it shares ASan's). A ThreadSanitizer class is its words joined by `-` (`data race` is `data-race`, `lock-order-inversion`), and a LeakSanitizer report's class is `leak`; `frame` must match a frame of the report's first stack (the faulting access, up to the first blank line), written as `func file:line`. A report is written after resume, so the step waits up to 5 s for a matching one; `none` watches the whole 5 s and fails on the first report |
 | `expect_log` | the regexp (dot matches newline) against what the target logged since the attempt started, waiting up to 5 s for it |
 
 Every attempt ends as exactly one of:

@@ -481,6 +481,20 @@ var cases = []conformanceCase{
 			t.Fatalf("an unset entrypoint was sent as %q", ep)
 		}
 	}},
+	{"container_create_hardening", func(t *testing.T, h *harness) {
+		// The runner hardens targets and sidecars (#146) through these
+		// fields; every engine must pass them to the daemon unchanged, and
+		// leave them unset when the spec does.
+		create(t, h, engine.ContainerSpec{Name: "vs-hard", SecurityOpt: []string{"no-new-privileges:true"}, CapAdd: []string{"NET_RAW"}, CapDrop: []string{"MKNOD"}})
+		so, add, drop := h.hardening(t, "vs-hard")
+		if !reflect.DeepEqual(so, []string{"no-new-privileges:true"}) || !reflect.DeepEqual(add, []string{"NET_RAW"}) || !reflect.DeepEqual(drop, []string{"MKNOD"}) {
+			t.Fatalf("created with security_opt %q cap_add %q cap_drop %q", so, add, drop)
+		}
+		create(t, h, engine.ContainerSpec{Name: "vs-soft"})
+		if so, add, drop := h.hardening(t, "vs-soft"); len(so)+len(add)+len(drop) != 0 {
+			t.Fatalf("unset hardening sent as security_opt %q cap_add %q cap_drop %q", so, add, drop)
+		}
+	}},
 	{"container_create_errors", func(t *testing.T, h *harness) {
 		if _, err := h.eng.ContainerCreate(bg(t), engine.ContainerSpec{Name: "vs-x", Image: imgB}); err == nil {
 			t.Error("creating from a missing image must fail")
