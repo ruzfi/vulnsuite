@@ -17,17 +17,31 @@ const (
 	Env = "VULNSUITE_ENGINE"
 )
 
-// New constructs the engine client for kind ("" means $VULNSUITE_ENGINE, then sdk)
-// against host ("" means $DOCKER_HOST or the local socket).
-func New(kind, host string) (engine.Engine, error) {
+// Resolve returns the engine kind New would use for kind ("" means
+// $VULNSUITE_ENGINE, then sdk), or an error naming an unknown one.
+func Resolve(kind string) (string, error) {
+	from := "-engine"
 	if kind == "" {
-		kind = os.Getenv(Env)
+		kind, from = os.Getenv(Env), "$"+Env
 	}
 	switch kind {
 	case "", SDK, "moby":
-		return moby.New(host)
+		return SDK, nil
 	case API, "docker":
+		return API, nil
+	}
+	return "", fmt.Errorf("unknown engine %q from %s (sdk or api)", kind, from)
+}
+
+// New constructs the engine client for kind ("" means $VULNSUITE_ENGINE, then sdk)
+// against host ("" means $DOCKER_HOST or the local socket).
+func New(kind, host string) (engine.Engine, error) {
+	kind, err := Resolve(kind)
+	if err != nil {
+		return nil, err
+	}
+	if kind == API {
 		return docker.New(host)
 	}
-	return nil, fmt.Errorf("unknown engine %q (sdk or api)", kind)
+	return moby.New(host)
 }

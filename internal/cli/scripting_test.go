@@ -61,7 +61,7 @@ func TestStopJSONPrunesNetwork(t *testing.T) {
 	root := fixtures(t)
 	fe := enginetest.New()
 	seedHostTarget(fe, "127.0.0.1", 49154)
-	fe.Networks[runner.DefaultNetwork] = engine.NetworkSpec{Name: runner.DefaultNetwork}
+	fe.Networks[runner.DefaultNetwork] = engine.NetworkSpec{Name: runner.DefaultNetwork, Labels: map[string]string{engine.LabelManaged: "true"}}
 	code, out, errOut := run(t, fe, "-json", "-T", root, "stop", "-prune-net")
 	if code != ExitOK {
 		t.Fatalf("stop: %d\n%s\n%s", code, out, errOut)

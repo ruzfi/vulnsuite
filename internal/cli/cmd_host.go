@@ -38,14 +38,18 @@ probe image cannot be pulled), and the command exits non-zero.`,
 		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
 			eng, err := g.Engine(ctx)
 			if err != nil {
-				return err
+				return g.hostJSONError(err)
 			}
 			rep, err := runner.Host(ctx, eng, runner.HostProbeOptions{NoPull: noPull, Progress: g.progress()})
 			if rep == nil {
-				return err
+				return g.hostJSONError(err)
 			}
 			if g.JSON {
-				if jerr := g.emitJSON(rep); jerr != nil {
+				out := hostJSON{HostReport: rep}
+				if err != nil {
+					out.Error = err.Error()
+				}
+				if jerr := g.emitJSON(out); jerr != nil {
 					return jerr
 				}
 			} else {
@@ -67,6 +71,22 @@ probe image cannot be pulled), and the command exits non-zero.`,
 			return nil
 		},
 	}
+}
+
+// hostJSON is `host -json`'s output: the report, and error when the daemon
+// could not be asked (then the report fields are absent).
+type hostJSON struct {
+	*runner.HostReport
+	Error string `json:"error,omitempty"`
+}
+
+// hostJSONError returns err, first printing {"error": ...} under -json so
+// stdout stays valid JSON when the daemon is unreachable.
+func (g *Global) hostJSONError(err error) error {
+	if g.JSON && err != nil {
+		return errors.Join(err, g.emitJSON(hostJSON{Error: err.Error()}))
+	}
+	return err
 }
 
 func printHostReport(g *Global, rep *runner.HostReport) {

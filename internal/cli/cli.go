@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 	"unicode/utf8"
 
 	"github.com/ruzfi/vulnsuite/pkg/engine"
@@ -79,6 +80,10 @@ func (g *Global) addFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&g.Quiet, "q", g.Quiet, "less output")
 }
 
+// pingTimeout bounds the first contact with the container engine (a var for
+// tests).
+var pingTimeout = 30 * time.Second
+
 // Store resolves the templates directory into a loader.Store.
 func (g *Global) Store() (*loader.Store, error) {
 	dir, err := templates.Resolve(g.TemplatesDir)
@@ -100,7 +105,14 @@ func (g *Global) Engine(ctx context.Context) (engine.Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := e.Ping(ctx); err != nil {
+	// A listener that accepts connections but never answers would otherwise
+	// hang every command: the first contact has a deadline, on either engine.
+	pctx, cancel := context.WithTimeout(ctx, pingTimeout)
+	defer cancel()
+	if _, err := e.Ping(pctx); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			return nil, fmt.Errorf("container engine did not answer within %s: %w", pingTimeout, err)
+		}
 		return nil, err
 	}
 	g.engine = e
@@ -176,7 +188,19 @@ func mainWithEngine(ctx context.Context, eng engine.Engine, args []string, stdou
 		fmt.Fprintln(stderr, "vulnsuite:", err)
 		return ExitUsage
 	}
+	if _, err := engines.Resolve(g.EngineKind); err != nil {
+		fmt.Fprintln(stderr, "vulnsuite:", err)
+		return ExitUsage
+	}
 	if showVersion {
+		if g.JSON {
+			// As `vulnsuite -json version`.
+			if err := cmdVersion().Run(ctx, g, root, nil); err != nil {
+				fmt.Fprintln(stderr, "vulnsuite:", err)
+				return ExitFail
+			}
+			return ExitOK
+		}
 		fmt.Fprintln(stdout, versionString())
 		return ExitOK
 	}
@@ -224,6 +248,10 @@ func mainWithEngine(ctx context.Context, eng engine.Engine, args []string, stdou
 			printCommandHelp(stdout, cmd)
 			return ExitOK
 		}
+		fmt.Fprintf(stderr, "vulnsuite %s: %v\n", cmd.Name, err)
+		return ExitUsage
+	}
+	if _, err := engines.Resolve(g.EngineKind); err != nil {
 		fmt.Fprintf(stderr, "vulnsuite %s: %v\n", cmd.Name, err)
 		return ExitUsage
 	}

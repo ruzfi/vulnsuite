@@ -9,7 +9,7 @@ builds:
     flags: [-trimpath]
     ldflags:
       - -s -w
-      - -X github.com/ruzfi/vulnsuite/internal/cli.Version={{.Version}}
+      - -X github.com/ruzfi/vulnsuite/internal/cli.Version=v{{.Version}}
       - -X github.com/ruzfi/vulnsuite/internal/cli.Commit={{.ShortCommit}}
       - -X github.com/ruzfi/vulnsuite/internal/cli.Date={{.Date}}
 archives:

@@ -31,7 +31,7 @@ vulnsuite run [vulnerable|patched] -t SEL... | -f FILE | <filters> | -all [-vari
 vulnsuite stamp -t SEL... | -f FILE | <filters> | -all [-dry-run]  run every state; record metadata.verified_on when all verify ok
 vulnsuite ps                                                     running targets (id, state, ip)
 vulnsuite targets [-file FILE] [-by auto|ip|alias|host]          scannable URLs, right port per template
-vulnsuite stop [-t SEL]... [-variants] [-prune-net]              tear down (targets, their sidecars and sidecar networks; alias: down)
+vulnsuite stop [-t SEL]... [-variants] [-prune-net [-network N]] tear down (targets, their sidecars and sidecar networks; alias: down)
 vulnsuite images [-rm]                                           locally built images
 vulnsuite host [-no-pull]                                        what the daemon's machine offers: arch, CPU flags, /dev/kvm, kernel, amd64 (alias: doctor)
 vulnsuite update-templates [-repo OWNER/NAME] [-ref REF] [-force]  fetch / update the community templates (alias: ut)
@@ -49,6 +49,11 @@ SDK by default, or the built-in API client. Both follow the docker CLI's
 context (`DOCKER_CONTEXT`, else `currentContext` in `~/.docker/config.json`)
 when `DOCKER_HOST` is unset, and speak TLS to a `tcp://` daemon with
 `DOCKER_TLS_VERIFY` / `DOCKER_CERT_PATH` (`ca.pem`, `cert.pem`, `key.pem`).
+Any other `-engine` or `$VULNSUITE_ENGINE` value is a usage error (exit 2) for
+every command, `version` and `list` included. Connecting to the daemon (and the
+TLS handshake) gives up after 30 seconds on either client, and so does the first
+request when the daemon accepts the connection but never answers.
+`vulnsuite -json -version` prints the same object as `vulnsuite -json version`.
 A selector is a folder (`web-servers`), a contract file, or a template id (a
 unique substring works: `-t grafana`). A bare name is always looked up in the
 templates directory, so a file or folder called `grafana` in your working
@@ -279,6 +284,13 @@ prefix such as `docker.io/you`) matches every Docker Hub reference, bare ones
 like `nginx:1.25` included. The pair is never put in a build's registry
 config.
 
+A credential helper that fails (not installed, timed out on a locked keychain,
+exited non-zero, or printed something that is not a credential) is reported on
+stderr once per helper and registry, as `warning: credential helper
+docker-credential-<name> for <registry> ...`, and the pull or push goes on
+without its credentials. The helper's output is never printed. Its "credentials
+not found" answer is not a failure and is not reported.
+
 ## Running and verifying
 
 ```bash
@@ -346,7 +358,9 @@ unchanged: non-zero whenever anything failed or was interrupted. The same holds
 for the bare `run -json` array: once the selection is resolved it is printed
 on every way out but a usage error (`[]` when a template fails to load or
 nothing came up), and `targets -json` prints `[]` when nothing is running,
-like `ps -json`, still exiting non-zero. In `build`,
+still exiting non-zero. With the daemon unreachable, `ps -json` prints `[]`,
+`stop -json` prints `{"removed": [], "network_removed": false}` and `host
+-json` prints `{"error": "..."}`, all exiting 1. In `build`,
 jobs an interrupt stopped before they started are counted (`N ok, M failed, K
 cancelled before starting`); in the bare `-json` array they appear with an
 `error`.
@@ -395,8 +409,13 @@ is a usage error (exit 2) instead of a run that silently keeps its egress.
 `vulnsuite ps`, `targets` and `stop` find containers by their
 `dev.vulnsuite.*` labels: `stop -t foo` stops exactly template `foo` (never
 `foo-bar`), and containers vulnsuite did not start are left alone.
-`stop -prune-net` also removes `vulnsuite-net`, which only makes sense when
-stopping everything; with a selector it is a usage error. `run`
+`stop -prune-net` also removes `vulnsuite-net` (or `-network NAME`), which only
+makes sense when stopping everything; with a selector it is a usage error.
+`stop` removes targets on every network, so `-network` without `-prune-net`
+is a usage error too. Only a network vulnsuite created (labelled
+`dev.vulnsuite.managed`) is removed: `stop -prune-net -network some-other-net`
+leaves a network someone else made alone and says so, without failing the stop.
+`run`
 also records a target's published ports and their schemes on the container
 (`dev.vulnsuite.ports`), so `targets` addresses it correctly even when its
 template is outside the templates directory, was removed or changed by
@@ -631,6 +650,13 @@ failing state leaves the file untouched and fails the command. A host that does
 not meet `requires` skips the target. There is no `-ignore-requires`: the point
 is evidence from a host that qualifies. Commit the stamped contract with the
 run's output in the PR.
+
+Running a state replaces its container, so `stamp` refuses (exit 1, `-dry-run`
+included) when a selected target is already running in any state, before
+anything runs: `plain-demo [vulnerable] already running; stamp would replace
+and remove it. stop it first:  vulnsuite stop -t plain-demo`. A `-host-port-map`
+key that a selected target does not publish is a usage error (exit 2), as for
+`run`.
 
 `stamp -json` prints one object per target: `id`, `path`, `outcome`
 (`stamped`, `verified` under `-dry-run`, `failed` or `skipped`), `detail`,

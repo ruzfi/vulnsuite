@@ -112,6 +112,10 @@ type HostBinding struct {
 	Port int
 }
 
+// LabelManaged marks containers and networks vulnsuite created. A network
+// without it is never removed by vulnsuite.
+const LabelManaged = "dev.vulnsuite.managed"
+
 // NetworkSpec describes a network to create.
 type NetworkSpec struct {
 	Name    string
@@ -121,6 +125,9 @@ type NetworkSpec struct {
 	Gateway string
 	// Internal networks have no route off the host.
 	Internal bool
+	// Labels are set on the new network in addition to the managed label
+	// (dev.vulnsuite.managed=true) every engine adds.
+	Labels map[string]string
 }
 
 // Network is a network as the daemon reports it.
@@ -132,6 +139,8 @@ type Network struct {
 	// Subnet and Gateway are the first IPAM config ("" when there is none).
 	Subnet  string
 	Gateway string
+	// Labels are the network's labels.
+	Labels map[string]string
 }
 
 // HostInfo describes the daemon's platform.
@@ -193,6 +202,9 @@ type Engine interface {
 	// with its own settings (which may differ from spec): the caller compares.
 	NetworkEnsure(ctx context.Context, spec NetworkSpec) (Network, error)
 	NetworkExists(ctx context.Context, name string) (bool, error)
+	// NetworkInspect returns the network as the daemon reports it; exists
+	// is false (and err nil) when there is no network by that name.
+	NetworkInspect(ctx context.Context, name string) (n Network, exists bool, err error)
 	// NetworkRemove deletes a network; a missing network is not an error.
 	NetworkRemove(ctx context.Context, name string) error
 	// NetworkConnect attaches an existing (created or running) container to a

@@ -250,7 +250,7 @@ type Report struct {
 
 // Match resolves a contract's scanner links against idx (nil = no checkout).
 func Match(c *contract.Contract, idx *Index) Report {
-	rep := Report{Detection: c.Metadata.Detection, Indexed: idx != nil}
+	rep := Report{Detection: c.Metadata.Detection, Indexed: idx != nil, Declared: []Link{}} // [] in JSON, never null
 	// Keyed by (scanner, id): an nmap script that happens to share a nuclei
 	// template's id must not hide that template's suggestion.
 	declared := map[Ref]bool{}

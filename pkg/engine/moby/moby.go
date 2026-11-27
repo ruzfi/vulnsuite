@@ -502,6 +502,28 @@ func (e *Engine) NetworkExists(ctx context.Context, name string) (bool, error) {
 	return false, err
 }
 
+// NetworkInspect returns the network; exists is false when it is missing.
+func (e *Engine) NetworkInspect(ctx context.Context, name string) (engine.Network, bool, error) {
+	res, err := e.cli.NetworkInspect(ctx, name, client.NetworkInspectOptions{})
+	if err == nil {
+		return toNetwork(res.Network), true, nil
+	}
+	if cerrdefs.IsNotFound(err) {
+		return engine.Network{}, false, nil
+	}
+	return engine.Network{}, false, err
+}
+
+// networkLabels is spec's labels plus the managed label.
+func networkLabels(spec engine.NetworkSpec) map[string]string {
+	l := map[string]string{}
+	for k, v := range spec.Labels {
+		l[k] = v
+	}
+	l[engine.LabelManaged] = "true"
+	return l
+}
+
 // NetworkEnsure creates the network when missing and returns it as the
 // daemon reports it; an existing network is returned with its own settings.
 func (e *Engine) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (engine.Network, error) {
@@ -515,7 +537,7 @@ func (e *Engine) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (en
 		driver = "bridge"
 	}
 	opts := client.NetworkCreateOptions{Driver: driver, Internal: spec.Internal, Options: spec.Options,
-		Labels: map[string]string{"dev.vulnsuite.managed": "true"}}
+		Labels: networkLabels(spec)}
 	if spec.Subnet != "" {
 		prefix, err := netip.ParsePrefix(spec.Subnet)
 		if err != nil {
@@ -551,7 +573,7 @@ func (e *Engine) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (en
 }
 
 func toNetwork(n network.Inspect) engine.Network {
-	out := engine.Network{ID: n.ID, Driver: n.Driver, Internal: n.Internal, Options: n.Options}
+	out := engine.Network{ID: n.ID, Driver: n.Driver, Internal: n.Internal, Options: n.Options, Labels: n.Labels}
 	if len(n.IPAM.Config) > 0 {
 		c := n.IPAM.Config[0]
 		if c.Subnet.IsValid() {
