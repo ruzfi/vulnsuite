@@ -426,7 +426,9 @@ than being ignored: `-bind` outside `host` mode, and `-parent`, `-ip`,
 
 A template may publish more than one port: the primary is always published, and
 any port marked `publish: true` in the contract is published alongside it and
-added to the scanner target lists. `-host-port` pins the primary's host port;
+added to the scanner target lists. Verify probes can reach only published ports
+in this mode: a probe of an unpublished container port is skipped, and verify
+then reports skipped (not verified) unless another probe fails. `-host-port` pins the primary's host port;
 `-host-port-map container=host` pins an additional one (repeatable). Unpinned
 published ports get a free host port assigned by the Docker daemon (on its own
 machine, so this works with a remote daemon too), all reported by `ps`, `targets` and
@@ -446,7 +448,8 @@ URL. The healthcheck then runs inside the target (it checks that the port
 listens, or, for an `http` healthcheck, asks `curl` when the image has it), so
 seeds still wait for the service; an image without a shell is taken as ready
 once it runs. A check that hangs (the exec times out) counts as not ready,
-never as "no shell". `exec` and `sequence` verify probes still run, since they need
+never as "no shell"; each check's exec ends by the healthcheck timeout (with a
+1s floor), so a short `timeout` is not overrun. `exec` and `sequence` verify probes still run, since they need
 no network path: a failing one fails verify, and the network probes are
 reported as skipped. A `sequence` reports each attempt (`hit`, `pass`, `not
 reached` or `fail`) in its verify line and in `-json` under the probe's

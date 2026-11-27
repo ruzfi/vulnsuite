@@ -184,7 +184,7 @@ func TestSequenceRestartUsesReadyTimeoutAndReseeds(t *testing.T) {
 
 // untrackStepPID returns the command trackStepPID wrapped, or ok false.
 func untrackStepPID(wrapped string) (command, pidFile string, ok bool) {
-	const pre, mid = "if command -v setsid >/dev/null 2>&1; then setsid sh -c '", "' & p=$!; g=g; else sh -c '"
+	const pre, mid = "c='", "'; if command -v setsid >/dev/null 2>&1; then setsid sh -c \"$c\" & p=$!; g=g; else sh -c \"$c\""
 	rest, found := strings.CutPrefix(wrapped, pre)
 	if !found {
 		return "", "", false
@@ -259,6 +259,34 @@ func TestSequenceExpectLogLongLinesPastCap(t *testing.T) {
 	}})
 	if !r.OK || outcomes(r) != "pass" {
 		t.Fatalf("the new line was not seen: %+v", r)
+	}
+}
+
+// #151 item 1: the wrapper holds the command once, so a step of 64-128 KiB
+// (one argument is capped at 128 KiB on Linux) still fits in one argument.
+func TestTrackStepPIDCommandOnce(t *testing.T) {
+	marker := "UNIQUE-STEP-MARKER-" + strings.Repeat("y", 70<<10)
+	w := trackStepPID("echo '"+marker+"'", "/tmp/.vulnsuite-step-x")
+	if n := strings.Count(w, "UNIQUE-STEP-MARKER-"); n != 1 {
+		t.Fatalf("command appears %d times in the wrapper, want 1", n)
+	}
+	if len(w) > 80<<10 {
+		t.Errorf("wrapper is %d bytes for a 70 KiB command", len(w))
+	}
+	if runtime.GOOS == "windows" {
+		return
+	}
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		return
+	}
+	pidFile := filepath.Join(t.TempDir(), "step.pid")
+	out, err := exec.Command(sh, "-c", trackStepPID("echo '"+marker+"'", pidFile)).Output()
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if strings.TrimSpace(string(out)) != marker {
+		t.Errorf("output is %d bytes, want the marker", len(out))
 	}
 }
 

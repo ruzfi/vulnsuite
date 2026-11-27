@@ -703,8 +703,11 @@ func stepPIDFile() string {
 // group leader, so setsid execs in place and $! is the group's ID.
 func trackStepPID(command, pidFile string) string {
 	f, c := shellQuote(pidFile), shellQuote(command)
-	return fmt.Sprintf(`if command -v setsid >/dev/null 2>&1; then setsid sh -c %s & p=$!; g=g; else sh -c %s & p=$!; g=; fi; `+
-		`echo "$p $g" > %s; wait "$p"; rc=$?; rm -f %s; exit "$rc"`, c, c, f, f)
+	// #151: the command goes into the wrapper once, in a variable: one
+	// argument is capped at 128 KiB on Linux, so a step of 64-128 KiB put in
+	// twice would fail with "argument list too long".
+	return fmt.Sprintf(`c=%s; if command -v setsid >/dev/null 2>&1; then setsid sh -c "$c" & p=$!; g=g; else sh -c "$c" & p=$!; g=; fi; `+
+		`echo "$p $g" > %s; wait "$p"; rc=$?; rm -f %s; exit "$rc"`, c, f, f)
 }
 
 // killStepScript kills the process tree of the step whose PID file is

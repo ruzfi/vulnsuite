@@ -353,6 +353,10 @@
         "healthcheck": {
           "type": "object",
           "additionalProperties": false,
+          "description": "when the target is ready: an http check or a tcp check, not both",
+          "not": {
+            "required": ["http", "tcp"]
+          },
           "properties": {
             "http": {
               "type": "object",

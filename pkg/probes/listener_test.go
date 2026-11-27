@@ -66,7 +66,8 @@ func TestPortProxyWithoutListener(t *testing.T) {
 		t.Error("Reachability: a port proxy with nothing behind it must count as refused (answering, nothing listens yet)")
 	}
 
-	tgt := Target{Host: "127.0.0.1", Port: port}
+	// Host mode: the probe dials a published port (PortMap is set).
+	tgt := Target{Host: "127.0.0.1", Port: port, PortMap: map[int]int{}}
 	r := Run(ctx, contract.Probe{TCP: &contract.TCPProbe{}}, tgt)
 	if r.OK || !strings.Contains(r.Detail, "nothing is listening") {
 		t.Errorf("tcp open probe passed against a port proxy with nothing behind it: ok=%v %s", r.OK, r.Detail)
@@ -74,6 +75,39 @@ func TestPortProxyWithoutListener(t *testing.T) {
 	r = Run(ctx, contract.Probe{TCP: &contract.TCPProbe{Closed: true}}, tgt)
 	if !r.OK || !strings.Contains(r.Detail, "closed as expected") {
 		t.Errorf("tcp closed probe failed against a port proxy with nothing behind it: ok=%v %s", r.OK, r.Detail)
+	}
+}
+
+// #151: without a port proxy (internal or macvlan mode, PortMap nil) the
+// connection reaches the container itself, so a service that accepts and
+// closes at once (tcpwrapped) listens: open passes and closed: fails.
+func TestAcceptThenCloseWithoutPortProxy(t *testing.T) {
+	ctx := context.Background()
+	tgt := Target{Host: "127.0.0.1", Port: proxyServer(t)}
+	if r := Run(ctx, contract.Probe{TCP: &contract.TCPProbe{Timeout: 2}}, tgt); !r.OK {
+		t.Errorf("tcp open probe failed on an accept-then-close listener: %s", r.Detail)
+	}
+	if r := Run(ctx, contract.Probe{TCP: &contract.TCPProbe{Closed: true}}, tgt); r.OK {
+		t.Errorf("tcp closed probe passed on an accept-then-close listener: %s", r.Detail)
+	}
+}
+
+// #151: a tcp probe with no send and no banner_matches does not wait out its
+// timeout on a server that waits for the client to speak first.
+func TestTCPProbeSilentServerNoWait(t *testing.T) {
+	port := silentServer(t)
+	for name, tgt := range map[string]Target{
+		"direct": {Host: "127.0.0.1", Port: port},
+		"host":   {Host: "127.0.0.1", Port: port, PortMap: map[int]int{}},
+	} {
+		start := time.Now()
+		r := Run(context.Background(), contract.Probe{TCP: &contract.TCPProbe{Timeout: 5}}, tgt)
+		if !r.OK {
+			t.Fatalf("%s: %s", name, r.Detail)
+		}
+		if took := time.Since(start); took > ListenerGrace+time.Second {
+			t.Errorf("%s: the probe took %s, want about the listener grace", name, took)
+		}
 	}
 }
 

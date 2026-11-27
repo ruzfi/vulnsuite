@@ -965,27 +965,34 @@ func remoteProbeHint(h *Handle) string {
 		h.ScannerTarget(), bind)
 }
 
-// allTransportFailures reports whether every probe failed to reach the target
-// (so this machine could not get to it), rather than any reaching it.
+// allTransportFailures reports whether every probe that ran failed to reach
+// the target (so this machine could not get to it), rather than any reaching
+// it. Skipped probes did not run and are left out.
 func allTransportFailures(rs []probes.Result) bool {
-	if len(rs) == 0 {
-		return false
-	}
+	ran := false
 	for _, r := range rs {
+		if r.Skipped {
+			continue
+		}
 		if !r.Transport {
 			return false
 		}
+		ran = true
 	}
-	return true
+	return ran
 }
 
 // probeAddress is where a probe run on this host can reach the target, or ""
-// when it cannot (internal mode on Docker Desktop/OrbStack, macvlan).
+// when it cannot (internal mode on Docker Desktop/OrbStack, macvlan, a remote
+// daemon).
 func (r *Runner) probeAddress(h *Handle, c *contract.Contract) (string, int) {
 	if h.Exposure.Mode == ModeHost {
 		return h.EndpointHost, h.EndpointPort
 	}
-	if h.IP != "" {
+	// #151: a remote daemon's container IP is on that machine's bridge, and
+	// local and remote bridges often share a subnet (172.18.0.0/16): dialling
+	// it here could reach a local container instead. Check from inside.
+	if h.IP != "" && !h.DaemonRemote {
 		return h.IP, c.Service.PrimaryPort().Container
 	}
 	return "", 0
@@ -1171,7 +1178,9 @@ func (r *Runner) waitReadyInside(ctx context.Context, c *contract.Contract, h *H
 		if (left <= 0 && !first) || ctx.Err() != nil {
 			return false
 		}
-		code, _, err := r.Engine.ContainerExec(ctx, h.Container, cmd, insideExecTimeout)
+		// #151: never run past the deadline by more than a short floor (the
+		// first attempt runs however short the timeout).
+		code, _, err := r.Engine.ContainerExec(ctx, h.Container, cmd, insideExecBudget(left))
 		switch {
 		case ctx.Err() != nil:
 			return false
@@ -1195,12 +1204,25 @@ func (r *Runner) waitReadyInside(ctx context.Context, c *contract.Contract, h *H
 }
 
 // insideCurlMaxTime is curl's --max-time in httpScript, and insideExecTimeout
-// the exec's own timeout around it: always longer, so a slow service ends in
-// curl's "000" (not ready) instead of an exec timeout.
+// the exec's own timeout around it: longer, so a slow service ends in curl's
+// "000" (not ready) instead of an exec timeout. Near the healthcheck deadline
+// the exec timeout is clamped to the time left (insideExecBudget); an exec
+// timeout is not ready too.
 const (
 	insideCurlMaxTime = 5 * time.Second
 	insideExecTimeout = insideCurlMaxTime + 5*time.Second
 )
+
+// insideMinExecTimeout is the shortest exec timeout an inside check gets, so
+// one at the deadline still has time to start a shell.
+const insideMinExecTimeout = time.Second
+
+// insideExecBudget is the exec timeout for an inside check with left of the
+// healthcheck timeout remaining: insideExecTimeout, clamped to left (at least
+// insideMinExecTimeout).
+func insideExecBudget(left time.Duration) time.Duration {
+	return min(insideExecTimeout, max(left, insideMinExecTimeout))
+}
 
 // execMissingShell reports whether an exec failed because the image has no
 // shell (or no sh on PATH): exit 126/127 from the runtime, or the runtime's
@@ -1290,11 +1312,24 @@ func (r *Runner) runProbes(ctx context.Context, c *contract.Contract, st *contra
 	}
 	tgt.Sequence = seq
 	ok := true
+	skipped := 0
 	results := make([]probes.Result, 0, len(st.Verify))
 	for _, p := range st.Verify {
-		res := probes.Run(ctx, p, tgt)
+		var res probes.Result
+		if port, unpub := unpublishedSequencePort(p.Sequence, tgt); unpub {
+			// Every attempt would end not reached for a reason that is this
+			// host's, not the target's.
+			res = probes.Result{Kind: p.Kind(), Skipped: true, Detail: fmt.Sprintf(
+				"sequence: container port %d is not published to the host, so its network steps cannot run from here", port)}
+		} else {
+			res = probes.Run(ctx, p, tgt)
+		}
 		results = append(results, res)
-		ok = ok && res.OK
+		if res.Skipped {
+			skipped++
+		} else {
+			ok = ok && res.OK
+		}
 		if p.Kind() == "sequence" {
 			// A sequence may have restarted the target, and the daemon may
 			// have given its published ports other host ports: later
@@ -1313,9 +1348,48 @@ func (r *Runner) runProbes(ctx context.Context, c *contract.Contract, st *contra
 		h.VerifyDetail = remoteProbeHint(h)
 		return
 	}
-	h.VerifyOK = &ok
 	h.Probes = results
 	h.VerifyDetail = probes.FormatResults(results)
+	if skipped > 0 {
+		// #151: a probe of a container port that is not published to the host
+		// cannot run from here; it neither passes nor fails. As in
+		// runExecProbesOnly, a failure among the others fails verify, and
+		// otherwise the result is partial: not verified (VerifyOK nil).
+		h.VerifyDetail += fmt.Sprintf("\nskip %d probe(s): %s", skipped, unpublishedHint)
+		if ok {
+			return
+		}
+	}
+	h.VerifyOK = &ok
+}
+
+// unpublishedHint explains a probe skipped for an unpublished port.
+const unpublishedHint = "in host mode only published container ports can be probed from this machine; " +
+	"mark the port publish: true in the contract, or run with -expose internal"
+
+// unpublishedSequencePort returns the port of the first http, tcp or net step
+// of s that tgt cannot dial because the port is not published to the host.
+func unpublishedSequencePort(s *contract.SequenceProbe, tgt probes.Target) (int, bool) {
+	if s == nil {
+		return 0, false
+	}
+	for _, st := range s.Steps {
+		port, network := 0, true
+		switch {
+		case st.HTTP != nil:
+			port = st.HTTP.Port
+		case st.TCP != nil:
+			port = st.TCP.Port
+		case st.Net != nil:
+			port = st.Net.Port
+		default:
+			network = false
+		}
+		if network && tgt.Unpublished(port) {
+			return port, true
+		}
+	}
+	return 0, false
 }
 
 // networkTarget is where network probes reach the target from this machine,

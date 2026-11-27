@@ -299,7 +299,9 @@ func TestInsideHealthcheckExecTimeoutExceedsCurl(t *testing.T) {
 	fe := enginetest.New()
 	r := unreachableRunner(fe)
 	c := load(t, "redis-unauthenticated-access")
-	h, err := r.Run(context.Background(), c, "vulnerable", DefaultExposure(), Options{ReadyTimeout: 100 * time.Millisecond, Build: builder.Options{Pull: true}})
+	// #151 clamps the exec timeout to the time left; with time to spare it
+	// is the full insideExecTimeout.
+	h, err := r.Run(context.Background(), c, "vulnerable", DefaultExposure(), Options{ReadyTimeout: time.Minute, Build: builder.Options{Pull: true}})
 	if err != nil || !h.Ready {
 		t.Fatalf("run: %v, ready %v", err, h != nil && h.Ready)
 	}

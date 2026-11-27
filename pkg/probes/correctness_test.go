@@ -163,8 +163,28 @@ func TestProbePortMapTranslatesContainerPorts(t *testing.T) {
 	if r.OK || !strings.Contains(r.Detail, "not published") {
 		t.Fatalf("closed: on an unpublished port must not pass: ok=%v %s", r.OK, r.Detail)
 	}
+	if !r.Skipped || r.Transport {
+		t.Errorf("#151: closed: on an unpublished port must be skipped, not failed: %+v", r)
+	}
 	r = Run(ctx, contract.Probe{TCP: &contract.TCPProbe{Port: 9999}}, tgt)
 	if r.OK || !strings.Contains(r.Detail, "not published") {
 		t.Fatalf("tcp on an unpublished port: ok=%v %s", r.OK, r.Detail)
+	}
+	// #151: every network kind on an unpublished port is skipped.
+	for _, p := range []contract.Probe{
+		{TCP: &contract.TCPProbe{Port: 9999}},
+		{HTTP: &contract.HTTPProbe{Port: 9999, Path: "/"}},
+		{Net: &contract.NetProbe{Port: 9999, Steps: []contract.NetStep{{Send: "x"}}}},
+	} {
+		if r := Run(ctx, p, tgt); r.OK || !r.Skipped {
+			t.Errorf("%s on an unpublished port: want skipped, got %+v", p.Kind(), r)
+		}
+	}
+	// A published port that fails is never skipped.
+	if r := Run(ctx, contract.Probe{TCP: &contract.TCPProbe{Port: 6379, Closed: true}}, tgt); r.Skipped {
+		t.Errorf("a failed probe on a published port was marked skipped: %+v", r)
+	}
+	if got := FormatResults([]Result{{Skipped: true, Detail: "d"}}); got != "skip d" {
+		t.Errorf("FormatResults(skipped) = %q", got)
 	}
 }
