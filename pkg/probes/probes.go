@@ -76,7 +76,24 @@ func (t Target) dialPort(p int) (int, error) {
 	if hp, ok := t.PortMap[p]; ok {
 		return hp, nil
 	}
-	return 0, fmt.Errorf("container port %d is not published to the host, so it cannot be probed from here", p)
+	return 0, &unpublishedError{port: p}
+}
+
+// unpublishedError is dialPort's error for a container port that is not
+// published to the host (host exposure mode). #151: the probe is not run, so
+// it is neither a pass nor a fail; Run marks the result Skipped.
+type unpublishedError struct{ port int }
+
+func (e *unpublishedError) Error() string {
+	return fmt.Sprintf("container port %d is not published to the host, so it cannot be probed from here", e.port)
+}
+
+// Unpublished reports whether a probe naming container port p (0 = the
+// target's own port) cannot be dialled from here because the port is not
+// published to the host.
+func (t Target) Unpublished(p int) bool {
+	_, err := t.dialPort(p)
+	return err != nil
 }
 
 // portScheme is the scheme of the port a probe names (0 = the default port).
@@ -100,6 +117,10 @@ type Result struct {
 	// lets a caller tell "I can't get to this address from here" from "the
 	// service answered but is in the wrong state".
 	Transport bool `json:"transport,omitempty"`
+	// Skipped is set when the probe was not run because its port is not
+	// reachable from here at all (a container port not published to the host
+	// in host exposure mode): it neither passed nor failed. OK is false.
+	Skipped bool `json:"skipped,omitempty"`
 	// Attempts is each attempt of a sequence probe, in order (nil for the
 	// other kinds).
 	Attempts []SequenceAttempt `json:"attempts,omitempty"`
@@ -442,13 +463,15 @@ func Run(ctx context.Context, p contract.Probe, t Target) Result {
 	default:
 		err = fmt.Errorf("unknown probe kind %q", p.Kind())
 	}
-	transport := false
+	transport, skipped := false, false
 	if err != nil {
 		ok, detail = false, err.Error()
 		var ce *connError
 		transport = errors.As(err, &ce)
+		var ue *unpublishedError
+		skipped = errors.As(err, &ue)
 	}
-	return Result{Kind: p.Kind(), OK: ok, Detail: detail, Transport: transport, Elapsed: time.Since(started)}
+	return Result{Kind: p.Kind(), OK: ok, Detail: detail, Transport: transport, Skipped: skipped, Elapsed: time.Since(started)}
 }
 
 func runHTTP(ctx context.Context, s *contract.HTTPProbe, t Target) (bool, string, error) {
@@ -461,7 +484,7 @@ func runHTTP(ctx context.Context, s *contract.HTTPProbe, t Target) (bool, string
 	}
 	port, err := t.dialPort(s.Port)
 	if err != nil {
-		return false, "", fmt.Errorf("%s -> %v", path, err)
+		return false, "", fmt.Errorf("%s -> %w", path, err)
 	}
 	resp, err := RawHTTP(ctx, t.Host, port, s.Method, path, s.Headers, s.Body, secs(s.Timeout, 10*time.Second), t.portScheme(s.Port) == "https")
 	if err != nil {
@@ -554,8 +577,9 @@ func runTCP(ctx context.Context, s *contract.TCPProbe, t Target) (bool, string, 
 	dport, err := t.dialPort(s.Port)
 	if err != nil {
 		// Not reachable from here at all: neither "open" nor "closed" can be
-		// asserted, so a closed: probe must not pass by default.
-		return false, "", fmt.Errorf("tcp %d -> %v", port, err)
+		// asserted, so a closed: probe must not pass by default; Run marks it
+		// skipped.
+		return false, "", fmt.Errorf("tcp %d -> %w", port, err)
 	}
 	timeout := secs(s.Timeout, 10*time.Second)
 	d := net.Dialer{Timeout: timeout}
@@ -564,11 +588,15 @@ func runTCP(ctx context.Context, s *contract.TCPProbe, t Target) (bool, string, 
 		defer conn.Close()
 	}
 	// A port proxy accepts for a port nothing listens on, then closes: that
-	// connection does not make the port open.
+	// connection does not make the port open. #151: only host mode
+	// (PortMap set) dials a port proxy; elsewhere the connection reaches the
+	// container itself, so an accept means something listens, even if it
+	// closes at once (a tcpwrapped service).
 	var early []byte
 	listening := err == nil
 	if listening {
 		early, listening = checkListener(conn, min(ListenerGrace, timeout))
+		listening = listening || t.PortMap == nil
 	}
 	if s.Closed {
 		// Asserting the port is NOT open: only a refused connection (or a
@@ -602,10 +630,12 @@ func runTCP(ctx context.Context, s *contract.TCPProbe, t Target) (bool, string, 
 		}
 	}
 	// The listener check may already hold the greeting. Read on when a reply
-	// to send is due, when nothing arrived yet, or when the greeting so far
-	// does not match banner_matches (it may continue in later segments). A
-	// timeout yields an empty banner, which may be the expected result.
-	if s.Send != "" || len(early) == 0 || (s.BannerMatches != "" && !matchDotAll(s.BannerMatches, banner)) {
+	// to send is due or the greeting so far does not match banner_matches (it
+	// may continue in later segments). #151: with neither there is nothing to
+	// wait for: a server that waits for the client to speak first (HTTP,
+	// redis, databases) would hold the probe for its whole timeout. A timeout
+	// yields an empty banner, which may be the expected result.
+	if s.Send != "" || (s.BannerMatches != "" && !matchDotAll(s.BannerMatches, banner)) {
 		banner = readUntilFrom(conn, early, 4096, s.BannerMatches, deadline)
 	}
 	if err := ctx.Err(); err != nil {
@@ -624,7 +654,7 @@ func runNet(ctx context.Context, s *contract.NetProbe, t Target) (bool, string, 
 	}
 	dport, err := t.dialPort(s.Port)
 	if err != nil {
-		return false, "", fmt.Errorf("net %d -> %v", port, err)
+		return false, "", fmt.Errorf("net %d -> %w", port, err)
 	}
 	timeout := secs(s.Timeout, 15*time.Second)
 	d := net.Dialer{Timeout: timeout}
@@ -763,9 +793,12 @@ func FormatResults(rs []Result) string {
 		if i > 0 {
 			b.WriteByte('\n')
 		}
-		if r.OK {
+		switch {
+		case r.OK:
 			b.WriteString("ok   ")
-		} else {
+		case r.Skipped:
+			b.WriteString("skip ")
+		default:
 			b.WriteString("FAIL ")
 		}
 		b.WriteString(r.Detail)

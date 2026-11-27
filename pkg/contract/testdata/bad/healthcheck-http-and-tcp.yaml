@@ -1,0 +1,19 @@
+# want: service/healthcheck
+apiVersion: vulnsuite/v1
+kind: Target
+metadata:
+  id: demo-bad
+  summary: a contract with one invalid value
+base:
+  kind: image
+  image: nginx:1.27
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+service:
+  ports: [ { container: 80, protocol: http } ]
+  healthcheck:
+    tcp: { port: 80 }
+    http: { path: / }
+states:
+  vulnerable:
+    verify:
+      - http: { path: /, status: 200 }

@@ -541,6 +541,12 @@ func (c *Contract) checkStructure(present map[string]any, sidecarKeys []map[stri
 			return se("service/devices", "%q is not an allowed device (allowed: /dev/kvm, /dev/net/tun, /dev/fuse, /dev/vhost-net, /dev/vhost-vsock, /dev/dri/cardN, /dev/dri/renderDN); raw disk/memory and other host devices are never needed for a target", d)
 		}
 	}
+	if s.Healthcheck.HTTP != nil && s.Healthcheck.TCP != nil {
+		// #151: one check, one port. With both, the check from here used
+		// http on the primary port while the check inside the target sent
+		// HTTP to the tcp port.
+		return se("service/healthcheck", "set http or tcp, not both")
+	}
 	if t := s.Healthcheck.Timeout; t != "" {
 		if !timeoutRe.MatchString(t) {
 			return se("service/healthcheck/timeout", "%q must look like 60s or 5m", t)

@@ -124,7 +124,7 @@ base: { kind: build, context: src, dockerfile: Dockerfile, build_args: {} }
 | `ports` | required; `{ container: 80, protocol: http }`. Protocols: `http`, `https`, `tcp`, `ssh`, `ftp`, `smtp`, `redis`, `mysql`, `postgres`. The first HTTP port (else the first port) is the **primary** port a scanner is pointed at, always published. Add `publish: true` to a secondary port to publish it too (host mode) and include it in scanner target lists; unmarked secondary ports stay internal. Container ports must be unique. |
 | `command` | string or list; overrides the image command |
 | `environment` | map; merged with the state's environment (state wins) |
-| `healthcheck` | `{ http: { path, status }, timeout: 60s }` or `{ tcp: { port }, timeout }`; `timeout` is `<n>s|m|h`, greater than 0 and at most `24h` (default 60s). When the target cannot be reached from the machine running vulnsuite, it is checked from inside the target: the port must be listening, and an `http` check uses `curl` if the image has it |
+| `healthcheck` | `{ http: { path, status }, timeout: 60s }` or `{ tcp: { port }, timeout }` (not both: an `http` check uses the primary port); `timeout` is `<n>s|m|h`, greater than 0 and at most `24h` (default 60s). When the target cannot be reached from the machine running vulnsuite, it is checked from inside the target: the port must be listening, and an `http` check uses `curl` if the image has it |
 | `sidecars` | helper containers `{ name, image, digest, command, environment }` (names unique, matching `^[A-Za-z0-9][A-Za-z0-9_.-]*$`: a name is part of the sidecar's container name and its network alias) started with each target state on a private network shared only with that state's target, reachable there by `name` in every exposure mode; each state gets its own sidecars (`command` sets the container command, e.g. a `server ...` arg list for a clustered node). Instead of `image`/`digest` a sidecar may have a `build: { context, dockerfile, build_args }` to run an image built from the template, e.g. a driver or fake-DNS sidecar that runs the template's own scripts: exactly one of `image` and `build` is set, and a `build` takes no `digest`. See **Built sidecars** below |
 | `user` | run-as `uid` or `uid:gid` |
 | `cap_add` / `cap_drop` | Linux capabilities, e.g. `cap_drop: [ALL]` then `cap_add: [CAP_NET_BIND_SERVICE]` |
@@ -321,12 +321,24 @@ accepted and closed at once by a port proxy (below). A dial that times out,
 finds no route or cannot resolve the host proves nothing about the port, so
 it counts as "could not verify from here", not as a pass.
 
+In `-expose host` mode only published ports (the primary and any `publish:
+true` port) are reachable from the machine running vulnsuite. A network probe,
+or a `sequence` with a network step, that names any other container port is
+skipped (`skip` in the verify detail, `skipped` in `-json`): it neither passes
+nor fails. As when the target cannot be reached at all, a failing probe still
+fails verify; otherwise verify is reported as skipped (not verified), not as
+passed. Publish the port, or run with `-expose internal`, to check it.
+
 A port counts as open, for a `tcp` probe and for a `tcp` (or default)
-healthcheck, only when something listens on it. A connection that is accepted
-and then closed within 300ms without a byte counts as closed: in host exposure
-mode the published port is held by Docker's port proxy, which accepts before the
-service listens in the container. A server that greets the client, or one that
-waits for the client to speak first, counts as open.
+healthcheck, only when something listens on it. In host exposure mode a
+connection that is accepted and then closed within 300ms without a byte counts
+as closed: the published port is held by Docker's port proxy, which accepts
+before the service listens in the container. In `internal` and `macvlan` mode
+there is no proxy, so such a connection means something listens (a
+tcpwrapped service counts as open). A server that greets the client, or one
+that waits for the client to speak first, counts as open. A `tcp` probe with
+neither `send` nor `banner_matches` does not wait for a banner: once the port
+counts as open it passes, after at most 300ms.
 
 The `net` probe runs an ordered send/expect dialogue over a single TCP connection (optionally TLS), for multi-step protocols -- FTP SITE commands, SMTP, line protocols -- that a one-shot `tcp` probe cannot express. Each step optionally sends bytes, then reads the response and asserts `expect` (regex must match) and/or `expect_absent`. A response is read across TCP segments: reading stops once `expect` matches, after `read` bytes (1-65536, default 4096), when the server closes, after 500ms without more data, or at the probe timeout. So a multi-line reply (`220-Welcome` then `220 ready`) is judged whole and none of it leaks into the next step. A `tcp` probe reads its banner the same way, up to `banner_matches`. The connection is TLS when `tls: true` is set or when the probed port is declared `protocol: https` (the primary port when `port` is left out); a dialogue with any other port, e.g. SMTP on 25 of an https target, stays plain.
 
