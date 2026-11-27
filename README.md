@@ -162,8 +162,9 @@ useful as ground truth if a machine can stand it up, prove it, scan it and
 tear it down without a human in the loop.
 
 - Every command takes `-json` and returns structured output (progress goes
-  to stderr; empty results are `[]`), and exits non-zero when a target fails
-  to build, start or verify. Flag mistakes exit 2. `-q` silences progress,
+  to stderr; empty results are `[]`, also when the daemon is unreachable), and
+  exits non-zero when a target fails to build, start or verify. Flag mistakes,
+  an unknown `-engine` included, exit 2. `-q` silences progress,
   never a command's output (`vulnsuite -q targets` still prints the URLs).
 - `vulnsuite run -detach -targets-file` plus `vulnsuite targets` give a
   scanner exactly the URLs to hit; `vulnsuite stop` cleans up.

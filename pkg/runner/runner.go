@@ -41,7 +41,7 @@ const (
 const DefaultNetwork = "vulnsuite-net"
 
 // LabelManaged marks containers vulnsuite started.
-const LabelManaged = "dev.vulnsuite.managed"
+const LabelManaged = engine.LabelManaged
 
 // Labels stamped on the containers vulnsuite runs, next to builder.LabelID and
 // builder.LabelState (both set on targets and sidecars). The fleet commands
@@ -1610,6 +1610,19 @@ func (r *Runner) StopAll(ctx context.Context, templateID string) ([]string, erro
 func (r *Runner) PruneNetwork(ctx context.Context, network string) error {
 	if network == "" {
 		network = DefaultNetwork
+	}
+	n, exists, err := r.Engine.NetworkInspect(ctx, network)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	// Only a network vulnsuite created is removed: -network may name any
+	// network on the daemon, and an empty one someone else made must not
+	// go with a `stop -prune-net`.
+	if n.Labels[LabelManaged] != "true" {
+		return fmt.Errorf("network %s was not created by vulnsuite (no %s label); not removing it (remove it yourself with \"docker network rm %s\" if it is yours)", network, LabelManaged, network)
 	}
 	return r.Engine.NetworkRemove(ctx, network)
 }

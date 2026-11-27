@@ -25,6 +25,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -339,30 +342,77 @@ func (c *dockerConfig) fromHelper(ctx context.Context, helper, server string) (C
 	}
 }
 
+// Warnings receives a line when a credential helper fails (missing, timed
+// out, exited non-zero, unreadable output), so a pull that then fails as
+// "unauthorized" is explained. Only the helper, the server and the failure
+// are printed, never the helper's output (it may hold a secret). nil
+// silences it.
+var Warnings io.Writer = os.Stderr
+
+// warned dedupes helper warnings: one per helper and server per process.
+var warned sync.Map
+
+func warnHelper(helper, server, format string, args ...any) {
+	if Warnings == nil {
+		return
+	}
+	if _, dup := warned.LoadOrStore(helper+"\x00"+server, true); dup {
+		return
+	}
+	fmt.Fprintf(Warnings, "warning: credential helper docker-credential-%s for %s %s; continuing without its credentials\n",
+		helper, server, fmt.Sprintf(format, args...))
+}
+
+// helperNotFound reports whether a helper's output is the docker credential
+// protocol's "no credentials for this server" answer, which is no failure.
+func helperNotFound(out []byte) bool {
+	return bytes.Contains(bytes.ToLower(out), []byte("credentials not found"))
+}
+
 // runHelper runs docker-credential-<helper> get for server, bounded by ctx and
 // helperTimeout.
 func runHelper(ctx context.Context, helper, server string) (Config, bool) {
 	bin := "docker-credential-" + helper
 	if _, err := exec.LookPath(bin); err != nil {
+		warnHelper(helper, server, "is not installed (%s not found in PATH)", bin)
 		return Config{}, false
 	}
-	ctx, cancel := context.WithTimeout(ctx, helperTimeout)
+	hctx, cancel := context.WithTimeout(ctx, helperTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, bin, "get")
+	cmd := exec.CommandContext(hctx, bin, "get")
 	cmd.Stdin = strings.NewReader(server)
-	var out bytes.Buffer
+	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
+	cmd.Stderr = &errOut
 	// Do not wait on output pipes held open by the helper's own children
 	// once it has been killed.
 	cmd.WaitDelay = time.Second
 	if err := cmd.Run(); err != nil {
+		switch {
+		case ctx.Err() != nil:
+			// The caller gave up (Ctrl-C): not the helper's failure.
+		case errors.Is(hctx.Err(), context.DeadlineExceeded):
+			warnHelper(helper, server, "did not answer within %s (a locked keychain waiting for a prompt?)", helperTimeout)
+		case helperNotFound(out.Bytes()) || helperNotFound(errOut.Bytes()):
+		default:
+			var ee *exec.ExitError
+			if errors.As(err, &ee) {
+				warnHelper(helper, server, "failed (exit status %d)", ee.ExitCode())
+			} else {
+				warnHelper(helper, server, "could not run: %v", err)
+			}
+		}
 		return Config{}, false
 	}
 	var r struct {
 		Username string `json:"Username"`
 		Secret   string `json:"Secret"`
 	}
-	if json.Unmarshal(out.Bytes(), &r) != nil || r.Secret == "" {
+	if err := json.Unmarshal(out.Bytes(), &r); err != nil {
+		warnHelper(helper, server, "returned output that is not a credential")
+		return Config{}, false
+	}
+	if r.Secret == "" {
 		return Config{}, false
 	}
 	a := Config{Username: r.Username, Password: r.Secret, ServerAddress: server}

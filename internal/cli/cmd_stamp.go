@@ -135,15 +135,34 @@ Targets run one at a time, and each state is torn down before the next.`,
 				// not a silent success that stamped nothing.
 				return fmt.Errorf("nothing to stamp")
 			}
+			if len(exp.HostPortMap) > 0 {
+				// As run: a pin must name a port the target publishes, or it
+				// would be silently dropped. Targets run one at a time, so
+				// the pin may serve each in turn; each must publish it.
+				for _, c := range cs {
+					if err := checkHostPortMap(exp.HostPortMap, c); err != nil {
+						return err
+					}
+				}
+			}
 			eng, err := g.Engine(ctx)
 			if err != nil {
 				return err
+			}
+			// Running a state replaces its container: a target the user has
+			// up would be torn down (and removed at the end). Refuse before
+			// any state runs, -dry-run included.
+			r := runner.New(eng)
+			if busy, err := runningTargets(ctx, r, cs); err != nil {
+				return fmt.Errorf("check for running targets: %w", err)
+			} else if len(busy) > 0 {
+				return fmt.Errorf("%s already running; stamp would replace and remove it. stop it first:  vulnsuite stop %s",
+					strings.Join(busy, ", "), stopSelectors(busy))
 			}
 			host, err := eng.Info(ctx)
 			if err != nil {
 				return err
 			}
-			r := runner.New(eng)
 			pf := &preflighter{ctx: ctx, g: g, eng: eng, host: host, noPull: noPull}
 			opts := runner.Options{Verify: true, AllowHostAccess: allowHostAccess, ReadyTimeout: readyTimeoutD,
 				Build: builder.Options{Pull: !noPull, NoCache: noCache, Force: force}}
@@ -199,6 +218,42 @@ Targets run one at a time, and each state is torn down before the next.`,
 			return nil
 		},
 	}
+}
+
+// runningTargets returns "id [state]" for every declared state of cs whose
+// target container is running.
+func runningTargets(ctx context.Context, r *runner.Runner, cs []*contract.Contract) ([]string, error) {
+	rows, err := r.Running(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	up := map[string]bool{}
+	for _, t := range rows {
+		up[strings.TrimPrefix(t.Container, "/")] = true
+	}
+	var busy []string
+	for _, c := range cs {
+		for _, state := range c.DeclaredStates() {
+			if up[c.ContainerName(state)] {
+				busy = append(busy, c.ID()+" ["+state+"]")
+			}
+		}
+	}
+	return busy, nil
+}
+
+// stopSelectors turns runningTargets entries into `-t id` arguments.
+func stopSelectors(busy []string) string {
+	seen := map[string]bool{}
+	var out []string
+	for _, b := range busy {
+		id, _, _ := strings.Cut(b, " ")
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, "-t "+id)
+		}
+	}
+	return strings.Join(out, " ")
 }
 
 // stampOne runs every declared state of c and returns the outcome; on

@@ -657,15 +657,41 @@ func (f *Fake) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (engi
 	// Like the real engines, an existing network is returned as it is: its
 	// settings are not updated to spec.
 	if _, ok := f.Networks[spec.Name]; !ok {
+		// As the real engines, a network vulnsuite creates carries the
+		// managed label. Tests add f.Networks entries directly to stand
+		// for networks someone else made (no label).
+		labels := map[string]string{}
+		for k, v := range spec.Labels {
+			labels[k] = v
+		}
+		labels[engine.LabelManaged] = "true"
+		spec.Labels = labels
 		f.Networks[spec.Name] = spec
 	}
-	n := f.Networks[spec.Name]
+	return fakeNetwork(f.Networks[spec.Name]), nil
+}
+
+func fakeNetwork(n engine.NetworkSpec) engine.Network {
 	driver := n.Driver
 	if driver == "" {
 		driver = "bridge"
 	}
-	return engine.Network{ID: "net-" + spec.Name, Driver: driver, Internal: n.Internal, Options: n.Options,
-		Subnet: n.Subnet, Gateway: n.Gateway}, nil
+	return engine.Network{ID: "net-" + n.Name, Driver: driver, Internal: n.Internal, Options: n.Options,
+		Subnet: n.Subnet, Gateway: n.Gateway, Labels: n.Labels}
+}
+
+// NetworkInspect returns the network; exists is false when it is missing.
+func (f *Fake) NetworkInspect(ctx context.Context, name string) (engine.Network, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return engine.Network{}, false, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n, ok := f.Networks[name]
+	if !ok {
+		return engine.Network{}, false, nil
+	}
+	return fakeNetwork(n), true, nil
 }
 
 func (f *Fake) NetworkExists(ctx context.Context, name string) (bool, error) {

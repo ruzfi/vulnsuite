@@ -27,6 +27,7 @@ type networkJSON struct {
 	Driver   string            `json:"Driver"`
 	Internal bool              `json:"Internal"`
 	Options  map[string]string `json:"Options"`
+	Labels   map[string]string `json:"Labels"`
 	IPAM     struct {
 		Config []struct {
 			Subnet  string `json:"Subnet"`
@@ -36,7 +37,7 @@ type networkJSON struct {
 }
 
 func (n networkJSON) network() engine.Network {
-	out := engine.Network{ID: n.ID, Driver: n.Driver, Internal: n.Internal, Options: n.Options}
+	out := engine.Network{ID: n.ID, Driver: n.Driver, Internal: n.Internal, Options: n.Options, Labels: n.Labels}
 	if len(n.IPAM.Config) > 0 {
 		out.Subnet, out.Gateway = n.IPAM.Config[0].Subnet, n.IPAM.Config[0].Gateway
 	}
@@ -49,6 +50,28 @@ func (c *Client) networkInspect(ctx context.Context, name string) (engine.Networ
 		return engine.Network{}, err
 	}
 	return n.network(), nil
+}
+
+// NetworkInspect returns the network; exists is false when it is missing.
+func (c *Client) NetworkInspect(ctx context.Context, name string) (engine.Network, bool, error) {
+	n, err := c.networkInspect(ctx, name)
+	if err == nil {
+		return n, true, nil
+	}
+	if IsNotFound(err) {
+		return engine.Network{}, false, nil
+	}
+	return engine.Network{}, false, err
+}
+
+// networkLabels is spec's labels plus the managed label.
+func networkLabels(spec engine.NetworkSpec) map[string]string {
+	l := map[string]string{}
+	for k, v := range spec.Labels {
+		l[k] = v
+	}
+	l[engine.LabelManaged] = "true"
+	return l
 }
 
 // NetworkEnsure creates the network when missing and returns it as the
@@ -68,7 +91,7 @@ func (c *Client) NetworkEnsure(ctx context.Context, spec engine.NetworkSpec) (en
 		"Driver":         driver,
 		"CheckDuplicate": true,
 		"Internal":       spec.Internal,
-		"Labels":         map[string]string{"dev.vulnsuite.managed": "true"},
+		"Labels":         networkLabels(spec),
 	}
 	if len(spec.Options) > 0 {
 		body["Options"] = spec.Options

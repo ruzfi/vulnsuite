@@ -106,3 +106,32 @@ func TestNetworkWithOtherDriverIsRefused(t *testing.T) {
 		t.Fatalf("want a driver mismatch error, got %v", err)
 	}
 }
+
+// #153: PruneNetwork removes only a network vulnsuite created (managed
+// label); -network may name any network on the daemon.
+func TestPruneNetworkRefusesUnmanaged(t *testing.T) {
+	fe, r := lifecycleRunner()
+	ctx := context.Background()
+	fe.Networks["user-net"] = engine.NetworkSpec{Name: "user-net"}
+	err := r.PruneNetwork(ctx, "user-net")
+	if err == nil || !strings.Contains(err.Error(), "not created by vulnsuite") {
+		t.Fatalf("PruneNetwork(user-net) = %v, want a refusal", err)
+	}
+	if _, ok := fe.Networks["user-net"]; !ok {
+		t.Fatal("an unmanaged network was removed")
+	}
+	// One a run created goes; a missing one is no error.
+	mustRun(t, r, sidecarContract("foo"), "vulnerable", DefaultExposure())
+	if _, err := r.StopAll(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.PruneNetwork(ctx, DefaultNetwork); err != nil {
+		t.Fatalf("PruneNetwork(%s): %v", DefaultNetwork, err)
+	}
+	if _, ok := fe.Networks[DefaultNetwork]; ok {
+		t.Fatal("the managed network was not removed")
+	}
+	if err := r.PruneNetwork(ctx, DefaultNetwork); err != nil {
+		t.Fatalf("PruneNetwork of a missing network: %v", err)
+	}
+}

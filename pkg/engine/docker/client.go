@@ -37,6 +37,9 @@ const (
 	MaxAPIVersion = "1.47"
 )
 
+// DialTimeout bounds connecting to the daemon and the TLS handshake.
+const DialTimeout = 30 * time.Second
+
 // Client talks to one daemon.
 type Client struct {
 	http    *http.Client
@@ -112,18 +115,26 @@ func New(host string) (*Client, error) {
 func NewEndpoint(ep Endpoint) (*Client, error) {
 	host := ep.Host
 	c := &Client{host: host}
+	// A daemon that cannot be reached must not hang the CLI: connecting and
+	// the TLS handshake are bounded, as the Moby SDK does. There is no
+	// ResponseHeaderTimeout: the same transport serves builds, pulls, logs,
+	// attach and waits, which can take long before the first byte. A daemon
+	// that accepts but never answers is caught by the caller's deadline on
+	// the first Ping.
+	dialer := &net.Dialer{Timeout: DialTimeout, KeepAlive: 30 * time.Second}
 	transport := &http.Transport{
+		DialContext:           dialer.DialContext,
+		TLSHandshakeTimeout:   DialTimeout,
 		MaxIdleConns:          8,
 		IdleConnTimeout:       90 * time.Second,
-		ResponseHeaderTimeout: 0, // builds and pulls can take a long time before the first byte
+		ResponseHeaderTimeout: 0,
 		Proxy:                 nil,
 	}
 	switch {
 	case strings.HasPrefix(host, "unix://"):
 		path := strings.TrimPrefix(host, "unix://")
 		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, "unix", path)
+			return dialer.DialContext(ctx, "unix", path)
 		}
 		c.baseURL = "http://docker"
 	case strings.HasPrefix(host, "tcp://"), strings.HasPrefix(host, "http://"), strings.HasPrefix(host, "https://"):

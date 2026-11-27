@@ -691,18 +691,33 @@ func cmdStop() *Command {
 	return &Command{
 		Name: "stop", Aliases: []string{"down"},
 		Short: "tear down running targets (all, or selected templates)",
-		Usage: "[-t SELECTOR]... [-variants] [-prune-net]",
+		Usage: "[-t SELECTOR]... [-variants] [-prune-net [-network NAME]]",
 		Flags: func(fs *flag.FlagSet) {
 			fs.Var(&sel, "t", "only this template/selector or suite:<name> (repeatable; default: everything vulnsuite started)")
-			fs.StringVar(&network, "network", runner.DefaultNetwork, "internal network name")
+			fs.StringVar(&network, "network", runner.DefaultNetwork, "the network -prune-net removes (only one vulnsuite created)")
 			fs.BoolVar(&variantsStop, "variants", false, "when a selector names a group, stop every member (default: just its primary)")
 			fs.BoolVar(&pruneNet, "prune-net", false, "also remove the internal network when stopping everything")
 		},
-		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
+		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) (retErr error) {
 			sel = append(sel, args...)
 			if pruneNet && len(sel) > 0 {
 				return usageError{"-prune-net removes the network only when stopping everything; drop the selectors, or run `vulnsuite stop -prune-net` once the rest is down"}
 			}
+			// As #113: a flag that would be silently ignored is refused.
+			// stop removes containers by label wherever they are; -network
+			// only names the network -prune-net removes.
+			if flagSet(fs, "network") && !pruneNet {
+				return usageError{"-network names the network -prune-net removes; stop removes targets on every network without it. add -prune-net, or drop -network"}
+			}
+			removed := []string{} // -json prints [] (not null) when nothing ran
+			networkRemoved := false
+			// With -json stdout always carries the result object, on a
+			// failure too (an unreachable engine: nothing removed).
+			defer func() {
+				if g.JSON {
+					retErr = errors.Join(retErr, g.emitJSON(map[string]any{"removed": removed, "network_removed": networkRemoved}))
+				}
+			}()
 			eng, err := g.Engine(ctx)
 			if err != nil {
 				return err
@@ -747,7 +762,6 @@ func cmdStop() *Command {
 			} else {
 				ids = []string{""}
 			}
-			removed := []string{} // -json prints [] (not null) when nothing ran
 			for _, id := range ids {
 				names, err := r.StopAll(ctx, id)
 				removed = append(removed, names...)
@@ -758,23 +772,21 @@ func cmdStop() *Command {
 			// Prune before reporting, so -json carries the outcome too. A network
 			// that cannot be removed (still in use, already gone) is a warning,
 			// not a failed stop.
-			networkRemoved := false
 			var pruneErr error
 			if pruneNet && len(sel) == 0 {
 				if pruneErr = r.PruneNetwork(ctx, network); pruneErr == nil {
 					networkRemoved = true
 				}
 			}
-			if g.JSON {
-				if err := g.emitJSON(map[string]any{"removed": removed, "network_removed": networkRemoved}); err != nil {
-					return err
-				}
-			} else if len(removed) == 0 {
-				g.printf("nothing to stop\n")
-			} else {
-				g.printf("stopped %d container(s):\n", len(removed))
-				for _, n := range removed {
-					g.printf("  %s\n", n)
+			// -json: the deferred emit prints the result.
+			if !g.JSON {
+				if len(removed) == 0 {
+					g.printf("nothing to stop\n")
+				} else {
+					g.printf("stopped %d container(s):\n", len(removed))
+					for _, n := range removed {
+						g.printf("  %s\n", n)
+					}
 				}
 			}
 			switch {
@@ -800,20 +812,28 @@ func cmdPS() *Command {
 			fs.StringVar(&network, "network", runner.DefaultNetwork, "internal network name")
 		},
 		NoArgs: true,
-		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) error {
+		Run: func(ctx context.Context, g *Global, fs *flag.FlagSet, args []string) (retErr error) {
+			// With -json stdout always carries a list, as targets -json: []
+			// when the engine is unreachable too (the error goes to stderr).
+			rows := []runner.Target{}
+			defer func() {
+				if g.JSON {
+					retErr = errors.Join(retErr, g.emitJSON(rows))
+				}
+			}()
 			eng, err := g.Engine(ctx)
 			if err != nil {
 				return err
 			}
-			rows, err := runner.New(eng).Running(ctx, network)
+			running, err := runner.New(eng).Running(ctx, network)
 			if err != nil {
 				return err
 			}
+			if running != nil {
+				rows = running
+			}
 			if g.JSON {
-				if rows == nil {
-					rows = []runner.Target{}
-				}
-				return g.emitJSON(rows)
+				return nil
 			}
 			if len(rows) == 0 {
 				g.printf("no targets running.  start some with:  vulnsuite run -t <selector>\n")
