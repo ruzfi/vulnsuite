@@ -1,0 +1,18 @@
+# want: anchor &root is defined more than once
+apiVersion: vulnsuite/v1
+kind: Target
+metadata:
+  id: demo-bad
+  summary: a contract with one invalid value
+base:
+  kind: image
+  image: httpd:2.4.49
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+service:
+  ports: [ { container: 80, protocol: http } ]
+  healthcheck: { http: &root { path: /, status: 200 }, timeout: 60s }
+states:
+  vulnerable:
+    verify:
+      - http: { path: /, status: 200 }
+      - http: &root { path: /x, status: 200 }

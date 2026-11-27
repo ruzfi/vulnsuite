@@ -231,4 +231,50 @@ func TestPatchStaysInTree(t *testing.T) {
 	if err := patchStaysInTree(abs); err == nil {
 		t.Error("absolute-path patch should be rejected")
 	}
+	for name, body := range map[string]string{
+		"quoted-dotdot":   "--- \"a/\\056\\056/evil\"\n+++ \"b/\\056\\056/evil\"\n@@ -0,0 +1 @@\n+x\n",
+		"quoted-plain":    "--- \"a/../evil\"\n+++ b/ok\n",
+		"quoted-abs":      "+++ \"/etc/evil\"\n",
+		"diff-git":        "diff --git a/ok b/../evil\n",
+		"diff-git-quoted": "diff --git \"a/ok\" \"b/\\056\\056/evil\"\n",
+		"rename-to":       "diff --git a/ok b/ok2\nsimilarity index 100%\nrename from ok\nrename to ../evil\n",
+		"rename-from-abs": "rename from /etc/passwd\nrename to ok\n",
+		"copy-to-quoted":  "copy from ok\ncopy to \"\\056\\056/evil\"\n",
+		"crlf":            "--- a/ok\r\n+++ b/../evil\r\n",
+		"backslash":       "+++ b/..\\evil\n",
+		"unterminated":    "+++ \"b/../evil\n",
+	} {
+		if err := patchStaysInTree(write(name+".patch", body)); err == nil {
+			t.Errorf("%s: patch should be rejected", name)
+		}
+	}
+	for name, body := range map[string]string{
+		"quoted-ok":   "diff --git \"a/sp ace\\tx\" \"b/sp ace\\tx\"\n--- \"a/sp ace\\tx\"\n+++ \"b/sp ace\\tx\"\n",
+		"rename-ok":   "diff --git a/old b/new\nrename from old\nrename to dir/new\n",
+		"timestamp":   "--- a/app.py\t2024-01-01 00:00:00\n+++ b/app.py\t2024-01-01 00:00:00\n",
+		"dotdot-name": "--- a/x..y\n+++ b/x..y\n",
+	} {
+		if err := patchStaysInTree(write(name+".patch", body)); err != nil {
+			t.Errorf("%s: patch rejected: %v", name, err)
+		}
+	}
+}
+
+func TestUnquoteCPath(t *testing.T) {
+	for in, want := range map[string]string{
+		`"a/\056\056/x"`: "a/../x",
+		`"a\"b\\c"`:      `a"b\c`,
+		`"t\tn\n"`:       "t\tn\n",
+		`"\303\251"`:     "\u00e9",
+	} {
+		got, _, ok := unquoteCPath(in)
+		if !ok || got != want {
+			t.Errorf("unquoteCPath(%s) = %q, %v; want %q", in, got, ok, want)
+		}
+	}
+	for _, in := range []string{`"abc`, `"\0"`, `"\08a"`, `"x\`} {
+		if _, _, ok := unquoteCPath(in); ok {
+			t.Errorf("unquoteCPath(%s) ok, want failure", in)
+		}
+	}
 }

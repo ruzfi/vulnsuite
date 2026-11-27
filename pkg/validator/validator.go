@@ -303,6 +303,30 @@ func (v *Validator) pinning(c *contract.Contract) []Finding {
 		out = append(out, Finding{level, c.ID(), "unpinned-base",
 			fmt.Sprintf("base.commit %q is not a commit id (a branch or tag moves); pin the full 40-character SHA", c.Base.Commit)})
 	}
+	// An inline digest that differs from the digest field is replaced by it
+	// (the field wins), so the reference written is not the one that runs.
+	conflict := func(what, image, digest string) {
+		if contract.DigestConflict(image, digest) {
+			out = append(out, Finding{Error, c.ID(), "digest-conflict",
+				fmt.Sprintf("%s %s pins %s inline but its digest field is %s; the digest field wins, so drop one of them", what, image, contract.InlineDigest(image), digest)})
+		}
+	}
+	if c.Base.Kind == contract.BaseImage {
+		conflict("base.image", c.Base.Image, c.Base.Digest)
+	}
+	for _, name := range c.DeclaredStates() {
+		st := c.States[name]
+		conflict(fmt.Sprintf("states.%s.image", name), st.Image, st.Digest)
+		for _, sc := range sortedKeys(st.Sidecars) {
+			ov := st.Sidecars[sc]
+			conflict(fmt.Sprintf("states.%s.sidecars.%s image", name, sc), ov.Image, ov.Digest)
+		}
+	}
+	for _, sc := range c.Service.Sidecars {
+		if sc.Build == nil {
+			conflict(fmt.Sprintf("sidecar %s image", sc.Name), sc.Image, sc.Digest)
+		}
+	}
 	for _, name := range c.DeclaredStates() {
 		st := c.States[name]
 		if st.Image != "" && !contract.RefPinned(st.Image, st.Digest) {
@@ -709,7 +733,7 @@ func sequenceStepRegexes(st contract.SequenceStep) []string {
 	return out
 }
 
-func sortedKeys(m map[string]string) []string {
+func sortedKeys[V any](m map[string]V) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)

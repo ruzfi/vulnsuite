@@ -178,10 +178,7 @@ var coreTags = map[string]bool{"!!str": true, "!!int": true, "!!float": true, "!
 // collection that starts on a later line must be indented under the tag's
 // line, as YAML requires.
 func checkTag(v *ast.TagNode) error {
-	name := v.Start.Value
-	if inner, ok := strings.CutPrefix(name, "!<tag:yaml.org,2002:"); ok {
-		name = "!!" + strings.TrimSuffix(inner, ">")
-	}
+	name := normTag(v.Start.Value)
 	if !coreTags[name] {
 		return se(lineOf(v), "tag %s is not supported; a contract may use only the core tags !!str, !!int, !!float, !!bool, !!null, !!seq and !!map", v.Start.Value)
 	}
@@ -231,6 +228,15 @@ func checkTag(v *ast.TagNode) error {
 		return se(lineOf(v), "tag %s does not match its value (%s)", v.Start.Value, describe(val))
 	}
 	return nil
+}
+
+// normTag writes a core tag in its short form: !<tag:yaml.org,2002:str> is
+// !!str.
+func normTag(name string) string {
+	if inner, ok := strings.CutPrefix(name, "!<tag:yaml.org,2002:"); ok {
+		return "!!" + strings.TrimSuffix(inner, ">")
+	}
+	return name
 }
 
 // indentedUnder reports whether first, the first token of a block collection
@@ -331,7 +337,9 @@ func (c checker) checkPositive(n ast.Node, key, loc string) error {
 		return se(loc, "must be greater than 0")
 	case (key == "attempts" || key == "min_hits" || key == "ms") && v < 1:
 		return se(loc, "must be at least 1")
-	case key == "read" && (v < 1 || v > MaxNetRead):
+	case key == "read" && v < 1:
+		return se(loc, "must be 1..%d; to send without waiting for a response, write no_read: true", MaxNetRead)
+	case key == "read" && v > MaxNetRead:
 		return se(loc, "must be 1..%d", MaxNetRead)
 	}
 	return nil
@@ -351,23 +359,52 @@ func lastSeg(loc string) string {
 // unwrap resolves anchors, tags and aliases to the node they stand for. An
 // alias without an anchor (checkAliases rejects those) is returned as is.
 func (c checker) unwrap(n ast.Node) ast.Node {
+	n, _ = c.unwrapTag(n)
+	return n
+}
+
+// unwrapTag is unwrap that also returns the core tag met on the way (in its
+// short form, "" for none): `!!str 123` is the string "123" to the decoder,
+// so its type is the tag's, not the plain scalar's.
+func (c checker) unwrapTag(n ast.Node) (ast.Node, string) {
+	tag := ""
 	for range maxExpandedNodes { // checkAliases rules out cycles; this is a backstop
 		switch v := n.(type) {
 		case *ast.AnchorNode:
 			n = v.Value
 		case *ast.TagNode:
+			tag = normTag(v.Start.Value)
 			n = v.Value
 		case *ast.AliasNode:
 			target, ok := c.anchors[v.Value.GetToken().Value]
 			if !ok {
-				return n
+				return n, tag
 			}
 			n = target
 		default:
-			return n
+			return n, tag
 		}
 	}
-	return n
+	return n, tag
+}
+
+// kindOf names the type node n (unwrapped, with tag the core tag it carried)
+// has to the decoder: its tag's type when it has a scalar tag, otherwise its
+// node type's, as describe names it.
+func kindOf(n ast.Node, tag string) string {
+	switch tag {
+	case "!!str":
+		return "a string"
+	case "!!int":
+		return "an integer"
+	case "!!float":
+		return "a number"
+	case "!!bool":
+		return "a boolean"
+	case "!!null":
+		return "null"
+	}
+	return describe(n)
 }
 
 func join(loc, key string) string {
@@ -380,7 +417,7 @@ func join(loc, key string) string {
 // describe names a node's YAML type for an error message.
 func describe(n ast.Node) string {
 	switch n.(type) {
-	case *ast.NullNode:
+	case nil, *ast.NullNode:
 		return "null"
 	case *ast.BoolNode:
 		return "a boolean"
@@ -398,11 +435,11 @@ func describe(n ast.Node) string {
 	return "a " + strings.ToLower(n.Type().String())
 }
 
-func typeErr(loc, want string, n ast.Node) error {
-	got := describe(n)
+func typeErr(loc, want string, n ast.Node, tag string) error {
+	got := kindOf(n, tag)
 	if s, ok := n.(ast.ScalarNode); ok {
 		if _, isNull := n.(*ast.NullNode); !isNull {
-			if isString(n) {
+			if got == "a string" {
 				got = fmt.Sprintf("%s (%q)", got, fmt.Sprint(s.GetValue()))
 			} else {
 				got = fmt.Sprintf("%s (%v)", got, s.GetValue())
@@ -422,30 +459,40 @@ func mappingEntries(n ast.Node) ([]*ast.MappingValueNode, bool) {
 	return nil, false
 }
 
-func isString(n ast.Node) bool {
+// isNaNOrInf reports a .nan or .inf scalar, which JSON has no number for.
+func isNaNOrInf(n ast.Node) bool {
 	switch n.(type) {
-	case *ast.StringNode, *ast.LiteralNode:
+	case *ast.InfinityNode, *ast.NanNode:
 		return true
 	}
 	return false
 }
 
+// scalarText is a scalar's value as text ("" for a non-scalar).
+func scalarText(n ast.Node) string {
+	if s, ok := n.(ast.ScalarNode); ok {
+		return fmt.Sprint(s.GetValue())
+	}
+	return ""
+}
+
 // checkNodeType checks node n against Go type t (mirroring the schema type the
 // field is declared with).
 func (c checker) checkNodeType(n ast.Node, t reflect.Type, loc string) error {
-	n = c.unwrap(n)
+	n, tag := c.unwrapTag(n)
 	if n == nil {
 		return nil
 	}
+	kind := kindOf(n, tag)
 	if a, ok := n.(*ast.AliasNode); ok {
 		return se(loc, "alias *%s does not refer to an anchor", a.Value.GetToken().Value)
 	}
 	if t == commandType {
-		if isString(n) {
+		if kind == "a string" {
 			return nil
 		}
 		if _, ok := n.(*ast.SequenceNode); !ok {
-			return typeErr(loc, "a string or a list of strings", n)
+			return typeErr(loc, "a string or a list of strings", n, tag)
 		}
 		return c.checkNodeType(n, reflect.TypeOf([]string(nil)), loc)
 	}
@@ -455,11 +502,11 @@ func (c checker) checkNodeType(n ast.Node, t reflect.Type, loc string) error {
 	if t == expectSanitizerType {
 		// The scalar none (its value is checked by the decoder) or a
 		// { kind, frame } mapping.
-		if isString(n) {
+		if kind == "a string" {
 			return nil
 		}
 		if _, ok := mappingEntries(n); !ok {
-			return typeErr(loc, "none or a mapping", n)
+			return typeErr(loc, "none or a mapping", n, tag)
 		}
 		return c.checkNodeType(n, reflect.TypeOf(rawExpectSanitizer{}), loc)
 	}
@@ -469,33 +516,31 @@ func (c checker) checkNodeType(n ast.Node, t reflect.Type, loc string) error {
 			return c.checkNodeType(n, reflect.TypeOf([]VerifiedOn(nil)), loc)
 		}
 		if _, ok := mappingEntries(n); !ok {
-			return typeErr(loc, "a mapping or a list of mappings", n)
+			return typeErr(loc, "a mapping or a list of mappings", n, tag)
 		}
 		return c.checkNodeType(n, reflect.TypeOf(VerifiedOn{}), loc)
 	}
 	switch t.Kind() {
 	case reflect.String:
-		if !isString(n) {
-			return typeErr(loc, "a string", n)
+		if kind != "a string" {
+			return typeErr(loc, "a string", n, tag)
 		}
 	case reflect.Int, reflect.Int64:
-		if _, ok := n.(*ast.IntegerNode); !ok {
-			return typeErr(loc, "an integer", n)
+		if kind != "an integer" {
+			return typeErr(loc, "an integer", n, tag)
 		}
 	case reflect.Float64:
-		switch n.(type) {
-		case *ast.IntegerNode, *ast.FloatNode:
-		default:
-			return typeErr(loc, "a number", n)
+		if kind != "an integer" && (kind != "a number" || isNaNOrInf(n)) {
+			return typeErr(loc, "a number", n, tag)
 		}
 	case reflect.Bool:
-		if _, ok := n.(*ast.BoolNode); !ok {
-			return typeErr(loc, "a boolean", n)
+		if kind != "a boolean" {
+			return typeErr(loc, "a boolean", n, tag)
 		}
 	case reflect.Slice:
 		seq, ok := n.(*ast.SequenceNode)
 		if !ok {
-			return typeErr(loc, "a list", n)
+			return typeErr(loc, "a list", n, tag)
 		}
 		if len(seq.Values) == 0 && nonEmptyLists[lastSeg(loc)] {
 			return se(loc, "must not be empty")
@@ -508,7 +553,7 @@ func (c checker) checkNodeType(n ast.Node, t reflect.Type, loc string) error {
 	case reflect.Map:
 		entries, ok := mappingEntries(n)
 		if !ok {
-			return typeErr(loc, "a mapping", n)
+			return typeErr(loc, "a mapping", n, tag)
 		}
 		for _, e := range entries {
 			if e.Key.IsMergeKey() {
@@ -524,7 +569,7 @@ func (c checker) checkNodeType(n ast.Node, t reflect.Type, loc string) error {
 	case reflect.Struct:
 		entries, ok := mappingEntries(n)
 		if !ok {
-			return typeErr(loc, "a mapping", n)
+			return typeErr(loc, "a mapping", n, tag)
 		}
 		for _, e := range entries {
 			if e.Key.IsMergeKey() {
@@ -544,7 +589,7 @@ func (c checker) checkNodeType(n ast.Node, t reflect.Type, loc string) error {
 				return err
 			}
 			if nonEmptyKeys[t][key] {
-				if sn, ok := c.unwrap(e.Value).(ast.ScalarNode); ok && isString(sn) && fmt.Sprint(sn.GetValue()) == "" {
+				if sn, stag := c.unwrapTag(e.Value); kindOf(sn, stag) == "a string" && scalarText(sn) == "" {
 					return se(join(loc, key), "must not be empty; leave the key out instead")
 				}
 			}
@@ -571,7 +616,7 @@ func (c checker) checkMerge(v ast.Node, t reflect.Type, loc string) error {
 	for _, src := range sources {
 		m := c.unwrap(src)
 		if _, ok := mappingEntries(m); !ok {
-			return typeErr(join(loc, "<<"), "a mapping or a list of mappings", m)
+			return typeErr(join(loc, "<<"), "a mapping or a list of mappings", m, "")
 		}
 		if err := c.checkNodeType(m, t, loc); err != nil {
 			return err

@@ -106,3 +106,48 @@ func TestPinningSourceCommit(t *testing.T) {
 		t.Fatalf("-allow-unpinned: %v", fs)
 	}
 }
+
+// Issue #152 item 6: an inline digest must be a full sha256 digest to pin, and
+// one that differs from the digest field (which wins) is an error.
+func TestPinningInlineDigest(t *testing.T) {
+	other := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	for _, tc := range []struct {
+		image, digest string
+		unpinned      bool
+		conflict      bool
+	}{
+		{image: "httpd@" + pinned},
+		{image: "httpd", digest: pinned},
+		{image: "httpd@" + pinned, digest: pinned},
+		{image: "httpd@sha256:", unpinned: true},
+		{image: "httpd@sha256:zzz", unpinned: true},
+		{image: "httpd@" + strings.ToUpper(pinned[7:]), unpinned: true},
+		{image: "httpd@" + other, digest: pinned, conflict: true},
+	} {
+		base := "base: { kind: image, image: \"" + tc.image + "\""
+		if tc.digest != "" {
+			base += ", digest: " + tc.digest
+		}
+		doc := pinHead + base + " }\nstates:\n  vulnerable:\n    sidecars: {}\n"
+		fs := (&Validator{}).Check(parse(t, doc))
+		if got := len(findingsFor(fs, "unpinned-base")) > 0; got != tc.unpinned {
+			t.Errorf("%s/%s: unpinned-base = %v, want %v", tc.image, tc.digest, got, tc.unpinned)
+		}
+		cf := findingsFor(fs, "digest-conflict")
+		if (len(cf) > 0) != tc.conflict || (tc.conflict && cf[0].Level != Error) {
+			t.Errorf("%s/%s: digest-conflict = %v, want %v", tc.image, tc.digest, cf, tc.conflict)
+		}
+	}
+	doc := pinHead + `  sidecars:
+    - { name: cache, image: "redis@` + other + `", digest: ` + pinned + ` }
+base: { kind: image, image: httpd, digest: ` + pinned + ` }
+states:
+  vulnerable:
+    image: "httpd@` + other + `"
+    digest: ` + pinned + `
+    sidecars: { cache: { image: "redis@` + other + `", digest: ` + pinned + ` } }
+`
+	if cf := findingsFor((&Validator{}).Check(parse(t, doc)), "digest-conflict"); len(cf) != 3 {
+		t.Errorf("want 3 digest-conflict (state, override, sidecar), got %v", cf)
+	}
+}

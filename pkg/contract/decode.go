@@ -137,7 +137,7 @@ func Parse(data []byte) (*Contract, error) {
 		}
 	}
 	var raw rawContract
-	if err := unmarshal(data, &raw, perr, yaml.Strict()); err != nil {
+	if err := decodeMerged(data, &raw, perr, yaml.Strict()); err != nil {
 		return nil, err
 	}
 	if perr != nil { // the decoder reports syntax errors itself; a backstop
@@ -198,7 +198,7 @@ func Parse(data []byte) (*Contract, error) {
 		} `yaml:"service"`
 		States map[string]map[string]any `yaml:"states"`
 	}
-	if err := unmarshal(data, &keys, nil); err != nil {
+	if err := decodeMerged(data, &keys, nil); err != nil {
 		return nil, err
 	}
 	if err := c.checkStructure(keys.Base, keys.Service.Sidecars, keys.States); err != nil {
@@ -214,8 +214,9 @@ func Parse(data []byte) (*Contract, error) {
 // to its own decode, for callers that read only part of a contract (the
 // loader's peek): aliases, merge keys and tags are checked first, so an alias
 // bomb or a tag with no value is an error rather than a hang or a crash, and
-// a panic in the decoder is returned as an error. It does not validate the
-// document; use Parse for that.
+// a panic in the decoder is returned as an error. Merge keys are resolved as
+// Parse resolves them, so a key overriding a merged one reads the same here.
+// It does not validate the document; use Parse for that.
 func DecodeYAML(data []byte, v any, opts ...yaml.DecodeOption) error {
 	file, perr := parser.ParseBytes(data, 0)
 	if perr == nil {
@@ -223,7 +224,7 @@ func DecodeYAML(data []byte, v any, opts ...yaml.DecodeOption) error {
 			return err
 		}
 	}
-	if err := unmarshal(data, v, perr, opts...); err != nil {
+	if err := decodeMerged(data, v, perr, opts...); err != nil {
 		return err
 	}
 	if perr != nil {
@@ -503,8 +504,13 @@ func (c *Contract) checkStructure(present map[string]any, sidecarKeys []map[stri
 		if strings.TrimSpace(p.Reason) == "" {
 			return se("requires/probe/reason", "must say what a host that fails the probe lacks")
 		}
-		if p.Timeout != "" && !timeoutRe.MatchString(p.Timeout) {
-			return se("requires/probe/timeout", "must look like 30s or 2m")
+		if t := p.Timeout; t != "" {
+			if !timeoutRe.MatchString(t) {
+				return se("requires/probe/timeout", "must look like 30s or 2m")
+			}
+			if d, err := ParseDuration(t, 0); err != nil || d <= 0 || d > MaxRequiresProbeTimeout {
+				return se("requires/probe/timeout", "%q must be greater than 0 and at most %s", t, fmtDuration(MaxRequiresProbeTimeout))
+			}
 		}
 	}
 

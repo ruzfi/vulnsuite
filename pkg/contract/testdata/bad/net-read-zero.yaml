@@ -1,4 +1,4 @@
-# want: states/vulnerable/verify/1/net/steps/0/read: must be 1..65536
+# want: states/vulnerable/verify/1/net/steps/0/read: must be 1..65536; to send without waiting for a response, write no_read: true
 apiVersion: vulnsuite/v1
 kind: Target
 metadata:
