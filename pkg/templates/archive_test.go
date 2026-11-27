@@ -184,3 +184,71 @@ func TestUpdateArchiveReplacesInstalledTemplates(t *testing.T) {
 		t.Fatalf("leftovers: %v", sib)
 	}
 }
+
+// Git metadata in an archive is refused (GHSA-g5pf-8pw3-4pwc): extracted, it
+// would make the install a "checkout" whose config and hooks the next
+// update-templates runs on the host. Case and Windows spellings count too.
+func TestUpdateArchiveRejectsGitMetadata(t *testing.T) {
+	for _, name := range []string{
+		".git/config",
+		".git/hooks/post-merge",
+		".GIT/config",
+		".git./config",
+		"GIT~1/config",
+		"web/x/.git/config",
+		".git", // a gitfile pointing elsewhere
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := installedDir(t)
+			data := makeZip(t,
+				zipEntry{name: "vulnsuite-templates-main/web/x/contract.yaml", body: contractBody},
+				zipEntry{name: "vulnsuite-templates-main/" + name, body: "[core]\n\tfsmonitor = touch /tmp/pwned\n"},
+			)
+			s := serveArchive(t, http.StatusOK, data)
+			_, _, err := Update(context.Background(), opts(dir, s))
+			if err == nil || !strings.Contains(err.Error(), "git metadata") {
+				t.Fatalf("err = %v", err)
+			}
+			mustKeepOld(t, dir)
+		})
+	}
+}
+
+// Names that merely contain "git" are ordinary files.
+func TestHasGitSegment(t *testing.T) {
+	for name, want := range map[string]bool{
+		".git/config":       true,
+		"a/.Git/HEAD":       true,
+		"a/.git ":           true,
+		"a\\.git\\config":   true,
+		".gitignore":        false,
+		".github/workflows": false,
+		"web/git/contract":  false,
+		"x.git/y":           false,
+	} {
+		if got := hasGitSegment(name); got != want {
+			t.Errorf("hasGitSegment(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
+// An archive install with a .git in it (from an older vulnsuite, or put there
+// by hand) is still updated from the archive: git is never run in it.
+func TestUpdateArchiveInstallIgnoresPlantedGit(t *testing.T) {
+	dir := installedDir(t)
+	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if isRepoRoot(dir) {
+		t.Fatal("an archive install must not count as a git checkout")
+	}
+	data := makeZip(t, zipEntry{name: "vulnsuite-templates-main/web/x/contract.yaml", body: contractBody})
+	s := serveArchive(t, http.StatusOK, data)
+	if _, _, err := Update(context.Background(), opts(dir, s)); err != nil {
+		t.Fatal(err)
+	}
+	mustExist(t, filepath.Join(dir, "web", "x", "contract.yaml"))
+	if _, err := os.Lstat(filepath.Join(dir, ".git")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the planted .git should be gone with the old tree: %v", err)
+	}
+}

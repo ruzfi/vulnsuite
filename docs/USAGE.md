@@ -94,7 +94,10 @@ any subfolder: the git root, or the directory holding the
   non-empty directory is refused unless you pass `-force`; a subfolder of an
   archive install is refused even with `-force`. The archive is
   refused, and the old directory kept, when it is over 256 MiB, expands past
-  512 MiB or 50,000 entries, or holds no templates (a wrong `-repo`). The old
+  512 MiB or 50,000 entries, holds no templates (a wrong `-repo`), or
+  contains git metadata (a `.git` file or folder, which `git archive` never
+  produces). A directory with the marker is always updated from the archive,
+  never with `git`, even if a `.git` appears in it. The old
   directory is removed only once the new one is in place; if it cannot be
   removed (e.g. a read-only file), the update still succeeds and a warning
   names the leftover `.<name>.old-*` directory to delete. When the templates

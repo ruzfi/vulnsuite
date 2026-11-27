@@ -132,9 +132,26 @@ func enclosingInstall(dir string) string {
 	return ""
 }
 
+// isRepoRoot reports whether dir is a git checkout. A directory carrying the
+// archive version marker is an archive install, whatever .git it contains:
+// git is never run in it.
 func isRepoRoot(dir string) bool {
 	_, err := os.Stat(filepath.Join(dir, ".git"))
-	return err == nil
+	return err == nil && !isArchiveInstall(dir)
+}
+
+// hasGitSegment reports whether any segment of the slash-separated archive
+// path names git metadata: ".git" in any case (case-insensitive file
+// systems), with the trailing dots or spaces Windows drops, or its 8.3
+// short name "git~1".
+func hasGitSegment(name string) bool {
+	for _, seg := range strings.Split(strings.ReplaceAll(name, "\\", "/"), "/") {
+		seg = strings.ToLower(strings.TrimRight(seg, ". "))
+		if seg == ".git" || seg == "git~1" {
+			return true
+		}
+	}
+	return false
 }
 
 // HasTemplates reports whether dir contains at least one vulnsuite contract
@@ -685,6 +702,13 @@ func unzipStripTop(r io.ReaderAt, size int64, dst string) ([]string, error) {
 		}
 		if name == "" {
 			continue
+		}
+		// Git metadata is never part of a templates archive (git archive
+		// cannot produce it). Extracted, a .git directory or file would turn
+		// the install into a "checkout" whose config and hooks the next
+		// update-templates runs on the host.
+		if hasGitSegment(name) {
+			return links, errors.New("archive contains git metadata: " + f.Name)
 		}
 		target := filepath.Join(dst, filepath.FromSlash(name))
 		if !strings.HasPrefix(target, root) {

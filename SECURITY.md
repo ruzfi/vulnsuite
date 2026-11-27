@@ -53,6 +53,18 @@ vulnsuite stands up **knowingly vulnerable** targets. Two trust boundaries matte
 - Build steps (`Dockerfile` `RUN`, overlays, `seed`) execute inside the
   container/build sandbox, not on the host.
 
+### Template installs (`update-templates`)
+
+- **an archive install can never become a git checkout.** The GitHub archive
+  is extracted with directories and regular files only (symlinks are
+  skipped), every entry must stay inside the install, sizes and entry counts
+  are capped, and any `.git` path segment (in any case, `.git.` / `.git `, or
+  the 8.3 name `git~1`) is refused. A directory carrying the
+  `.vulnsuite-templates-version` marker is never treated as a checkout, so
+  `git` is not run in it. Without this, an archive carrying `.git/config`
+  (`core.fsmonitor`, `core.sshCommand`) or hooks would run commands on the
+  host at the next `update-templates`.
+
 ### Registry credentials
 
 - `VULNSUITE_REGISTRY_USER` / `VULNSUITE_REGISTRY_TOKEN` name no registry, and
