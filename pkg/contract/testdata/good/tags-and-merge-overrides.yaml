@@ -1,0 +1,27 @@
+# A !!str tag makes a plain scalar a string (#152), and a key written after a
+# merge key overrides the merged one, on struct fields as on maps.
+apiVersion: vulnsuite/v1
+kind: Target
+metadata:
+  <<: { id: demo-merge-base, summary: merged, severity: low }
+  id: demo-merge-override
+  severity: high
+  vuln_refs: [ !!str VS-DEMO-1 ]
+base:
+  kind: image
+  image: httpd:2.4.49
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+service:
+  ports: [ { container: !!int 80, protocol: http } ]
+  environment: { A: !!str 1, B: !!str true, C: !!str 1.5 }
+  healthcheck: { http: &root { path: /, status: 200 }, timeout: 60s }
+states:
+  vulnerable:
+    verify:
+      - http: { <<: *root, status: 404 }
+      - tcp: &tcp { port: 80, timeout: 5 }
+  patched:
+    image: httpd:2.4.51
+    environment: { <<: { MODE: x, OTHER: y }, MODE: patched }
+    verify:
+      - tcp: { <<: *tcp, timeout: 10 }

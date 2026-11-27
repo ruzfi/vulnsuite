@@ -13,43 +13,86 @@
     "states"
   ],
   "additionalProperties": false,
-  "if": {
-    "required": [
-      "base"
-    ],
-    "properties": {
-      "base": {
+  "allOf": [
+    {
+      "if": {
         "required": [
-          "kind"
+          "base"
         ],
         "properties": {
-          "kind": {
-            "enum": [
-              "source",
-              "build"
-            ]
+          "base": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "enum": [
+                  "source",
+                  "build"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "description": "A source or build base builds every state from its own source: a per-state image (and the digest pinning it) applies only to kind: image.",
+        "properties": {
+          "states": {
+            "additionalProperties": {
+              "propertyNames": {
+                "not": {
+                  "enum": [
+                    "image",
+                    "digest"
+                  ]
+                }
+              }
+            }
           }
         }
       }
-    }
-  },
-  "then": {
-    "description": "A source or build base builds every state from its own source: a per-state image (and the digest pinning it) applies only to kind: image.",
-    "properties": {
-      "states": {
-        "additionalProperties": {
-          "propertyNames": {
-            "not": {
-              "enum": [
-                "image",
-                "digest"
-              ]
+    },
+    {
+      "if": {
+        "required": [
+          "base"
+        ],
+        "properties": {
+          "base": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "image"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "description": "On an image base an overlay dest is a path in the image, so it must be absolute.",
+        "properties": {
+          "states": {
+            "additionalProperties": {
+              "properties": {
+                "overlay": {
+                  "items": {
+                    "properties": {
+                      "dest": {
+                        "pattern": "^/"
+                      }
+                    }
+                  }
+                }
+              }
             }
           }
         }
       }
     }
-  },
+  ],
   "properties": {
     "apiVersion": {
       "enum": [
@@ -67,6 +110,17 @@
         "summary"
       ],
       "additionalProperties": false,
+      "if": {
+        "required": [
+          "variant"
+        ]
+      },
+      "then": {
+        "description": "A variant discriminates a member within its group, so it needs one.",
+        "required": [
+          "group"
+        ]
+      },
       "properties": {
         "id": {
           "type": "string",
@@ -611,8 +665,8 @@
             },
             "timeout": {
               "type": "string",
-              "pattern": "^\\d+[smh]$",
-              "description": "bound on run (default 30s); running out fails the target rather than skipping it"
+              "pattern": "^0*[1-9]\\d*[smh]$",
+              "description": "bound on run (default 30s): greater than 0 and at most 24h (vulnsuite enforces the upper bound); running out fails the target rather than skipping it"
             }
           },
           "description": "Generic host check for what no dedicated field covers (kernel version, cgroup v2, a sysctl, a device). A non-zero exit skips the target with reason, never fails it; -ignore-requires does not run it."

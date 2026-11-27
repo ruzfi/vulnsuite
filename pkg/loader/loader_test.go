@@ -352,6 +352,24 @@ func TestPeekGuards(t *testing.T) {
 	}
 }
 
+// peek reads a merged metadata key overridden by the mapping's own key as
+// Parse does, rather than failing on it as a duplicate (#152).
+func TestPeekMergeOverride(t *testing.T) {
+	doc := "base: &m {id: x-base, group: g, variant: a, vuln_refs: [VS-X-1]}\n" +
+		"metadata: {<<: *m, id: x-override, variant: b, primary: !!bool true}\n"
+	path := filepath.Join(t.TempDir(), "contract.yaml")
+	if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, err := peek(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.ID != "x-override" || p.Group != "g" || p.Variant != "b" || !p.Primary || len(p.Refs) != 1 {
+		t.Fatalf("peek = %+v", p)
+	}
+}
+
 func TestFindSurfacesYAMLErrors(t *testing.T) {
 	root := t.TempDir()
 	writeContract(t, filepath.Join(root, "web", "ok", "contract.yaml"), "web-ok")

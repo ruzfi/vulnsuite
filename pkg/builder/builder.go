@@ -614,30 +614,143 @@ func isGNUPatch(ctx context.Context) bool {
 
 // patchStaysInTree rejects a unified diff whose target paths are absolute or
 // contain a ".." segment, so applying it cannot write outside the source tree.
+// It reads every header that names a path: --- and +++, diff --git, and git's
+// rename from/to and copy from/to, decoding git's C-quoted form
+// ("a/\056\056/x"). git apply refuses such paths itself; this is defence in
+// depth, and covers the GNU patch fallback too.
 func patchStaysInTree(patch string) error {
 	data, err := os.ReadFile(patch)
 	if err != nil {
 		return err
 	}
 	for _, line := range strings.Split(string(data), "\n") {
-		if !strings.HasPrefix(line, "--- ") && !strings.HasPrefix(line, "+++ ") {
-			continue
-		}
-		p := strings.TrimSpace(line[4:])
-		if i := strings.IndexAny(p, "\t "); i >= 0 { // strip trailing timestamp
-			p = p[:i]
-		}
-		p = strings.TrimPrefix(strings.TrimPrefix(p, "a/"), "b/")
-		if p == "" || p == "/dev/null" {
-			continue
-		}
-		if strings.HasPrefix(p, "/") {
-			return fmt.Errorf("patch targets an absolute path %q", p)
-		}
-		for _, seg := range strings.Split(filepath.ToSlash(p), "/") {
-			if seg == ".." {
-				return fmt.Errorf("patch escapes the source tree via %q", p)
+		line = strings.TrimSuffix(line, "\r")
+		for _, p := range patchHeaderPaths(line) {
+			if err := checkPatchPath(p); err != nil {
+				return err
 			}
+		}
+	}
+	return nil
+}
+
+// patchHeaderPaths returns the paths a diff header line names, or nil for
+// any other line. An unquoted path is returned both up to the first tab (a
+// diff timestamp's separator) and up to the first space, so a path is checked
+// whichever way a patch tool splits it.
+func patchHeaderPaths(line string) []string {
+	var rest string
+	switch {
+	case strings.HasPrefix(line, "--- "), strings.HasPrefix(line, "+++ "):
+		rest = line[4:]
+	case strings.HasPrefix(line, "diff --git "):
+		rest = line[len("diff --git "):]
+		var out []string
+		for rest = strings.TrimLeft(rest, " "); rest != ""; rest = strings.TrimLeft(rest, " ") {
+			if rest[0] == '"' {
+				p, after, ok := unquoteCPath(rest)
+				if !ok {
+					return append(out, rest)
+				}
+				out = append(out, p)
+				rest = after
+				continue
+			}
+			tok, after, _ := strings.Cut(rest, " ")
+			out = append(out, tok)
+			rest = after
+		}
+		return out
+	default:
+		for _, h := range []string{"rename from ", "rename to ", "copy from ", "copy to "} {
+			if strings.HasPrefix(line, h) {
+				rest = line[len(h):]
+				break
+			}
+		}
+		if rest == "" {
+			return nil
+		}
+	}
+	rest = strings.TrimLeft(rest, " ")
+	if strings.HasPrefix(rest, "\"") {
+		if p, _, ok := unquoteCPath(rest); ok {
+			return []string{p}
+		}
+		return []string{rest} // unterminated: check it as written
+	}
+	tab, _, _ := strings.Cut(rest, "\t")
+	sp, _, _ := strings.Cut(rest, " ")
+	return []string{strings.TrimRight(tab, " "), sp}
+}
+
+// unquoteCPath decodes the C-quoted path git writes for names with special
+// characters (a leading '"', backslash escapes and \NNN octal bytes) and
+// returns it with the text after the closing quote.
+func unquoteCPath(s string) (path, rest string, ok bool) {
+	var b strings.Builder
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '"':
+			return b.String(), s[i+1:], true
+		case c != '\\':
+			b.WriteByte(c)
+		case i+1 >= len(s):
+			return "", "", false
+		default:
+			i++
+			switch e := s[i]; e {
+			case 'a':
+				b.WriteByte('\a')
+			case 'b':
+				b.WriteByte('\b')
+			case 't':
+				b.WriteByte('\t')
+			case 'n':
+				b.WriteByte('\n')
+			case 'v':
+				b.WriteByte('\v')
+			case 'f':
+				b.WriteByte('\f')
+			case 'r':
+				b.WriteByte('\r')
+			case '0', '1', '2', '3':
+				if i+2 >= len(s) {
+					return "", "", false
+				}
+				v := 0
+				for _, d := range s[i : i+3] {
+					if d < '0' || d > '7' {
+						return "", "", false
+					}
+					v = v*8 + int(d-'0')
+				}
+				b.WriteByte(byte(v))
+				i += 2
+			default:
+				b.WriteByte(e) // \" and \\, and anything git does not write
+			}
+		}
+	}
+	return "", "", false
+}
+
+// checkPatchPath rejects an absolute path or one with a ".." segment. The
+// a/ or b/ prefix git writes is a segment like any other, so it needs no
+// stripping; backslashes count as separators, as GNU patch on Windows reads
+// them.
+func checkPatchPath(p string) error {
+	if p == "" || p == "/dev/null" {
+		return nil
+	}
+	norm := strings.ReplaceAll(p, "\\", "/")
+	if strings.HasPrefix(norm, "/") || (len(norm) > 1 && norm[1] == ':') {
+		return fmt.Errorf("patch targets an absolute path %q", p)
+	}
+	for _, seg := range strings.Split(norm, "/") {
+		if seg == ".." {
+			return fmt.Errorf("patch escapes the source tree via %q", p)
 		}
 	}
 	return nil

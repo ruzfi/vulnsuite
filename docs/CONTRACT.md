@@ -18,7 +18,12 @@ where a string is expected (`summary: 123`, an `environment` value of `1`,
 `true` or `null` -- quote it: `FOO: "1"`). A file must hold a single YAML
 document. YAML anchors, aliases and merge keys (`<<: *base`) may be used; a
 value reached through one must have the type required where it is used, and a
-merged key must be a field of the mapping it is merged into. Each anchor name
+merged key must be a field of the mapping it is merged into. A key the mapping
+writes itself overrides a merged one, on any mapping
+(`http: { <<: *root, status: 404 }`), but it must be written after the `<<`,
+and a key two merged mappings both bring (`<<: [*a, *b]`) must be overridden
+in the mapping: YAML readers differ on which value wins in those cases, so
+they are rejected rather than read one way. Each anchor name
 may be defined once, before any alias to it, and the document with every alias
 expanded may hold at most 100,000 nodes. These rules are checked before the
 document is decoded, by `validate` and by every command that reads the
@@ -26,7 +31,10 @@ templates tree (`list`, `info`, `run <id>`), so a malformed contract is an error
 there rather than a hang. Tags may be only the core ones that restate a value's
 type (`!!str`, `!!int`, `!!float`, `!!bool`, `!!null`, `!!seq`, `!!map`), on a
 value of that type; a local tag (`!x`), any other tag, and a tag with no value
-after it (`ports: !!seq` and nothing more) are rejected. A required string may not be empty
+after it (`ports: !!seq` and nothing more) are rejected. A tagged value has its
+tag's type: `summary: !!str 123` is the string `"123"` (and `!!str 0x10` the
+string `"0x10"`), while `container: !!str 80` is a string where an integer is
+required, and `container: !!float 80` a number, both errors. A required string may not be empty
 (`summary` may not be blank either): `base.image`, `base.repo`, `base.commit`,
 a sidecar's `name` and `image` (or its `build.context`), a per-state sidecar `image`, and the `run` of a
 `seed` step or an `exec` probe. An optional string whose value has a format may
@@ -107,7 +115,9 @@ base: { kind: build, context: src, dockerfile: Dockerfile, build_args: {} }
   that fails and GNU patch is on `PATH`, it is retried with GNU patch, which
   applies with fuzz and refuses absolute paths, `..` and writes through a
   symbolic link (patch files with absolute or `..` targets are rejected
-  before either runs). Without GNU patch (BSD patch on macOS) the build fails
+  before either runs: the `---`/`+++`, `diff --git`, `rename from`/`to` and
+  `copy from`/`to` headers are read, git's quoted form `"a/\056\056/x"`
+  included). Without GNU patch (BSD patch on macOS) the build fails
   with `git apply`'s error.
 - Per-state `image` overrides and every sidecar image (`service.sidecars`
   and per-state `sidecars` overrides) must pin `digest` too
@@ -188,7 +198,8 @@ replaced, the service's `user` and environment, no network, no capabilities and
 none of the service's devices. Exit 0 runs the target; a non-zero exit
 **skips** it with `reason` (never fails it), in `run` and `build` alike (`build`
 then neither counts nor pushes the image). A probe that cannot run at all -- the
-image has no `/bin/sh`, or it outlives `timeout` (`<n>s|m|h`, default 30s) --
+image has no `/bin/sh`, or it outlives `timeout` (`<n>s|m|h`, greater than 0
+and at most 24h, default 30s) --
 fails the target instead: that is a broken template, not a host that lacks
 something. `run` probes each target as it reaches it; `build` probes each
 state's image once it is built.
@@ -340,7 +351,7 @@ that waits for the client to speak first, counts as open. A `tcp` probe with
 neither `send` nor `banner_matches` does not wait for a banner: once the port
 counts as open it passes, after at most 300ms.
 
-The `net` probe runs an ordered send/expect dialogue over a single TCP connection (optionally TLS), for multi-step protocols -- FTP SITE commands, SMTP, line protocols -- that a one-shot `tcp` probe cannot express. Each step optionally sends bytes, then reads the response and asserts `expect` (regex must match) and/or `expect_absent`. A response is read across TCP segments: reading stops once `expect` matches, after `read` bytes (1-65536, default 4096), when the server closes, after 500ms without more data, or at the probe timeout. So a multi-line reply (`220-Welcome` then `220 ready`) is judged whole and none of it leaks into the next step. A `tcp` probe reads its banner the same way, up to `banner_matches`. The connection is TLS when `tls: true` is set or when the probed port is declared `protocol: https` (the primary port when `port` is left out); a dialogue with any other port, e.g. SMTP on 25 of an https target, stays plain.
+The `net` probe runs an ordered send/expect dialogue over a single TCP connection (optionally TLS), for multi-step protocols -- FTP SITE commands, SMTP, line protocols -- that a one-shot `tcp` probe cannot express. Each step optionally sends bytes, then reads the response and asserts `expect` (regex must match) and/or `expect_absent`. A response is read across TCP segments: reading stops once `expect` matches, after `read` bytes (1-65536, default 4096; to send without reading a response, write `no_read: true` rather than `read: 0`), when the server closes, after 500ms without more data, or at the probe timeout. So a multi-line reply (`220-Welcome` then `220 ready`) is judged whole and none of it leaks into the next step. A `tcp` probe reads its banner the same way, up to `banner_matches`. The connection is TLS when `tls: true` is set or when the probed port is declared `protocol: https` (the primary port when `port` is left out); a dialogue with any other port, e.g. SMTP on 25 of an https target, stays plain.
 
 HTTP probes are sent over a raw socket so the request line is exactly what the
 template says. Chunked responses are decoded. A probe speaks the scheme of the
@@ -532,7 +543,8 @@ rather than failed; use `-expose host` or scan from a container.
 
 | Rule | Level | Meaning |
 | --- | --- | --- |
-| `unpinned-base` | error (warning with `-allow-unpinned`) | image has no digest / source has no commit, or a commit that is not a commit id (a branch or tag) |
+| `unpinned-base` | error (warning with `-allow-unpinned`) | image has no digest / source has no commit, or a commit that is not a commit id (a branch or tag). An inline digest (`image@sha256:...`) pins only when it is a full `sha256:` and 64 hex digits |
+| `digest-conflict` | error | an image (base, state, sidecar or state sidecar override) writes an inline `@sha256:` digest that differs from its `digest` field; the field wins, so the inline one is never used |
 | `unpinned-state-image` | error (warning with `-allow-unpinned`) | a state's `image` override has no digest |
 | `unpinned-sidecar` | error (warning with `-allow-unpinned`) | a sidecar image, or a state's sidecar override, has no digest (a sidecar with a `build` is pinned by its content) |
 | `short-commit` | warning | `base.commit` is an abbreviated commit id; use the full SHA |

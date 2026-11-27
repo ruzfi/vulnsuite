@@ -1,0 +1,20 @@
+# want: must be greater than 0 and at most 24h
+apiVersion: vulnsuite/v1
+kind: Target
+metadata:
+  id: demo-probe
+  summary: demo
+  vuln_refs: [VS-DEMO-1]
+  severity: high
+base:
+  kind: image
+  image: eclipse-temurin:21-jre
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+service:
+  ports: [ { container: 8080, protocol: http } ]
+states:
+  vulnerable:
+    verify:
+      - http: { path: /, status: 200 }
+requires:
+  probe: { run: "true", reason: needs x, timeout: 25h }

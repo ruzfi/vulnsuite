@@ -495,9 +495,26 @@ func (b Base) Pinned() bool {
 }
 
 // RefPinned reports whether an image reference is pinned to a digest, either
-// by a separate digest field or inline (image@sha256:...).
+// by a separate digest field or inline (image@sha256:...). Either must be a
+// full sha256 digest (sha256: and 64 lower-case hex digits): `httpd@sha256:`
+// or `@sha256:zzz` pins nothing.
 func RefPinned(image, digest string) bool {
-	return digest != "" || strings.Contains(image, "@sha256:")
+	return digestRe.MatchString(digest) || digestRe.MatchString(InlineDigest(image))
+}
+
+// InlineDigest returns the digest written inline in an image reference
+// (what follows "@" in image@sha256:...), or "" when there is none.
+func InlineDigest(image string) string {
+	_, d, _ := strings.Cut(image, "@")
+	return d
+}
+
+// DigestConflict reports whether an image reference carries an inline digest
+// that differs from its digest field. The digest field wins (pinRef replaces
+// the inline one), so the inline digest written next to it is never used.
+func DigestConflict(image, digest string) bool {
+	inline := InlineDigest(image)
+	return digest != "" && inline != "" && inline != digest
 }
 
 // ImageRef is the fully pinned image reference of an image base.
@@ -901,13 +918,18 @@ type Requires struct {
 // DefaultRequiresProbeTimeout bounds a requires.probe without a timeout.
 const DefaultRequiresProbeTimeout = 30 * time.Second
 
+// MaxRequiresProbeTimeout bounds requires.probe.timeout, as
+// MaxHealthcheckTimeout bounds the healthcheck's.
+const MaxRequiresProbeTimeout = 24 * time.Hour
+
 // RequiresProbe is requires.probe.
 type RequiresProbe struct {
 	// Run is a /bin/sh -c command; exit 0 means the host can run the target.
 	Run string `yaml:"run" json:"run"`
 	// Reason is the skip reason shown when Run exits non-zero.
 	Reason string `yaml:"reason" json:"reason"`
-	// Timeout bounds Run (<n>s|m|h, default 30s); running out fails the target.
+	// Timeout bounds Run (<n>s|m|h, greater than 0 and at most 24h, default
+	// 30s); running out fails the target.
 	Timeout string `yaml:"timeout,omitempty" json:"timeout,omitempty"`
 }
 
